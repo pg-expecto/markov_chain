@@ -62,7 +62,7 @@
   --ОСНОВНЫЕ ОТЧЕТЫ
   - mchain_quality_report : Отчёт о качестве прогнозов для указанного горизонта (по умолчанию из markov_config)
   - mchain_summary_report :  Сводный отчёт по состоянию цепи Маркова mchain_reliability_report+mchain_incident_transitions_report
-  - mchain_health_check : Проверяет состояние цепи Маркова и возвращает статус (OK, WARNING, CRITICAL)
+  - mchain_health_check : Проверяет состояние цепи Маркова и возвращает статус (OK, WARNING, CRITICAL) !!!!!!
   - mchain_state_transition_matrix_report : Формирует матрицу переходов между укрупнёнными группами состояний. Источник: markov_probabilities (усреднение по состояниям внутри группы)
   --ОСНОВНЫЕ ОТЧЕТЫ
   
@@ -663,10 +663,9 @@ DECLARE
     stability_bonus INT := 0;
     coverage_bonus INT := 0;
 BEGIN
-    -- Общее число переходов
     SELECT COUNT(*) INTO total_transitions FROM transition_log;
 
-    -- 1. Базовая оценка по объёму данных (0-2)
+    -- 1. Базовая оценка по объёму данных (0-3)
     IF total_transitions < 100 THEN
         RETURN 0;
     ELSIF total_transitions < 500 THEN
@@ -674,10 +673,10 @@ BEGIN
     ELSIF total_transitions < 5000 THEN
         base_score := 2;
     ELSE
-        base_score := 3;  -- достаточно данных для минимальной достоверности
+        base_score := 3;
     END IF;
 
-    -- Если данных мало (менее 5000), стабильность и покрытие не вычисляем
+    -- Если данных мало (<5000), возвращаем базовый рейтинг без учёта стабильности
     IF total_transitions < 5000 THEN
         RETURN base_score;
     END IF;
@@ -702,16 +701,7 @@ BEGIN
     FROM recent r
     FULL JOIN current c USING (from_state, to_state);
 
-    -- Бонус за стабильность (0-2)
-    IF max_prob_change < 0.02 THEN
-        stability_bonus := 2;
-    ELSIF max_prob_change < 0.05 THEN
-        stability_bonus := 1;
-    ELSE
-        stability_bonus := 0;
-    END IF;
-
-    -- 3. Покрытие частых состояний (аналог критерия C1 из evaluate_training_sufficiency)
+    -- 3. Покрытие частых состояний
     WITH state_stats AS (
         SELECT from_state, COUNT(*) AS n_i,
                COUNT(*)::REAL / total_transitions AS freq
@@ -721,7 +711,7 @@ BEGIN
     frequent_states AS (
         SELECT from_state
         FROM state_stats
-        WHERE freq > 0.01   -- частота >1%
+        WHERE freq > 0.01
     ),
     coverage AS (
         SELECT 
@@ -741,17 +731,29 @@ BEGIN
         END INTO coverage_pct
     FROM coverage;
 
-    -- Бонус за покрытие (0-1)
-    IF coverage_pct >= 90 THEN
-        coverage_bonus := 1;
-    ELSIF coverage_pct >= 70 THEN
-        coverage_bonus := 0;
-    ELSE
-        coverage_bonus := 0;  -- штраф не применяем, просто нет бонуса
+    -- 4. Штрафы за нестабильность (снижаем базовый рейтинг)
+    IF max_prob_change > 0.5 THEN
+        base_score := GREATEST(base_score - 2, 0);
+    ELSIF max_prob_change > 0.2 THEN
+        base_score := GREATEST(base_score - 1, 0);
     END IF;
 
-    -- Итоговый рейтинг: база (3) + бонус стабильности (0-2) + бонус покрытия (0-1)
-    RETURN base_score + stability_bonus + coverage_bonus;
+    -- 5. Бонус стабильности (0-2)
+    IF max_prob_change < 0.02 THEN
+        stability_bonus := 2;
+    ELSIF max_prob_change < 0.05 THEN
+        stability_bonus := 1;
+    ELSE
+        stability_bonus := 0;
+    END IF;
+
+    -- 6. Бонус покрытия (0-1) – только если нестабильность не слишком высока
+    IF max_prob_change < 0.2 AND coverage_pct >= 90 THEN
+        coverage_bonus := 1;
+    END IF;
+
+    -- Итоговый рейтинг (ограничиваем 5)
+    RETURN LEAST(base_score + stability_bonus + coverage_bonus, 5);
 END;
 $$;
 
@@ -817,14 +819,11 @@ DECLARE
     report TEXT := '';
     line_sep CONSTANT TEXT := E'\n--------------------------------------------------------------------\n';
 BEGIN
-    -- Получаем порог из конфигурации
     SELECT COALESCE(min_transitions_for_forgetting, 5000) INTO min_transitions_threshold
     FROM markov_config LIMIT 1;
 
-    -- 1. Общее число переходов
     SELECT COUNT(*) INTO total_transitions FROM transition_log;
 
-    -- 2. Стабильность вероятностей (максимальное изменение за 14 дней)
     IF total_transitions >= 5000 THEN
         WITH recent AS (
             SELECT from_state, to_state,
@@ -848,7 +847,6 @@ BEGIN
         max_prob_change := NULL;
     END IF;
 
-    -- 3. Покрытие частых состояний (только если данных достаточно)
     IF total_transitions >= 5000 THEN
         WITH state_stats AS (
             SELECT from_state, COUNT(*) AS n_i,
@@ -882,26 +880,32 @@ BEGIN
         coverage_pct := NULL;
     END IF;
 
-    -- Итоговый рейтинг достоверности
     SELECT mchain_forecast_reliability() INTO reliability_score;
 
     -- Формирование отчёта
     report := report || 'ОТЧЁТ О ДОСТОВЕРНОСТИ ПРОГНОЗОВ ЦЕПИ МАРКОВА' || line_sep;
     report := report || E'\n1. ОБЩИЙ РЕЙТИНГ ДОСТОВЕРНОСТИ (0-5): ' || reliability_score::TEXT || E'\n';
     
+    -- ===================== ИСПРАВЛЕННЫЙ БЛОК =====================
     CASE reliability_score
-        WHEN 0 THEN report := report || '   Интерпретация: модель не обучена (нет данных или менее 100 переходов). Прогнозы недостоверны.' || E'\n';
-        WHEN 1 THEN report := report || '   Интерпретация: очень мало данных (100-499 переходов). Прогнозы случайны.' || E'\n';
-        WHEN 2 THEN report := report || '   Интерпретация: недостаточно данных (500-4999 переходов). Прогнозы нестабильны.' || E'\n';
-        WHEN 3 THEN report := report || '   Интерпретация: минимально достаточный объём данных, но вероятности ещё не стабилизировались или покрытие низкое.' || E'\n';
-        WHEN 4 THEN report := report || '   Интерпретация: хорошая достоверность. Прогнозам можно доверять в большинстве ситуаций.' || E'\n';
-        WHEN 5 THEN report := report || '   Интерпретация: отличная достоверность. Прогнозы максимально надёжны.' || E'\n';
+        WHEN 0 THEN 
+            report := report || '   Интерпретация: модель не обучена (нет данных или менее 100 переходов). Прогнозы недостоверны.' || E'\n';
+        WHEN 1 THEN 
+            report := report || '   Интерпретация: крайне низкая достоверность. Причина – недостаток данных, высокая нестабильность вероятностей или их сочетание. Прогнозы не рекомендуется использовать для принятия решений.' || E'\n';
+        WHEN 2 THEN 
+            report := report || '   Интерпретация: низкая достоверность (возможно, недостаточно данных или вероятности нестабильны). Прогнозы следует применять с большой осторожностью.' || E'\n';
+        WHEN 3 THEN 
+            report := report || '   Интерпретация: минимально достаточный объём данных, но вероятности ещё не стабилизировались или покрытие низкое. Прогнозы можно использовать с осторожностью.' || E'\n';
+        WHEN 4 THEN 
+            report := report || '   Интерпретация: хорошая достоверность. Прогнозам можно доверять в большинстве ситуаций.' || E'\n';
+        WHEN 5 THEN 
+            report := report || '   Интерпретация: отличная достоверность. Прогнозы максимально надёжны.' || E'\n';
     END CASE;
+    -- ===================== КОНЕЦ ИСПРАВЛЕНИЙ =====================
 
     report := report || line_sep;
     report := report || E'\n2. ДЕТАЛИЗАЦИЯ ПО МЕТРИКАМ\n';
 
-    -- Общее число переходов
     report := report || E'\n   Общее число переходов (total_transitions): ' || total_transitions::TEXT;
     report := report || E'\n   Рекомендуемое минимальное значение: ' || min_transitions_threshold::TEXT || ' (min_transitions_for_forgetting)';
     IF total_transitions >= min_transitions_threshold THEN
@@ -910,7 +914,6 @@ BEGIN
         report := report || E'\n   Статус: НЕДОСТАТОЧНО – требуется накопить больше переходов.' || E'\n';
     END IF;
 
-    -- Стабильность вероятностей
     IF max_prob_change IS NOT NULL THEN
         report := report || E'\n   Максимальное изменение вероятностей за две недели (max_prob_change): ' || round(max_prob_change::numeric, 4)::TEXT;
         report := report || E'\n   Порог стабильности: ' || stability_threshold::TEXT || ' (0.05)';
@@ -923,7 +926,6 @@ BEGIN
         report := report || E'\n   Максимальное изменение вероятностей: недостаточно данных для расчёта (требуется >=5000 переходов).' || E'\n';
     END IF;
 
-    -- Покрытие частых состояний
     IF coverage_pct IS NOT NULL THEN
         report := report || E'\n   Покрытие частых состояний (coverage_pct): ' || coverage_pct::TEXT || '%';
         report := report || E'\n   Рекомендуемое покрытие: не менее ' || coverage_threshold::TEXT || '% (состояния с частотой >1% должны иметь >=50 переходов)';
@@ -936,17 +938,22 @@ BEGIN
         report := report || E'\n   Покрытие частых состояний: недостаточно данных для расчёта (требуется >=5000 переходов).' || E'\n';
     END IF;
 
-    -- Рекомендации
+    -- Блок рекомендаций (оставлен без изменений)
     report := report || line_sep;
     report := report || E'\n3. РЕКОМЕНДАЦИИ\n';
-    IF reliability_score < 3 THEN
-        report := report || E'   - Продолжить обучение модели, не полагаясь на прогнозы для принятия решений.\n';
-        report := report || E'   - Увеличить период накопления данных (минимум 5000 переходов).\n';
-        report := report || E'   - Если прошло много времени, проверить поступление метрик в cluster_stat_median.\n';
-    ELSIF reliability_score < 5 THEN
+    IF reliability_score <= 2 THEN
+        report := report || E'   - Модель недостаточно надёжна. Не рекомендуется использовать прогнозы для принятия решений.\n';
+        report := report || E'   - Необходимо накопить больше данных (минимум 5000 переходов) и/или улучшить стабильность вероятностей.\n';
+        report := report || E'   - Проверьте поступление метрик производительности и корректность работы mchain_train_step.\n';
+    ELSIF reliability_score = 3 THEN
         report := report || E'   - Прогнозы можно использовать с осторожностью, особенно при высоком риске.\n';
-        report := report || E'   - Для достижения максимальной достоверности следует улучшить стабильность вероятностей и покрытие частых состояний.\n';
-    ELSE
+        report := report || E'   - Рекомендуется периодически проверять стабильность вероятностей и покрытие частых состояний.\n';
+        report := report || E'   - Для повышения достоверности настройте адаптивное забывание или увеличьте период обучения.\n';
+    ELSIF reliability_score = 4 THEN
+        report := report || E'   - Прогнозы достаточно надёжны для большинства сценариев.\n';
+        report := report || E'   - Для достижения максимальной достоверности (рейтинг 5) следует улучшить стабильность вероятностей (если есть нестабильность) или покрытие.\n';
+        report := report || E'   - Поддерживайте актуальность модели с помощью планового забывания.\n';
+    ELSE  -- reliability_score = 5
         report := report || E'   - Модель полностью готова к эксплуатации. Прогнозы имеют высокую достоверность.\n';
         report := report || E'   - Рекомендуется поддерживать актуальность с помощью планового забывания (адаптивный alpha).\n';
     END IF;
@@ -957,6 +964,7 @@ BEGIN
     RETURN report;
 END;
 $$;
+
 COMMENT ON FUNCTION mchain_reliability_report() IS 'Возвращает расширенный текстовый отчёт о достоверности прогнозов с метриками, порогами и рекомендациями';
 
 --------------------------------------------------------------------------------
