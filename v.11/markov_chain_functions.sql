@@ -2951,7 +2951,7 @@ BEGIN
             AVG(ABS(predicted_risk - actual_outcome)) AS mae
         FROM predictions
     ),
-    -- Вычисление ROC-AUC через ранжирование (Mann-Whitney U)
+    -- Исправленный расчёт ROC-AUC: ранжирование по возрастанию риска
     roc_auc_calc AS (
         SELECT
             CASE
@@ -2966,20 +2966,20 @@ BEGIN
             END AS auc
         FROM (
             SELECT predicted_risk, actual_outcome,
-                   ROW_NUMBER() OVER (ORDER BY predicted_risk DESC) AS rank
+                   ROW_NUMBER() OVER (ORDER BY predicted_risk ASC) AS rank   -- ASC вместо DESC
             FROM predictions
         ) ranked
         WHERE actual_outcome IN (0,1)
     ),
-    -- Precision и Recall при пороге 0.5
+    -- Исправленный расчёт Precision/Recall: COUNT(*) FILTER с COALESCE
     pr_at_05 AS (
         SELECT
-            SUM(CASE WHEN predicted_risk >= 0.5 AND actual_outcome = 1 THEN 1 ELSE 0 END) AS tp,
-            SUM(CASE WHEN predicted_risk >= 0.5 AND actual_outcome = 0 THEN 1 ELSE 0 END) AS fp,
-            SUM(CASE WHEN predicted_risk < 0.5 AND actual_outcome = 1 THEN 1 ELSE 0 END) AS fn
+            COALESCE(COUNT(*) FILTER (WHERE predicted_risk >= 0.5 AND actual_outcome = 1), 0) AS tp,
+            COALESCE(COUNT(*) FILTER (WHERE predicted_risk >= 0.5 AND actual_outcome = 0), 0) AS fp,
+            COALESCE(COUNT(*) FILTER (WHERE predicted_risk < 0.5 AND actual_outcome = 1), 0) AS fn
         FROM predictions
     ),
-    -- Калибровка (10 бинов по 0.1)
+    -- Калибровка: 10 бинов, обрезаем риск до <1, чтобы избежать бина [1.0, 1.1)
     calib AS (
         SELECT jsonb_agg(
             jsonb_build_object(
@@ -3000,7 +3000,7 @@ BEGIN
                 COUNT(*) AS cnt
             FROM (
                 SELECT
-                    WIDTH_BUCKET(predicted_risk, 0, 1, 10) AS bin,
+                    WIDTH_BUCKET(LEAST(predicted_risk, 0.999999), 0, 1, 10) AS bin,
                     predicted_risk,
                     actual_outcome
                 FROM predictions
@@ -3012,8 +3012,8 @@ BEGIN
     SELECT
         s.incident_rate, s.avg_risk, s.brier, s.log_loss, s.mae,
         COALESCE(a.auc, 0) AS roc_auc,
-        CASE WHEN (p.tp+p.fp) > 0 THEN p.tp/(p.tp+p.fp) ELSE 0 END AS precision,
-        CASE WHEN (p.tp+p.fn) > 0 THEN p.tp/(p.tp+p.fn) ELSE 0 END AS recall,
+        CASE WHEN (p.tp+p.fp) > 0 THEN p.tp::REAL / (p.tp+p.fp) ELSE 0 END AS precision,
+        CASE WHEN (p.tp+p.fn) > 0 THEN p.tp::REAL / (p.tp+p.fn) ELSE 0 END AS recall,
         c.calib
     INTO v_incident_rate, v_avg_risk, v_brier, v_log_loss, v_mae,
          v_roc_auc, v_precision, v_recall, v_calib
@@ -3023,7 +3023,7 @@ BEGIN
     CROSS JOIN calib c;
 
     -- ------------------------------------------------------------------
-    -- 5. Формирование отчёта
+    -- 5. Формирование отчёта (без изменений)
     -- ------------------------------------------------------------------
     v_report := v_report || format('ОТЧЁТ КАЧЕСТВА ПРОГНОЗОВ (ГОРИЗОНТ %s МИНУТ)', v_horizon) || v_line_sep;
     v_report := v_report || 'Период: ' || v_start::DATE::TEXT || ' – ' || (v_end - INTERVAL '1 day')::DATE::TEXT || E'\n';
@@ -3080,7 +3080,6 @@ BEGIN
                 COALESCE(v_rec.notes, 'OK')) || E'\n';
         END LOOP;
     ELSE
-        -- Если в истории нет записей – вычисляем динамику на лету по сырым данным (с фильтром по горизонту)
         v_report := v_report || 'Источник: вычислено по сырым данным' || E'\n';
         v_report := v_report || 'Дата       | Brier  | Log-loss | ROC-AUC | Наблюдений' || E'\n';
         FOR v_rec IN
@@ -3115,7 +3114,7 @@ BEGIN
     END IF;
     v_report := v_report || v_sub_sep;
 
-    -- Диагностические сообщения (пропущенные расчёты из-за низкого рейтинга)
+    -- Диагностические сообщения (пропущенные расчёты)
     SELECT string_agg(format('  %s: %s', date_from::TEXT, notes), E'\n' ORDER BY date_from)
     INTO v_notes
     FROM mchain_quality_metrics_history
