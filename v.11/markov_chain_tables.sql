@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_tables.sql
--- version 11.1
+-- version 11.3
 --------------------------------------------------------------------------------
 -- Таблицы для расчета цепи Маркова 
 --------------------------------------------------------------------------------
@@ -42,7 +42,7 @@
   - mchain_quality_metrics_history – агрегированные метрики по дням
   - mchain_quality_errors - Ошибки прогноза
   
--- 11.1 
+-- 11
   - critical_states - Динамический список состояний, считающихся аварийными (поглощающими) для прогноза риска.
   
   
@@ -73,7 +73,10 @@ CREATE UNLOGGED TABLE IF NOT EXISTS markov_config (
     min_alpha REAL DEFAULT 0.01,                       -- Минимальный alpha (при очень редких инцидентах)
     incident_half_life_days REAL DEFAULT 7.0,          -- Период полураспада веса инцидента (дни)
     last_incident_time TIMESTAMPTZ DEFAULT NULL,       -- Время последнего аварийного перехода (обновляется триггером)
-    min_transitions_for_forgetting INT DEFAULT 5000    -- Минимальное число переходов для начала забывания
+    min_transitions_for_forgetting INT DEFAULT 5000,    -- Минимальное число переходов для начала забывания
+	
+	--Горизонт
+	forecast_horizon_minutes INT DEFAULT 30
 );
 COMMENT ON TABLE markov_config IS 'Конфигурация цепи Маркова (используется mchain_*)';
 COMMENT ON COLUMN markov_config.last_forget_time IS 'Время последнего забывания (для проверки interval_minute)';
@@ -88,6 +91,7 @@ COMMENT ON COLUMN markov_config.min_alpha IS ' Минимальный alpha (п�
 COMMENT ON COLUMN markov_config.incident_half_life_days IS ' Период полураспада веса инцидента (дни)';
 COMMENT ON COLUMN markov_config.last_incident_time IS 'Автоматически обновляется триггером при аварийном переходе';
 COMMENT ON COLUMN markov_config.min_transitions_for_forgetting IS 'Пока общее число переходов меньше этого порога, забывание не применяется (alpha=0)';
+COMMENT ON COLUMN markov_config.forecast_horizon_minutes IS 'Основной горизонт прогноза (минуты), используемый в collect и отчётах';
 
 -- Начальная инициализация (если таблица пуста)
 INSERT INTO markov_config (last_forget_time) VALUES (now()) ON CONFLICT DO NOTHING;
@@ -218,7 +222,8 @@ CREATE TABLE prediction_log (
     -- Поля, заполняемые позже (при обновлении исходов)
     actual_outcome     SMALLINT DEFAULT NULL,   -- 1 – инцидент произошёл в окне, 0 – нет, NULL – ещё не известно
     first_incident_time TIMESTAMPTZ DEFAULT NULL,
-    incident_count     SMALLINT DEFAULT 0
+    incident_count     SMALLINT DEFAULT 0,
+	horizon_minutes INT DEFAULT 30
 );
 
 -- Индексы для быстрых обновлений и отчётов
@@ -227,6 +232,7 @@ CREATE INDEX idx_outcome_null ON prediction_log (actual_outcome) WHERE actual_ou
 CREATE INDEX idx_outcome_actual ON prediction_log (actual_outcome);
 
 COMMENT ON TABLE prediction_log IS 'Журнал всех прогнозов';
+COMMENT ON COLUMN prediction_log.horizon_minutes IS 'Горизонт прогноза в минутах (фиксированное значение для всех записей после перехода на 30 мин)';
 
 -- ============================================================================
 -- агрегированные метрики по дням
@@ -302,7 +308,7 @@ COMMENT ON TABLE mchain_quality_errors IS 'Ошибки прогноза';
 
 
 ----------------------------------------------------------------------------------
--- 11.1 Этап 2. Создание и заполнение таблицы критических состояний
+-- 11. Создание и заполнение таблицы критических состояний
 
 -- ============================================================================
 -- Динамический список состояний, считающихся аварийными (поглощающими) для прогноза риска.
