@@ -48,10 +48,8 @@
   - format_timestamptz_to_minute : Сервисная функция: форматирование TIMESTAMPTZ до минут (без секунд). Используется для вывода в сообщениях health_check и других отчётах.
 
   - **Прогнозирование риска**
+  - mchain_predict_risk_current_horizon : возвращает прогноз риска на горизонт, заданный в 
   - mchain_predict_risk_k_v2 :Вероятность хотя бы одного попадания в критическое множество за k шагов
-  - mchain_predict_risk_15min_v2 :  Прогноз риска аварии на ближайшие 15 минут
-  - mchain_predict_risk_30min_v2 :  Прогноз риска аварии на ближайшие 30 минут
-  - mchain_predict_risk_1hour_v2 :  Прогноз риска аварии на ближайший час
   
   - collect_prediction : Формирование прогноза с горизонтом из markov_config.forecast_horizon_minutes
   - update_prediction_outcomes : Обновление исходов для прогнозов, у которых истёк горизонт (из markov_config)
@@ -1202,28 +1200,17 @@ $$;
 COMMENT ON FUNCTION mchain_incident_transitions_report(TIMESTAMPTZ, TIMESTAMPTZ) IS 'Формирует отчёт о переходах в аварийные состояния (correlation<0, os_trend=-1) за указанный период. Объединяет сырую статистику (transition_log) и взвешенные частоты из текущей модели (markov_frequencies). По умолчанию – последние 7 дней. Безопасно обрабатывает отсутствие данных.';
 
 
---------------------------------------------------------------------------------
--- mchain_summary_report
+-- =============================================================================
+-- mchain_summary_report (версия 11.5)
 -- Сводный отчёт по состоянию цепи Маркова:
 --   - общая достоверность прогнозов (mchain_reliability_report)
 --   - анализ переходов в аварию за период (mchain_incident_transitions_report)
---   - параметры конфигурации (забывание, пороги)
---   - текущее состояние системы (если доступно)
+--   - параметры конфигурации (забывание, пороги, горизонт прогноза)
+--   - текущее состояние системы и прогноз риска на горизонт из markov_config
 -- Параметры:
 --   p_start TIMESTAMPTZ DEFAULT NULL – начало периода (по умолч. now() - interval '7 days')
 --   p_end   TIMESTAMPTZ DEFAULT NULL – конец периода (по умолч. now())
---------------------------------------------------------------------------------
---------------------------------------------------------------------------------
--- mchain_summary_report (версия 11.1)
--- Сводный отчёт по состоянию цепи Маркова:
---   - общая достоверность прогнозов (mchain_reliability_report)
---   - анализ переходов в аварию за период (mchain_incident_transitions_report)
---   - параметры конфигурации (забывание, пороги)
---   - текущее состояние системы и прогнозы риска (v2)
--- Параметры:
---   p_start TIMESTAMPTZ DEFAULT NULL – начало периода (по умолч. now() - interval '7 days')
---   p_end   TIMESTAMPTZ DEFAULT NULL – конец периода (по умолч. now())
---------------------------------------------------------------------------------
+-- =============================================================================
 CREATE OR REPLACE FUNCTION mchain_summary_report(
     p_start TIMESTAMPTZ DEFAULT NULL,
     p_end   TIMESTAMPTZ DEFAULT NULL
@@ -1243,6 +1230,8 @@ DECLARE
     v_report TEXT := '';
     v_line_sep CONSTANT TEXT := E'\n' || repeat('=', 68) || E'\n';
     v_sub_sep CONSTANT TEXT := E'\n' || repeat('-', 68) || E'\n';
+    v_horizon INT;
+    v_risk REAL;
 BEGIN
     -- Нормализация периода
     v_start := COALESCE(p_start, now() - INTERVAL '7 days');
@@ -1268,7 +1257,7 @@ BEGIN
     END;
 
     -- ========================================================================
-    -- 2. Конфигурация цепи Маркова
+    -- 2. Конфигурация цепи Маркова (включая горизонт прогноза)
     -- ========================================================================
     SELECT 
         adaptive_forgetting_enabled,
@@ -1281,7 +1270,8 @@ BEGIN
         min_transitions_for_forgetting,
         last_forget_time,
         last_incident_time,
-        transition_log_retention_days
+        transition_log_retention_days,
+        forecast_horizon_minutes
     INTO v_config
     FROM markov_config LIMIT 1;
 
@@ -1330,31 +1320,27 @@ BEGIN
     v_report := v_report || '   Интервал забывания (минут): ' || v_config.interval_minute::TEXT || E'\n';
     v_report := v_report || '   Порог переходов для забывания: ' || v_config.min_transitions_for_forgetting::TEXT || E'\n';
     v_report := v_report || '   Глубина хранения transition_log (дней): ' || v_config.transition_log_retention_days::TEXT || E'\n';
+    v_report := v_report || '   Горизонт прогноза (минут): ' || COALESCE(v_config.forecast_horizon_minutes::TEXT, '30 (по умолчанию)') || E'\n';
     v_report := v_report || '   Последнее забывание: ' || COALESCE(format_timestamptz_to_minute(v_config.last_forget_time), 'никогда') || E'\n';
     v_report := v_report || '   Последний инцидент: ' || COALESCE(format_timestamptz_to_minute(v_config.last_incident_time), 'не зафиксирован') || E'\n';
 
-    -- Блок: Текущее состояние и прогнозы риска (восстановлен с v2)
+    -- Блок: Текущее состояние и прогноз риска (с использованием единого горизонта)
     v_report := v_report || v_sub_sep;
-    v_report := v_report || E'\n2. ТЕКУЩЕЕ СОСТОЯНИЕ СИСТЕМЫ И ПРОГНОЗЫ РИСКА' || E'\n';
+    v_report := v_report || E'\n2. ТЕКУЩЕЕ СОСТОЯНИЕ СИСТЕМЫ И ПРОГНОЗ РИСКА' || E'\n';
     v_report := v_report || '   State ID: ' || COALESCE(v_current_state_id::TEXT, 'неизвестно') || E'\n';
     v_report := v_report || '   Параметры: ' || v_current_desc || E'\n';
 
-    -- Прогнозы риска с использованием v2-функций
+    -- Прогноз риска на горизонт из конфигурации
     BEGIN
-        DECLARE
-            risk15 REAL;
-            risk30 REAL;
-            risk60 REAL;
-        BEGIN
-            risk15 := mchain_predict_risk_15min_v2();
-            risk30 := mchain_predict_risk_30min_v2();
-            risk60 := mchain_predict_risk_1hour_v2();
-            v_report := v_report || '   Прогноз риска на 15 мин: ' || COALESCE(risk15::TEXT, 'н/д') || E'\n';
-            v_report := v_report || '   Прогноз риска на 30 мин: ' || COALESCE(risk30::TEXT, 'н/д') || E'\n';
-            v_report := v_report || '   Прогноз риска на 60 мин: ' || COALESCE(risk60::TEXT, 'н/д') || E'\n';
-        END;
+        v_horizon := COALESCE(v_config.forecast_horizon_minutes, 30);
+        IF v_current_state_id IS NOT NULL THEN
+            v_risk := mchain_predict_risk_k_v2(v_current_state_id, v_horizon);
+            v_report := v_report || '   Прогноз риска на ' || v_horizon || ' мин: ' || COALESCE(v_risk::TEXT, 'н/д') || E'\n';
+        ELSE
+            v_report := v_report || '   Прогноз риска: недоступен (текущее состояние не определено)' || E'\n';
+        END IF;
     EXCEPTION WHEN OTHERS THEN
-        v_report := v_report || '   Прогнозы риска недоступны (' || SQLERRM || ')' || E'\n';
+        v_report := v_report || '   Прогноз риска недоступен (' || SQLERRM || ')' || E'\n';
     END;
 
     -- Блок: Отчёт о достоверности
@@ -1411,7 +1397,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION mchain_summary_report(TIMESTAMPTZ, TIMESTAMPTZ) IS 'Сводный отчёт по цепи Маркова: достоверность, переходы в аварию (на основе critical_states), конфигурация, текущее состояние и прогнозы v2.';
+COMMENT ON FUNCTION mchain_summary_report(TIMESTAMPTZ, TIMESTAMPTZ) IS 'Сводный отчёт по цепи Маркова: достоверность, переходы в аварию (на основе critical_states), конфигурация (включая горизонт прогноза), текущее состояние и прогноз риска на горизонт из markov_config.';
 
 --------------------------------------------------------------------------------
 -- mchain_incident_state_detail_report
@@ -2574,6 +2560,11 @@ BEGIN
         RETURN 0.0;
     END IF;
 
+    -- Если текущее состояние критическое – вероятность попадания равна 1 (уже в множестве)
+    IF p_state_id = ANY(critical_ids) THEN
+        RETURN 1.0;
+    END IF;
+
     -- Инициализация вектора
     v := array_fill(0.0, ARRAY[total_states]);
     IF p_state_id BETWEEN 0 AND total_states - 1 THEN
@@ -2582,11 +2573,10 @@ BEGIN
         RETURN 0.0;
     END IF;
 
-    -- Итерации
+    -- Итерации (только для некритических стартовых состояний)
     FOR step IN 1..k LOOP
         v_new := array_fill(0.0, ARRAY[total_states]);
 
-        -- Умножение вектора на матрицу вероятностей
         FOR rec IN
             SELECT from_state, to_state, probability
             FROM markov_probabilities
@@ -2598,13 +2588,11 @@ BEGIN
 
         v := v_new;
 
-        -- Вычисляем вероятность оказаться в критическом состоянии на этом шаге
         FOR i IN 1..array_length(critical_ids, 1) LOOP
             risk := risk + v[critical_ids[i] + 1];
-            v[critical_ids[i] + 1] := 0.0;  -- обнуляем, чтобы не учитывать повторно
+            v[critical_ids[i] + 1] := 0.0;
         END LOOP;
 
-        -- Если риск достиг 1, можно прерваться
         IF risk >= 1.0 THEN
             RETURN 1.0;
         END IF;
@@ -2613,45 +2601,8 @@ BEGIN
     RETURN LEAST(risk, 1.0);
 END;
 $$;
+
 COMMENT ON FUNCTION mchain_predict_risk_k_v2( SMALLINT, INT ) IS 'Вероятность хотя бы одного попадания в критическое множество за k шагов';
-
-  
--- =============================================================================
--- Прогноз риска аварии на ближайшие 15 минут
--- =============================================================================
-CREATE OR REPLACE FUNCTION mchain_predict_risk_15min_v2()
-RETURNS REAL
-LANGUAGE sql
-STABLE
-AS $$
-    SELECT mchain_predict_risk_k_v2(mchain_get_current_state_id(), 15);
-$$;
-COMMENT ON FUNCTION mchain_predict_risk_15min_v2() IS 'Прогноз риска аварии на ближайшие 15 минут';
-
--- =============================================================================
--- Прогноз риска аварии на ближайшие 30 минут
--- =============================================================================
-CREATE OR REPLACE FUNCTION mchain_predict_risk_30min_v2()
-RETURNS REAL
-LANGUAGE sql
-STABLE
-AS $$
-    SELECT mchain_predict_risk_k_v2(mchain_get_current_state_id(), 30);
-$$;
-COMMENT ON FUNCTION mchain_predict_risk_30min_v2() IS 'Прогноз риска аварии на ближайшие 30 минут';
-
--- =============================================================================
--- Прогноз риска аварии на ближайший час
--- =============================================================================
-CREATE OR REPLACE FUNCTION mchain_predict_risk_1hour_v2()
-RETURNS REAL
-LANGUAGE sql
-STABLE
-AS $$
-    SELECT mchain_predict_risk_k_v2(mchain_get_current_state_id(), 60);
-$$;
-COMMENT ON FUNCTION mchain_predict_risk_1hour_v2() IS 'Прогноз риска аварии на ближайший час';
-
 
 -- =============================================================================
 -- Функция: compute_empirical_incident_risk
@@ -3208,3 +3159,43 @@ END;
 $$;
 
 COMMENT ON FUNCTION mchain_quality_report(DATE, DATE, INT) IS 'Формирует текстовый отчёт о качестве прогнозов риска за указанный период для заданного горизонта (по умолчанию из markov_config). По умолчанию – предыдущие 7 дней. Включает калибровку, метрики (Brier, log‑loss, ROC‑AUC, precision/recall), дневную динамику и рекомендации. Вероятности обрезаются снизу через GREATEST(..., 1e-15) для избежания log(0).';
+
+-- =============================================================================
+-- Функция: mchain_predict_risk_current_horizon
+-- Назначение: возвращает прогноз риска на горизонт, заданный в 
+--             markov_config.forecast_horizon_minutes (по умолчанию 30 минут).
+-- Использует текущее состояние системы и динамический список критических 
+-- состояний (critical_states).
+-- Аналог mchain_predict_risk_15min_v2, но горизонт берётся из конфигурации,
+-- что обеспечивает единообразие с collect_prediction и отчётами.
+-- Возвращает REAL – вероятность от 0 до 1, либо NULL, если текущее состояние 
+-- не определено или модель не обучена.
+-- =============================================================================
+CREATE OR REPLACE FUNCTION mchain_predict_risk_current_horizon()
+RETURNS REAL
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    curr_state SMALLINT;
+    horizon INT;
+BEGIN
+    -- Получаем горизонт из конфигурации
+    SELECT forecast_horizon_minutes INTO horizon FROM markov_config LIMIT 1;
+    IF horizon IS NULL THEN
+        horizon := 30;  -- значение по умолчанию, если не задано
+    END IF;
+
+    -- Получаем текущее состояние
+    curr_state := mchain_get_current_state_id();
+    IF curr_state IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    -- Вычисляем риск на указанное количество шагов (минут)
+    RETURN mchain_predict_risk_k_v2(curr_state, horizon);
+END;
+$$;
+
+COMMENT ON FUNCTION mchain_predict_risk_current_horizon() IS 
+'Прогноз риска на горизонт, заданный в markov_config.forecast_horizon_minutes (по умолчанию 30). Заменяет жёстко заданные mchain_predict_risk_15min_v2, mchain_predict_risk_30min_v2, mchain_predict_risk_1hour_v2, обеспечивая единый источник горизонта.';
