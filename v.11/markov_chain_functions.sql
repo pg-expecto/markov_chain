@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_functions.sql
--- version 11.3
+-- version 11.4
 /*
 - **Обучение цепи Маркова**
   - mchain_train_step :  Основной шаг обучения (вызов каждую минуту): получает состояние, логирует переход, обновляет цепь, вызывает плановое забывание
@@ -231,7 +231,10 @@ COMMENT ON FUNCTION mchain_train_step() IS 'Одношаговое обучен�
 -- на основе времени, прошедшего с последнего инцидента (таблица markov_config).
 -- Параметр alpha_override позволяет принудительно задать значение.
 --------------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION mchain_apply_forgetting(alpha_override REAL DEFAULT NULL)
+CREATE OR REPLACE FUNCTION mchain_apply_forgetting(
+    alpha_override REAL DEFAULT NULL,
+    p_max_alpha REAL DEFAULT 0.5
+)
 RETURNS VOID
 LANGUAGE plpgsql
 AS $$
@@ -240,6 +243,7 @@ DECLARE
     effective_alpha REAL;
     days_since REAL;
     is_sufficient BOOLEAN;
+    stability_factor REAL;
     details_text TEXT;
     err_context JSONB;
 BEGIN
@@ -249,22 +253,21 @@ BEGIN
     INTO cfg
     FROM markov_config LIMIT 1;
 
-    -- Если адаптивное забывание отключено глобально – ничего не делаем
     IF NOT cfg.adaptive_forgetting_enabled THEN
         RAISE DEBUG 'mchain_apply_forgetting: skipped because adaptive_forgetting_enabled = false';
         RETURN;
     END IF;
 
-    -- Проверяем, достаточно ли обучена модель для применения забывания
-    SELECT mchain_check_sufficiency() INTO is_sufficient;
+    -- ИСПРАВЛЕНИЕ: явный алиас для таблицы-функции
+    SELECT s.sufficient, s.stability_factor INTO is_sufficient, stability_factor
+    FROM mchain_check_sufficiency() AS s;
+
     IF NOT is_sufficient THEN
-        RAISE DEBUG 'mchain_apply_forgetting: skipped due to insufficient training data';
         INSERT INTO apply_forgetting_log (effective_alpha, adaptive_used, days_since_incident, alpha_override, details)
         VALUES (0.0, cfg.use_adaptive_alpha, NULL, alpha_override, 'Skipped - insufficient data');
         RETURN;
     END IF;
 
-    -- Расчёт эффективного alpha
     IF alpha_override IS NOT NULL THEN
         effective_alpha := alpha_override;
         details_text := format('alpha_override = %s', alpha_override);
@@ -285,14 +288,15 @@ BEGIN
         details_text := format('non-adaptive mode, config.alpha = %s', cfg.alpha);
     END IF;
 
+    effective_alpha := LEAST(effective_alpha * stability_factor, p_max_alpha);
+    details_text := details_text || format(', stability_factor=%s, effective_alpha_capped=%s', stability_factor, effective_alpha);
+
     IF effective_alpha <= 0.0 THEN
-        RAISE DEBUG 'mchain_apply_forgetting: skipped because effective_alpha <= 0';
         INSERT INTO apply_forgetting_log (effective_alpha, adaptive_used, days_since_incident, alpha_override, details)
         VALUES (0.0, cfg.use_adaptive_alpha, days_since, alpha_override, 'Skipped - alpha zero');
         RETURN;
     END IF;
 
-    -- Применяем забывание (оборачиваем в блок с обработкой ошибок)
     BEGIN
         UPDATE markov_frequencies
         SET frequency = frequency * (1.0 - effective_alpha)
@@ -306,7 +310,7 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
         err_context := jsonb_build_object('effective_alpha', effective_alpha, 'sqlstate', SQLSTATE);
         PERFORM mchain_log_error('mchain_apply_forgetting', 'Failed to apply forgetting', SQLERRM, NULL, err_context);
-        RAISE; -- перевыбрасываем, чтобы вызывающий знал о проблеме
+        RAISE;
     END;
 
     INSERT INTO apply_forgetting_log (effective_alpha, adaptive_used, days_since_incident, alpha_override, details)
@@ -316,7 +320,7 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION mchain_apply_forgetting(REAL) IS 'Применяет забывание (адаптивное или по конфигурации)';
+COMMENT ON FUNCTION mchain_apply_forgetting(REAL, REAL) IS 'Применяет забывание с учётом stability_factor и ограничением max_alpha.';
 
 --------------------------------------------------------------------------------
 -- mchain_check_sufficiency
@@ -326,16 +330,17 @@ COMMENT ON FUNCTION mchain_apply_forgetting(REAL) IS 'Применяет заб�
 --------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION mchain_check_sufficiency(
     min_transitions INT DEFAULT NULL,
-    max_prob_change REAL DEFAULT 0.05,
+    max_prob_change REAL DEFAULT 0.05,  -- не используется для sufficient, но оставляем для совместимости
     weeks_history INT DEFAULT 2
 )
-RETURNS BOOLEAN
+RETURNS TABLE (sufficient BOOLEAN, stability_factor REAL)
 LANGUAGE plpgsql
 AS $$
 DECLARE
     cfg_min_transitions INT;
     total_transitions BIGINT;
     max_change REAL;
+    v_stability_factor REAL := 1.0;
 BEGIN
     -- Получаем порог из конфигурации, если не передан явно
     IF min_transitions IS NULL THEN
@@ -344,15 +349,16 @@ BEGIN
         cfg_min_transitions := min_transitions;
     END IF;
 
-    -- 1. Проверка общего числа переходов
+    -- 1. Проверка общего числа переходов (единственное условие для sufficient)
     SELECT COUNT(*) INTO total_transitions FROM transition_log;
     IF total_transitions < cfg_min_transitions THEN
         RAISE DEBUG 'mchain_check_sufficiency: too few transitions (%)', total_transitions;
-        RETURN FALSE;
+        RETURN QUERY SELECT FALSE, 1.0;
+        RETURN;
     END IF;
 
-    -- 2. Проверка стабильности вероятностей (если достаточно данных для вычислений)
-    IF total_transitions >= 2 * cfg_min_transitions THEN
+    -- 2. Вычисляем max_prob_change (для stability_factor), если данных достаточно
+    IF total_transitions >= 5000 THEN  -- используем 5000 как порог для стабильности
         WITH recent AS (
             SELECT from_state, to_state,
                    COUNT(*)::REAL / SUM(COUNT(*)) OVER (PARTITION BY from_state) AS prob
@@ -368,20 +374,29 @@ BEGIN
             WHERE ts >= now() - (weeks_history/2 || ' weeks')::INTERVAL
             GROUP BY from_state, to_state
         )
-        SELECT MAX(ABS(COALESCE(r.prob, 0) - COALESCE(c.prob, 0))) INTO max_change
+        SELECT COALESCE(MAX(ABS(COALESCE(r.prob, 0) - COALESCE(c.prob, 0))), 0.0) INTO max_change
         FROM recent r
         FULL JOIN current c USING (from_state, to_state);
-
-        IF max_change > max_prob_change THEN
-            RAISE DEBUG 'mchain_check_sufficiency: probability change too high (%)', max_change;
-            RETURN FALSE;
-        END IF;
+    ELSE
+        max_change := 0.0; -- недостаточно данных для расчёта стабильности
     END IF;
 
-    RETURN TRUE;
+    -- 3. Определяем stability_factor на основе max_change
+    IF max_change <= 0.05 THEN
+        v_stability_factor := 1.0;
+    ELSIF max_change <= 0.2 THEN
+        v_stability_factor := 1.5;
+    ELSIF max_change <= 0.5 THEN
+        v_stability_factor := 2.0;
+    ELSE
+        v_stability_factor := 3.0;
+    END IF;
+
+    -- 4. Возвращаем результат
+    RETURN QUERY SELECT TRUE, v_stability_factor;
 END;
 $$;
-COMMENT ON FUNCTION mchain_check_sufficiency(INT, REAL, INT) IS 'Проверяет достаточность обучения (объём данных + стабильность вероятностей)';
+COMMENT ON FUNCTION mchain_check_sufficiency(INT, REAL, INT) IS 'Проверяет достаточность данных для забывания (только по объёму) и возвращает коэффициент нестабильности для адаптации alpha.';
 
 --------------------------------------------------------------------------------
 -- mchain_log_transition
@@ -772,7 +787,7 @@ AS $$
 DECLARE
     sufficient BOOLEAN;
 BEGIN
-    SELECT mchain_check_sufficiency() INTO sufficient;
+    SELECT sufficient INTO sufficient FROM mchain_check_sufficiency();
     IF sufficient THEN
         UPDATE markov_config SET adaptive_forgetting_enabled = true;
         RETURN 'Adaptive forgetting enabled (sufficient data).';
@@ -1691,10 +1706,10 @@ BEGIN
     -- 2.1 Достоверность прогнозов
     IF v_reliability = 0 THEN
         v_status := 'CRITICAL';
-        v_messages := v_messages || 'Модель не обучена (рейтинг 0)';
+        v_messages := array_append(v_messages, 'Модель не обучена (рейтинг 0)');
     ELSIF v_reliability < 3 AND v_reliability >= 0 THEN
         IF v_status != 'CRITICAL' THEN v_status := 'WARNING'; END IF;
-        v_messages := v_messages || 'Низкая достоверность (' || v_reliability || ')';
+        v_messages := array_append(v_messages, 'Низкая достоверность (' || v_reliability || ')');
     END IF;
 
     -- 2.2 Рост аварийных переходов
@@ -1702,10 +1717,10 @@ BEGIN
         v_growth_ratio := COALESCE(v_incident_pct_last, 0) / v_incident_pct_prev;
         IF v_growth_ratio > 3 THEN
             v_status := 'CRITICAL';
-            v_messages := v_messages || 'Рост аварий >3x (' || round(v_incident_pct_prev, 1) || '%→' || round(COALESCE(v_incident_pct_last, 0), 1) || '%)';
+            v_messages := array_append(v_messages, 'Рост аварий >3x (' || round(v_incident_pct_prev, 1) || '%→' || round(COALESCE(v_incident_pct_last, 0), 1) || '%)');
         ELSIF v_growth_ratio > 2 THEN
             IF v_status != 'CRITICAL' THEN v_status := 'WARNING'; END IF;
-            v_messages := v_messages || 'Рост аварий >2x (' || round(v_incident_pct_prev, 1) || '%→' || round(COALESCE(v_incident_pct_last, 0), 1) || '%)';
+            v_messages := array_append(v_messages, 'Рост аварий >2x (' || round(v_incident_pct_prev, 1) || '%→' || round(COALESCE(v_incident_pct_last, 0), 1) || '%)');
         END IF;
     END IF;
 
@@ -1714,7 +1729,7 @@ BEGIN
         SELECT COUNT(*) INTO v_recent_transitions FROM transition_log WHERE ts >= now() - INTERVAL '10 minutes';
         IF v_recent_transitions = 0 THEN
             v_status := 'CRITICAL';
-            v_messages := v_messages || 'Нет переходов за 10 мин';
+            v_messages := array_append(v_messages, 'Нет переходов за 10 мин');
         END IF;
     EXCEPTION WHEN OTHERS THEN
         NULL;
@@ -1725,7 +1740,7 @@ BEGIN
         SELECT EXISTS (SELECT 1 FROM markov_frequencies LIMIT 1) INTO v_has_frequencies;
         IF NOT v_has_frequencies THEN
             IF v_status != 'CRITICAL' THEN v_status := 'WARNING'; END IF;
-            v_messages := v_messages || 'Нет частот (модель не обучена)';
+            v_messages := array_append(v_messages, 'Нет частот (модель не обучена)');
         END IF;
     EXCEPTION WHEN OTHERS THEN
         NULL;
@@ -1736,7 +1751,7 @@ BEGIN
         SELECT interval_minute, last_forget_time INTO v_config FROM markov_config LIMIT 1;
         IF v_config.last_forget_time < now() - (v_config.interval_minute * 2 || ' minutes')::INTERVAL THEN
             IF v_status != 'CRITICAL' THEN v_status := 'WARNING'; END IF;
-            v_messages := v_messages || 'Забывание давно (>' || v_config.interval_minute * 2 || ' мин)';
+            v_messages := array_append(v_messages, 'Забывание давно (>' || v_config.interval_minute * 2 || ' мин)');
         END IF;
     EXCEPTION WHEN OTHERS THEN
         NULL;
