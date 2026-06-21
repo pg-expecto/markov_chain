@@ -1818,12 +1818,12 @@ COMMENT ON FUNCTION mchain_health_check() IS 'Проверяет состоян�
 --   - если TRUE: 3 (корр) × 3 (OS) × 3 (wait) = 27 групп.
 -- Источник: markov_probabilities (усреднение по состояниям внутри группы)
 -- Параметры:
---   p_use_weighted BOOLEAN DEFAULT FALSE – взвешивание по частоте исходных состояний
---   p_include_wait_trend BOOLEAN DEFAULT FALSE – включать ли тренд ожиданий в группировку
+--   p_use_weighted BOOLEAN DEFAULT TRUE – взвешивание по частоте исходных состояний
+--   p_include_wait_trend BOOLEAN DEFAULT TRUE – включать ли тренд ожиданий в группировку
 --------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION mchain_state_transition_matrix_report(
     p_use_weighted BOOLEAN DEFAULT FALSE,
-    p_include_wait_trend BOOLEAN DEFAULT FALSE
+    p_include_wait_trend BOOLEAN DEFAULT TRUE
 )
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -1988,7 +1988,9 @@ BEGIN
         END LOOP;
         v_report := v_report || v_row || E'\n';
     END LOOP;
-    
+-------------------------------------------------------------------------------------------	
+-- ВРЕМЕННО ОТКЛЮЧЕНО   
+/* 
     -- Дополнительно: переходы из текущего состояния (если определено)
     v_report := v_report || v_sub_sep;
     v_report := v_report || 'ПЕРЕХОДЫ ИЗ ТЕКУЩЕГО СОСТОЯНИЯ (если определено)' || E'\n';
@@ -2044,6 +2046,10 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
         v_report := v_report || 'Ошибка при получении текущего состояния: ' || SQLERRM || E'\n';
     END;
+*/	
+-- ВРЕМЕННО ОТКЛЮЧЕНО    	
+-------------------------------------------------------------------------------------------	
+
 
     DROP TABLE IF EXISTS matrix_agg;
     RETURN v_report;
