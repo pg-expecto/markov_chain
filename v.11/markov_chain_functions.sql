@@ -62,14 +62,22 @@
   --ОСНОВНЫЕ ОТЧЕТЫ
   - mchain_quality_report : Отчёт о качестве прогнозов для указанного горизонта (по умолчанию из markov_config)
   - mchain_summary_report :  Сводный отчёт по состоянию цепи Маркова mchain_reliability_report+mchain_incident_transitions_report
-  - mchain_health_check : Проверяет состояние цепи Маркова и возвращает статус (OK, WARNING, CRITICAL) !!!!!!
   - mchain_state_transition_matrix_report : Формирует матрицу переходов между укрупнёнными группами состояний. Источник: markov_probabilities (усреднение по состояниям внутри группы)
+  - mchain_health_check : Проверяет состояние цепи Маркова и возвращает статус (OK, WARNING, CRITICAL)   
   --ОСНОВНЫЕ ОТЧЕТЫ
   
   --ВСПОМОГАТЕЛЬНЫЕ ОТЧЕТЫ
   - mchain_incident_state_detail_report : Детализированный отчёт по каждому аварийному состоянию.
   - mchain_reliability_report : Возвращает расширенный текстовый отчёт о достоверности прогнозов с метриками, порогами и рекомендациями
   - mchain_incident_transitions_report : Анализ переходов в аварийные состояния 
+
+----------------------------------------------------------  
+- 12. Эмпирический подбор параметров адаптивного забывания 
+  -- evaluate_forgetting_params : Функция оценки качества для заданных параметров
+  -- mchain_predict_risk_k_v2_with_matrix : Функция для прогноза риска с заданной матрицей
+  -- optimize_forgetting_params : Функция оптимизации (поиск по сетке)
+- 12. Эмпирический подбор параметров адаптивного забывания 
+----------------------------------------------------------
   
   
   --ВСПОМОГАТЕЛЬНЫЕ ОТЧЕТЫ  
@@ -102,6 +110,10 @@
 
 -- # Расчёт суточных метрик в 02:00 (с явным указанием горизонта 30)
 -- 0 2 * * * psql -d expecto_db -U expecto_user -c "SELECT calculate_daily_quality_metrics(CURRENT_DATE - 1, 30);"
+
+-- #12. Эмпирический подбор параметров адаптивного забывания
+-- # Еженедельный подбор параметров забывания (воскресенье в 04:00)
+-- 0 4 * * 0 psql -d expecto_db -U expecto_user -c "SELECT optimize_forgetting_params();" >> /postgres/pg_expecto/sh/forgetting_optimization.log 2>&1
 
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
@@ -1822,7 +1834,7 @@ COMMENT ON FUNCTION mchain_health_check() IS 'Проверяет состоян�
 --   p_include_wait_trend BOOLEAN DEFAULT TRUE – включать ли тренд ожиданий в группировку
 --------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION mchain_state_transition_matrix_report(
-    p_use_weighted BOOLEAN DEFAULT FALSE,
+    p_use_weighted BOOLEAN DEFAULT TRUE,
     p_include_wait_trend BOOLEAN DEFAULT TRUE
 )
 RETURNS TEXT
@@ -3227,3 +3239,563 @@ $$;
 
 COMMENT ON FUNCTION mchain_predict_risk_current_horizon() IS 
 'Прогноз риска на горизонт, заданный в markov_config.forecast_horizon_minutes (по умолчанию 30). Заменяет жёстко заданные mchain_predict_risk_15min_v2, mchain_predict_risk_30min_v2, mchain_predict_risk_1hour_v2, обеспечивая единый источник горизонта.';
+
+-- =============================================================================
+-- 12. Эмпирический подбор параметров адаптивного забывания 
+-- =============================================================================
+-- evaluate_forgetting_params : Функция оценки качества для заданных параметров
+-- =============================================================================
+CREATE OR REPLACE FUNCTION evaluate_forgetting_params(
+    p_base_alpha REAL,
+    p_half_life REAL,
+    p_min_alpha REAL,
+    p_interval_min INT,
+    p_learn_start DATE,
+    p_learn_end DATE,
+    p_eval_start DATE,
+    p_eval_end DATE,
+    p_horizon INT DEFAULT NULL
+)
+RETURNS TABLE (
+    brier REAL,
+    log_loss REAL,
+    roc_auc REAL,
+    precision_at_05 REAL,
+    recall_at_05 REAL,
+    mae REAL,
+    total_predictions INT,
+    incident_rate REAL,
+    max_prob_change REAL,
+    coverage_pct INT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_horizon INT := COALESCE(p_horizon, (SELECT forecast_horizon_minutes FROM markov_config LIMIT 1), 30);
+    v_rec RECORD;
+    v_risk REAL;
+    v_total INT := 0;
+    v_incidents INT := 0;
+    v_brier_sum REAL := 0;
+    v_log_loss_sum REAL := 0;
+    v_mae_sum REAL := 0;
+
+    -- Для ROC-AUC (Mann-Whitney)
+    v_rank_sum REAL := 0;
+    v_pos_count INT := 0;
+    v_neg_count INT := 0;
+    v_all_risks REAL[] := '{}';
+    v_all_outcomes INT[] := '{}';
+    v_idx INT;
+
+    -- Для Precision/Recall
+    v_tp INT := 0;
+    v_fp INT := 0;
+    v_fn INT := 0;
+
+    -- Для max_prob_change
+    v_max_prob_change REAL := 0.0;
+
+    -- Для coverage_pct
+    v_total_transitions BIGINT;
+    v_coverage_pct INT := 0;
+
+    -- Вспомогательные переменные для матриц
+    v_matrix_table TEXT := 'tmp_prob';
+    v_mid_date DATE;
+BEGIN
+    -- ------------------------------------------
+    -- 1. Построить взвешенные частоты переходов
+    -- ------------------------------------------
+    
+	DROP TABLE IF EXISTS tmp_weighted_freq;
+    CREATE TEMP TABLE tmp_weighted_freq AS
+    WITH transitions AS (
+        SELECT from_state, to_state,
+               ts,
+               EXP(-(EXTRACT(EPOCH FROM (p_learn_end - ts)) / 86400.0) / p_half_life) AS weight
+        FROM transition_log
+        WHERE ts >= p_learn_start AND ts < p_learn_end
+    )
+    SELECT from_state, to_state, SUM(weight) AS frequency
+    FROM transitions
+    GROUP BY from_state, to_state;
+
+    -- Удаляем шум
+    DELETE FROM tmp_weighted_freq WHERE frequency < 1e-6;
+
+    -- Нормализуем → вероятности
+	
+    DROP TABLE IF EXISTS tmp_prob;
+    CREATE TEMP TABLE tmp_prob AS
+    SELECT from_state, to_state,
+           frequency / SUM(frequency) OVER (PARTITION BY from_state) AS probability
+    FROM tmp_weighted_freq;
+
+    -- Создаём индексы для ускорения
+    CREATE INDEX idx_tmp_prob_from ON tmp_prob (from_state);
+
+    -- ------------------------------------------
+    -- 2. Оценка прогнозов
+    -- ------------------------------------------
+    FOR v_rec IN
+        SELECT id, current_state_id, actual_outcome, predicted_risk AS original_risk
+        FROM prediction_log
+        WHERE prediction_time >= p_eval_start AND prediction_time < p_eval_end
+          AND actual_outcome IS NOT NULL
+          AND current_state_id IS NOT NULL
+          AND horizon_minutes = v_horizon
+    LOOP
+        -- Вычисляем риск с использованием взвешенной матрицы
+        v_risk := mchain_predict_risk_k_v2_with_matrix(
+            v_rec.current_state_id,
+            v_horizon,
+            v_matrix_table
+        );
+
+        IF v_risk IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        v_total := v_total + 1;
+        v_incidents := v_incidents + v_rec.actual_outcome;
+
+        -- Brier
+        v_brier_sum := v_brier_sum + (v_risk - v_rec.actual_outcome)^2;
+
+        -- Log-loss
+        v_log_loss_sum := v_log_loss_sum + CASE
+            WHEN v_rec.actual_outcome = 1 THEN -ln(GREATEST(v_risk, 1e-15))
+            ELSE -ln(GREATEST(1 - v_risk, 1e-15))
+        END;
+
+        -- MAE
+        v_mae_sum := v_mae_sum + ABS(v_risk - v_rec.actual_outcome);
+
+        -- Для Precision/Recall
+        IF v_risk >= 0.5 THEN
+            IF v_rec.actual_outcome = 1 THEN
+                v_tp := v_tp + 1;
+            ELSE
+                v_fp := v_fp + 1;
+            END IF;
+        ELSE
+            IF v_rec.actual_outcome = 1 THEN
+                v_fn := v_fn + 1;
+            END IF;
+        END IF;
+
+        -- Для ROC-AUC (накапливаем массивы)
+        v_all_risks := array_append(v_all_risks, v_risk);
+        v_all_outcomes := array_append(v_all_outcomes, v_rec.actual_outcome);
+    END LOOP;
+
+    -- Если нет прогнозов, возвращаем NULL
+    IF v_total = 0 THEN
+        RETURN;
+    END IF;
+
+    -- ------------------------------------------
+    -- 3. Вычисление метрик
+    -- ------------------------------------------
+    -- Brier, Log-loss, MAE, incident_rate
+    brier := v_brier_sum / v_total;
+    log_loss := v_log_loss_sum / v_total;
+    mae := v_mae_sum / v_total;
+    incident_rate := v_incidents::REAL / v_total;
+    total_predictions := v_total;
+
+    -- Precision & Recall
+    precision_at_05 := CASE WHEN (v_tp + v_fp) > 0 THEN v_tp::REAL / (v_tp + v_fp) ELSE 0 END;
+    recall_at_05 := CASE WHEN (v_tp + v_fn) > 0 THEN v_tp::REAL / (v_tp + v_fn) ELSE 0 END;
+
+    -- ROC-AUC (Mann-Whitney)
+    IF array_length(v_all_outcomes, 1) > 0 THEN
+        -- Подсчёт числа положительных и отрицательных
+        SELECT COUNT(*) INTO v_pos_count FROM unnest(v_all_outcomes) WHERE unnest = 1;
+        SELECT COUNT(*) INTO v_neg_count FROM unnest(v_all_outcomes) WHERE unnest = 0;
+
+        IF v_pos_count > 0 AND v_neg_count > 0 THEN
+            -- Сортируем по убыванию риска, вычисляем ранги
+            WITH ranked AS (
+                SELECT unnest(v_all_risks) AS risk,
+                       unnest(v_all_outcomes) AS outcome,
+                       ROW_NUMBER() OVER (ORDER BY unnest(v_all_risks) DESC) AS rank
+            )
+            SELECT SUM(CASE WHEN outcome = 1 THEN rank ELSE 0 END) INTO v_rank_sum
+            FROM ranked;
+
+            roc_auc := (v_rank_sum - (v_pos_count * (v_pos_count + 1) / 2.0)) / (v_pos_count * v_neg_count);
+        ELSE
+            roc_auc := NULL;
+        END IF;
+    ELSE
+        roc_auc := NULL;
+    END IF;
+
+    -- ------------------------------------------
+    -- 4. Вычисление max_prob_change (стабильность)
+    -- ------------------------------------------
+    -- Разделим обучающий период пополам и построим две матрицы
+    v_mid_date := p_learn_start + (p_learn_end - p_learn_start) / 2;
+
+	
+    DROP TABLE IF EXISTS tmp_prob_first;
+    CREATE TEMP TABLE tmp_prob_first AS
+    WITH freq AS (
+        SELECT from_state, to_state, SUM(1.0) AS cnt
+        FROM transition_log
+        WHERE ts >= p_learn_start AND ts < v_mid_date
+        GROUP BY from_state, to_state
+    )
+    SELECT from_state, to_state,
+           cnt / SUM(cnt) OVER (PARTITION BY from_state) AS prob
+    FROM freq
+    WHERE cnt > 0;
+
+	
+    DROP TABLE IF EXISTS tmp_prob_second;
+    CREATE TEMP TABLE tmp_prob_second AS
+    WITH freq AS (
+        SELECT from_state, to_state, SUM(1.0) AS cnt
+        FROM transition_log
+        WHERE ts >= v_mid_date AND ts < p_learn_end
+        GROUP BY from_state, to_state
+    )
+    SELECT from_state, to_state,
+           cnt / SUM(cnt) OVER (PARTITION BY from_state) AS prob
+    FROM freq
+    WHERE cnt > 0;
+
+    -- Вычисляем максимальное абсолютное изменение вероятностей
+    SELECT COALESCE(MAX(ABS(COALESCE(a.prob, 0) - COALESCE(b.prob, 0))), 1.0)
+    INTO v_max_prob_change
+    FROM tmp_prob_first a
+    FULL JOIN tmp_prob_second b ON a.from_state = b.from_state AND a.to_state = b.to_state;
+
+    max_prob_change := v_max_prob_change;
+
+    -- ------------------------------------------
+    -- 5. Вычисление coverage_pct (покрытие частых состояний)
+    -- ------------------------------------------
+    SELECT COUNT(*) INTO v_total_transitions FROM transition_log WHERE ts >= p_learn_start AND ts < p_learn_end;
+
+    IF v_total_transitions > 0 THEN
+        WITH state_stats AS (
+            SELECT from_state, COUNT(*) AS n_i,
+                   COUNT(*)::REAL / v_total_transitions AS freq
+            FROM transition_log
+            WHERE ts >= p_learn_start AND ts < p_learn_end
+            GROUP BY from_state
+        ),
+        frequent_states AS (
+            SELECT from_state
+            FROM state_stats
+            WHERE freq > 0.01
+        ),
+        coverage AS (
+            SELECT
+                COUNT(*) AS total_frequent,
+                SUM(CASE WHEN n_i >= 50 THEN 1 ELSE 0 END) AS covered_frequent
+            FROM (
+                SELECT s.from_state, ss.n_i
+                FROM frequent_states s
+                CROSS JOIN LATERAL (
+                    SELECT COUNT(*) AS n_i FROM transition_log
+                    WHERE from_state = s.from_state
+                      AND ts >= p_learn_start AND ts < p_learn_end
+                ) ss
+            ) t
+        )
+        SELECT
+            CASE WHEN total_frequent = 0 THEN 100
+                 ELSE (covered_frequent * 100) / total_frequent
+            END INTO v_coverage_pct
+        FROM coverage;
+    ELSE
+        v_coverage_pct := 0;
+    END IF;
+
+    coverage_pct := v_coverage_pct;
+
+    -- Очистка временных таблиц
+	
+    DROP TABLE IF EXISTS tmp_weighted_freq;
+    DROP TABLE IF EXISTS tmp_prob;
+    DROP TABLE IF EXISTS tmp_prob_first;
+    DROP TABLE IF EXISTS tmp_prob_second;
+
+    RETURN NEXT;
+END;
+$$;
+COMMENT ON FUNCTION evaluate_forgetting_params IS 'Эмпирический подбор параметров адаптивного забывания';
+
+
+-- =====================================================================================
+-- mchain_predict_risk_k_v2_with_matrix : Функция для прогноза риска с заданной матрицей
+-- =====================================================================================
+CREATE OR REPLACE FUNCTION mchain_predict_risk_k_v2_with_matrix(
+    p_state_id SMALLINT,
+    k INT,
+    p_matrix_table TEXT
+)
+RETURNS REAL
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    total_states CONSTANT INT := 189;
+    v REAL[] := array_fill(0.0, ARRAY[total_states]);
+    v_new REAL[];
+    critical_ids SMALLINT[];
+    step INT;
+    risk REAL := 0.0;
+    rec RECORD;
+BEGIN
+    -- Получаем критичекие состояния (из critical_states)
+    SELECT array_agg(state_id) INTO critical_ids FROM critical_states;
+    IF critical_ids IS NULL OR array_length(critical_ids, 1) = 0 THEN
+        RETURN 0.0;
+    END IF;
+
+    IF p_state_id = ANY(critical_ids) THEN
+        RETURN 1.0;
+    END IF;
+
+    IF p_state_id BETWEEN 0 AND total_states - 1 THEN
+        v[p_state_id + 1] := 1.0;
+    ELSE
+        RETURN 0.0;
+    END IF;
+
+    FOR step IN 1..k LOOP
+        v_new := array_fill(0.0, ARRAY[total_states]);
+
+        FOR rec IN EXECUTE format('
+            SELECT from_state, to_state, probability
+            FROM %I
+        ', p_matrix_table) LOOP
+            IF v[rec.from_state + 1] > 0.0 THEN
+                v_new[rec.to_state + 1] := v_new[rec.to_state + 1] + v[rec.from_state + 1] * rec.probability;
+            END IF;
+        END LOOP;
+
+        v := v_new;
+
+        FOR i IN 1..array_length(critical_ids, 1) LOOP
+            risk := risk + v[critical_ids[i] + 1];
+            v[critical_ids[i] + 1] := 0.0;
+        END LOOP;
+
+        IF risk >= 1.0 THEN
+            RETURN 1.0;
+        END IF;
+    END LOOP;
+
+    RETURN LEAST(risk, 1.0);
+END;
+$$;
+COMMENT ON FUNCTION mchain_predict_risk_k_v2_with_matrix IS 'Функция для прогноза риска с заданной матрицей';
+
+
+
+-- =====================================================================================
+-- optimize_forgetting_params : Функция оптимизации (поиск по сетке)
+-- =====================================================================================
+/*
+Использование
+Запуск с выводом прогресса (по умолчанию):
+SELECT optimize_forgetting_params();
+
+Сухой запуск (только оценка, без обновления конфига):
+SELECT optimize_forgetting_params(p_dry_run => TRUE);
+
+Отключить детальный вывод:
+SELECT optimize_forgetting_params(p_verbose => FALSE);
+
+Принудительное обновление (даже без значительного улучшения):
+SELECT optimize_forgetting_params(p_force_update => TRUE);
+
+Настройка сетки параметров
+Для изменения диапазонов поиска отредактируйте массивы в начале функции:
+v_alphas – возможные значения base_alpha (скорость забывания).
+v_halfs – возможные значения incident_half_life_days (период полураспада).
+v_mins – возможные значения min_alpha (минимальный коэффициент забывания).
+v_intervals – возможные значения interval_minute (период между применениями забывания).
+*/
+CREATE OR REPLACE FUNCTION optimize_forgetting_params(
+    p_dry_run BOOLEAN DEFAULT FALSE,
+    p_force_update BOOLEAN DEFAULT FALSE,
+    p_verbose BOOLEAN DEFAULT TRUE
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    -- Сетка параметров (легко настраивается)
+    v_alphas REAL[] := ARRAY[0.05, 0.1, 0.15, 0.2, 0.25];
+    v_halfs REAL[] := ARRAY[2, 4, 7, 10, 14];
+    v_mins REAL[] := ARRAY[0.005, 0.01, 0.015, 0.02];
+    v_intervals INT[] := ARRAY[60, 120, 180, 240];
+
+    v_base_alpha REAL;
+    v_half_life REAL;
+    v_min_alpha REAL;
+    v_interval INT;
+    v_learn_start DATE := CURRENT_DATE - 60;
+    v_learn_end DATE := CURRENT_DATE - 1;
+    v_eval_start DATE := CURRENT_DATE - 30;
+    v_eval_end DATE := CURRENT_DATE - 1;
+    v_best_brier REAL := 999;
+    v_best_params JSONB;
+    v_result RECORD;
+    v_counter INT := 0;
+    v_total_combos INT;
+    v_log_id INT;
+    v_current_config RECORD;
+    v_improvement_threshold REAL := 0.01;
+BEGIN
+    -- Получаем текущие параметры для сравнения
+    SELECT base_alpha, incident_half_life_days, min_alpha, interval_minute
+    INTO v_current_config
+    FROM markov_config LIMIT 1;
+
+    -- Очистка старых записей (оставляем 90 дней)
+    DELETE FROM forgetting_optimization_log WHERE ts < CURRENT_DATE - 90;
+
+    -- Общее количество комбинаций
+    v_total_combos := array_length(v_alphas, 1) * array_length(v_halfs, 1) *
+                      array_length(v_mins, 1) * array_length(v_intervals, 1);
+
+    IF p_verbose THEN
+        RAISE NOTICE 'INFO: Starting optimization with % combinations', v_total_combos;
+    END IF;
+
+    -- Перебор параметров
+    FOR v_base_alpha IN (SELECT unnest(v_alphas))
+    LOOP
+        FOR v_half_life IN (SELECT unnest(v_halfs))
+        LOOP
+            FOR v_min_alpha IN (SELECT unnest(v_mins))
+            LOOP
+                FOR v_interval IN (SELECT unnest(v_intervals))
+                LOOP
+                    v_counter := v_counter + 1;
+
+                    -- Вывод прогресса каждые 10 комбинаций
+                    IF p_verbose AND v_counter % 10 = 0 THEN
+                        RAISE NOTICE 'INFO: Progress: %/% (%), current: base=%, half=%, min=%, interval=%, best Brier=%',
+                            v_counter, v_total_combos,
+                            round((v_counter::NUMERIC / v_total_combos * 100), 1),
+                            v_base_alpha, v_half_life, v_min_alpha, v_interval,
+                            round(v_best_brier::NUMERIC, 4);
+                    END IF;
+
+                    -- Оценка качества для текущих параметров
+                    SELECT * INTO v_result
+                    FROM evaluate_forgetting_params(
+                        v_base_alpha, v_half_life, v_min_alpha, v_interval,
+                        v_learn_start, v_learn_end,
+                        v_eval_start, v_eval_end
+                    );
+
+                    -- Пропускаем, если мало прогнозов
+                    IF v_result.total_predictions < 50 THEN
+                        CONTINUE;
+                    END IF;
+
+                    -- Запись в лог
+                    INSERT INTO forgetting_optimization_log (
+                        base_alpha, half_life, min_alpha, interval_minute,
+                        period_start, period_end, eval_start, eval_end,
+                        total_predictions, incident_rate,
+                        brier, log_loss, roc_auc, precision_at_05, recall_at_05, mae,
+                        max_prob_change, coverage_pct,
+                        notes
+                    ) VALUES (
+                        v_base_alpha, v_half_life, v_min_alpha, v_interval,
+                        v_learn_start, v_learn_end, v_eval_start, v_eval_end,
+                        v_result.total_predictions, v_result.incident_rate,
+                        v_result.brier, v_result.log_loss, v_result.roc_auc,
+                        v_result.precision_at_05, v_result.recall_at_05, v_result.mae,
+                        v_result.max_prob_change, v_result.coverage_pct,
+                        'grid_search'
+                    ) RETURNING id INTO v_log_id;
+
+                    -- Обновляем лучший результат
+                    IF v_result.brier < v_best_brier THEN
+                        v_best_brier := v_result.brier;
+                        v_best_params := jsonb_build_object(
+                            'base_alpha', v_base_alpha,
+                            'half_life', v_half_life,
+                            'min_alpha', v_min_alpha,
+                            'interval_minute', v_interval,
+                            'brier', v_result.brier,
+                            'log_loss', v_result.log_loss,
+                            'roc_auc', v_result.roc_auc,
+                            'max_prob_change', v_result.max_prob_change,
+                            'coverage_pct', v_result.coverage_pct
+                        );
+                        -- Отмечаем текущую запись как лучшую
+                        UPDATE forgetting_optimization_log SET is_best = TRUE WHERE id = v_log_id;
+                        UPDATE forgetting_optimization_log SET is_best = FALSE
+                        WHERE id != v_log_id AND is_best = TRUE;
+
+                        IF p_verbose THEN
+                            RAISE NOTICE 'INFO: New best found at combo %: Brier=%, params: base=%, half=%, min=%, interval=%',
+                                v_counter,
+                                round(v_result.brier::NUMERIC, 4),
+                                v_base_alpha, v_half_life, v_min_alpha, v_interval;
+                        END IF;
+                    END IF;
+                END LOOP;
+            END LOOP;
+        END LOOP;
+    END LOOP;
+
+    -- Итоговый вывод
+    IF p_verbose THEN
+        RAISE NOTICE 'INFO: Optimization finished. Total combinations evaluated: %', v_counter;
+        IF v_best_params IS NOT NULL THEN
+            RAISE NOTICE 'INFO:  Best params: base=%, half=%, min=%, interval=%, Brier=%, ROC-AUC=%',
+                v_best_params->>'base_alpha',
+                v_best_params->>'half_life',
+                v_best_params->>'min_alpha',
+                v_best_params->>'interval_minute',
+                round((v_best_params->>'brier')::NUMERIC, 4),
+                round((v_best_params->>'roc_auc')::NUMERIC, 4);
+        END IF;
+    END IF;
+
+    -- Обновление конфигурации (если не dry-run)
+    IF v_best_params IS NOT NULL AND NOT p_dry_run THEN
+        UPDATE markov_config SET
+            base_alpha = (v_best_params->>'base_alpha')::REAL,
+            incident_half_life_days = (v_best_params->>'half_life')::REAL,
+            min_alpha = (v_best_params->>'min_alpha')::REAL,
+            interval_minute = (v_best_params->>'interval_minute')::INT
+        WHERE TRUE;
+
+        RETURN format('Optimization completed. Updated config with params: base_alpha=%s, half_life=%s, min_alpha=%s, interval=%s, Brier=%s',
+            v_best_params->>'base_alpha',
+            v_best_params->>'half_life',
+            v_best_params->>'min_alpha',
+            v_best_params->>'interval_minute',
+            v_best_brier);
+    ELSIF p_dry_run THEN
+        RETURN format('Dry run completed. Best params found: base_alpha=%s, half_life=%s, min_alpha=%s, interval=%s, Brier=%s',
+            v_best_params->>'base_alpha',
+            v_best_params->>'half_life',
+            v_best_params->>'min_alpha',
+            v_best_params->>'interval_minute',
+            v_best_brier);
+    ELSE
+        RETURN 'Optimization failed: no valid parameters found.';
+    END IF;
+END;
+$$;
+
+COMMENT ON FUNCTION optimize_forgetting_params IS 'Функция оптимизации (поиск по сетке)';
+
+
+
