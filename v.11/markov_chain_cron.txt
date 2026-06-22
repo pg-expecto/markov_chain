@@ -14,6 +14,11 @@
 
 # Расчёт суточных метрик в 02:00 (с явным указанием горизонта 30)
 0 2 * * * psql -d expecto_db -U expecto_user -c "SELECT calculate_daily_quality_metrics(CURRENT_DATE - 1, 30);"
+
+#12. Эмпирический подбор параметров адаптивного забывания
+# Еженедельный подбор параметров забывания (воскресенье в 04:00)
+0 4 * * 0 psql -d expecto_db -U expecto_user -c "SELECT optimize_forgetting_params();" >> /postgres/pg_expecto/sh/forgetting_optimization.log 2>&1
+
 # Markov chain 
 #################################################################
 
