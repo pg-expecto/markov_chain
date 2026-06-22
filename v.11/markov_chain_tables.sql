@@ -347,3 +347,45 @@ VALUES
     (62, 'empirical_risk=0.1053, n=57'),
     (29, 'empirical_risk=0.1011, n=445')
 ON CONFLICT (state_id) DO UPDATE SET reason = EXCLUDED.reason, updated_at = now();
+
+----------------------------------------------------------------------------------
+-- 12. Эмпирический подбор параметров адаптивного забывания
+
+--------------------------------------------------------------
+-- Таблица для логирования экспериментов по подбору параметров
+--------------------------------------------------------------
+DROP TABLE IF EXISTS forgetting_optimization_log;
+-- Таблица для логирования экспериментов
+CREATE TABLE IF NOT EXISTS forgetting_optimization_log (
+    id SERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ DEFAULT now(),
+    base_alpha REAL,
+    half_life REAL,
+    min_alpha REAL,
+    interval_minute INT,
+    period_start DATE,
+    period_end DATE,
+    eval_start DATE,
+    eval_end DATE,
+    total_predictions INT,
+    incident_rate REAL,
+    brier REAL,
+    log_loss REAL,
+    roc_auc REAL,
+    precision_at_05 REAL,
+    recall_at_05 REAL,
+    mae REAL,
+    max_prob_change REAL,
+    coverage_pct INT,
+    is_best BOOLEAN DEFAULT FALSE,
+    notes TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_forgetting_optimization_log_ts ON forgetting_optimization_log(ts);
+CREATE INDEX IF NOT EXISTS idx_forgetting_optimization_log_is_best ON forgetting_optimization_log(is_best);
+COMMENT ON TABLE forgetting_optimization_log IS 'Журнал экспериментов по подбору параметров забывания';
+
+-- Таблица для логирования экспериментов по подбору параметров
+--------------------------------------------------------------
+
+
