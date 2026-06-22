@@ -1,2 +1,3 @@
 # История версий
- - 19.06.20026 : Версия 11.3 
+- 22.06.20026 : Версия 11.4 : [Эмпирический подбор параметров адаптивного забывания](https://github.com/pg-expecto/markov_chain/blob/main/v.11/functions/optimize_forgetting_params.md)
+- 19.06.20026 : Версия 11.3 
