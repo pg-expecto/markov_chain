@@ -1432,9 +1432,9 @@ BEGIN
     END IF;
     
     IF v_config.last_incident_time IS NOT NULL AND 
-       (now() - v_config.last_incident_time) > INTERVAL '30 days' AND
+       (now() - v_config.last_incident_time) > INTERVAL '14 days' AND
        v_config.use_adaptive_alpha THEN
-        v_report := v_report || '   → Давно не было инцидентов (>30 дней). alpha мог снизиться до минимума. Если система изменилась, выполните mchain_apply_forgetting(0.05) для ручной коррекции.' || E'\n';
+        v_report := v_report || '   → Давно не было инцидентов (>14 дней). alpha мог снизиться до минимума. Если система изменилась, выполните mchain_apply_forgetting(0.05) для ручной коррекции.' || E'\n';
     END IF;
     
     v_report := v_report || v_line_sep;
@@ -2664,7 +2664,7 @@ COMMENT ON FUNCTION mchain_predict_risk_k_v2( SMALLINT, INT ) IS 'Вероятн
 -- Использует таблицу performance_incident как источник инцидентов.
 -- Если таблица отсутствует, функция возвращает пустой результат с предупреждением.
 -- Параметры:
---   p_start           TIMESTAMPTZ  – начало периода анализа (по умолч. now() - interval '30 days')
+--   p_start           TIMESTAMPTZ  – начало периода анализа (по умолч. now() - interval '14 days')
 --   p_end             TIMESTAMPTZ  – конец периода (по умолч. now())
 --   p_min_transitions INT          – минимальное число переходов для включения состояния (по умолч. 10)
 --   p_interval_min    INT          – длина интервала в минутах (по умолч. 15)
@@ -2719,7 +2719,7 @@ DECLARE
     v_tbl_exists BOOLEAN;
     v_interval INTERVAL;
 BEGIN
-    v_start := COALESCE(p_start, now() - INTERVAL '30 days');
+    v_start := COALESCE(p_start, now() - INTERVAL '14 days');
     v_end   := COALESCE(p_end, now());
     IF v_start > v_end THEN
         RAISE EXCEPTION 'Начальная дата позже конечной.';
@@ -3769,9 +3769,9 @@ DECLARE
     v_max_trans_ts TIMESTAMPTZ;
     v_min_pred_ts TIMESTAMPTZ;
     v_max_pred_ts TIMESTAMPTZ;
-    v_learn_days INT := 30;   -- было 90
-    v_eval_days  INT := 14;   -- было 30
-    v_min_learn_days INT := 30; -- минимальная длительность обучения для проведения оптимизации
+    v_learn_days INT := 14;   
+    v_eval_days  INT := 14;   
+    v_min_learn_days INT := 14; -- минимальная длительность обучения для проведения оптимизации
     v_min_eval_preds INT := 50; -- минимальное число прогнозов с исходами для оценки
 
     v_best_brier REAL := 999;
@@ -3808,7 +3808,7 @@ BEGIN
     IF (v_learn_end - v_learn_start) < v_min_learn_days THEN
         RAISE NOTICE 'Недостаточно данных для обучения (доступно % дней, требуется минимум % дней). Оптимизация отменена.',
             (v_learn_end - v_learn_start), v_min_learn_days;
-        RETURN 'Optimization skipped: insufficient training data (need at least 30 days).';
+        RETURN 'Optimization skipped: insufficient training data (need at least 14 days).';
     END IF;
 
     IF (SELECT COUNT(*) FROM prediction_log
@@ -3979,7 +3979,7 @@ COMMENT ON FUNCTION optimize_forgetting_params IS 'Функция оптимиз
 Логика – рассчитывается аналогично внутренней логике mchain_check_sufficiency, но за несколько последних периодов (неделя, две недели, месяц). Результат – таблица с датами и значениями.
 
 Пример использования
-SELECT * FROM report_stability_trend(30) ORDER BY period_start;
+SELECT * FROM report_stability_trend(14) ORDER BY period_start;
 Результат покажет, как меняется стабильность модели во времени, и поможет оценить эффект от изменения параметров забывания.
 */
 
@@ -3993,7 +3993,7 @@ SELECT * FROM report_stability_trend(30) ORDER BY period_start;
 Результат – текстовый отчёт с таблицей, описанием столбцов и интерпретацией.
 
 Параметры:
-  p_lookback_days INT – сколько дней назад смотреть (по умолчанию 30)
+  p_lookback_days INT – сколько дней назад смотреть (по умолчанию 14)
 
 Возвращает:
   TEXT – отформатированный отчёт.
@@ -4459,12 +4459,12 @@ BEGIN
         l.total_predictions,
         l.is_best
     FROM forgetting_optimization_log l
-    WHERE l.ts >= CURRENT_DATE - 30
+    WHERE l.ts >= CURRENT_DATE - 14
     ORDER BY l.brier ASC NULLS LAST;
 END;
 $$;
 
-COMMENT ON FUNCTION report_forgetting_effectiveness() IS 'Возвращает результаты экспериментов по подбору параметров забывания за последние 30 дней, отсортированные по Brier score.';
+COMMENT ON FUNCTION report_forgetting_effectiveness() IS 'Возвращает результаты экспериментов по подбору параметров забывания за последние 14 дней, отсортированные по Brier score.';
 
 -- =============================================================================
 -- Функция: generate_full_analytical_report
