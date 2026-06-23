@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_tables.sql
--- version 11.5
+-- version 11.7
 --------------------------------------------------------------------------------
 -- Таблицы для расчета цепи Маркова 
 --------------------------------------------------------------------------------
@@ -62,8 +62,8 @@ CREATE UNLOGGED TABLE IF NOT EXISTS markov_config (
     interval_minute   INT        NOT NULL DEFAULT 180,       -- Интервал между плановыми забываниями (минуты)
 
     -- Глубина хранения журналов (используется функциями очистки)
-    transition_log_retention_days SMALLINT DEFAULT 21,          -- Срок хранения переходов
-	apply_forgetting_log_retention_days INT DEFAULT 21, -- Срок хранения журнала apply_forgetting_log
+    transition_log_retention_days SMALLINT DEFAULT 14,          -- Срок хранения переходов
+	apply_forgetting_log_retention_days INT DEFAULT 14, -- Срок хранения журнала apply_forgetting_log
 	
 	adaptive_forgetting_enabled BOOLEAN DEFAULT TRUE , 
 	
