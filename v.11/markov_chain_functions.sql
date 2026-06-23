@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_functions.sql
--- version 11.7
+-- version 11.8
 /*
 - **Обучение цепи Маркова**
   - mchain_train_step :  Основной шаг обучения (вызов каждую минуту): получает состояние, логирует переход, обновляет цепь, вызывает плановое забывание
@@ -124,7 +124,7 @@
 
 -- #12. Эмпирический подбор параметров адаптивного забывания
 -- # Еженедельный подбор параметров забывания (воскресенье в 04:00)
--- 0 4 * * 0 psql -d expecto_db -U expecto_user -c "SELECT optimize_forgetting_params();" >> /postgres/pg_expecto/sh/forgetting_optimization.log 2>&1
+-- 0 4 * * 0 /postgres/pg_expecto/sh/optimize_forgetting.sh false true 1 >> /postgres/pg_expecto/sh/forgetting_optimization.log 2>&1
 
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
@@ -3266,8 +3266,8 @@ CREATE OR REPLACE FUNCTION evaluate_forgetting_params(
     p_eval_start DATE,
     p_eval_end DATE,
     p_horizon INT DEFAULT NULL,
-    p_min_transitions INT DEFAULT 5,     -- минимальное число переходов для пары
-    p_smoothing REAL DEFAULT 0.01        -- коэффициент аддитивного сглаживания
+    p_min_transitions INT DEFAULT 5,
+    p_smoothing REAL DEFAULT 0.01
 )
 RETURNS TABLE (
     brier REAL,
@@ -3292,20 +3292,14 @@ DECLARE
     v_brier_sum REAL := 0;
     v_log_loss_sum REAL := 0;
     v_mae_sum REAL := 0;
-
-    -- Для ROC-AUC (Mann-Whitney)
     v_rank_sum REAL := 0;
     v_pos_count INT := 0;
     v_neg_count INT := 0;
     v_all_risks REAL[] := '{}';
     v_all_outcomes INT[] := '{}';
-
-    -- Для Precision/Recall
     v_tp INT := 0;
     v_fp INT := 0;
     v_fn INT := 0;
-
-    -- Для max_prob_change
     v_max_prob_change REAL := 0.0;
     v_mid1 DATE;
     v_mid2 DATE;
@@ -3315,12 +3309,8 @@ DECLARE
     v_seg_end2 DATE;
     v_seg_start3 DATE;
     v_seg_end3 DATE;
-
-    -- Для coverage_pct
     v_total_transitions BIGINT;
     v_coverage_pct INT := 0;
-
-    -- Вспомогательные переменные для матриц
     v_matrix_table TEXT := 'tmp_prob';
     v_total_states CONSTANT INT := 189;
     v_smooth_factor REAL;
@@ -3329,9 +3319,10 @@ BEGIN
 
     -- ------------------------------------------
     -- 1. Построить взвешенные частоты переходов с применением сглаживания
+    --    (добавлено ON COMMIT DROP для автоматического удаления при коммите)
     -- ------------------------------------------
     DROP TABLE IF EXISTS tmp_weighted_freq;
-    CREATE TEMP TABLE tmp_weighted_freq AS
+    CREATE TEMP TABLE tmp_weighted_freq ON COMMIT DROP AS
     WITH transitions AS (
         SELECT from_state, to_state,
                ts,
@@ -3347,7 +3338,7 @@ BEGIN
 
     -- Нормализуем → вероятности с аддитивным сглаживанием
     DROP TABLE IF EXISTS tmp_prob;
-    CREATE TEMP TABLE tmp_prob AS
+    CREATE TEMP TABLE tmp_prob ON COMMIT DROP AS
     SELECT from_state, to_state,
            (frequency + p_smoothing) / (SUM(frequency) OVER (PARTITION BY from_state) + v_smooth_factor) AS probability
     FROM tmp_weighted_freq;
@@ -3417,13 +3408,10 @@ BEGIN
     precision_at_05 := CASE WHEN (v_tp + v_fp) > 0 THEN v_tp::REAL / (v_tp + v_fp) ELSE 0 END;
     recall_at_05 := CASE WHEN (v_tp + v_fn) > 0 THEN v_tp::REAL / (v_tp + v_fn) ELSE 0 END;
 
-    -- ------------------------------------------
-    -- 4. Вычисление ROC-AUC (Mann-Whitney)
-    -- ------------------------------------------
+    -- ROC-AUC (Mann-Whitney)
     IF array_length(v_all_outcomes, 1) > 0 THEN
         SELECT COUNT(*) INTO v_pos_count FROM unnest(v_all_outcomes) WHERE unnest = 1;
         SELECT COUNT(*) INTO v_neg_count FROM unnest(v_all_outcomes) WHERE unnest = 0;
-
         IF v_pos_count > 0 AND v_neg_count > 0 THEN
             WITH data AS (
                 SELECT unnest(v_all_risks) AS risk,
@@ -3436,7 +3424,6 @@ BEGIN
             )
             SELECT SUM(CASE WHEN outcome = 1 THEN rank ELSE 0 END) INTO v_rank_sum
             FROM ranked;
-
             roc_auc := (v_rank_sum - (v_pos_count * (v_pos_count + 1) / 2.0)) / (v_pos_count * v_neg_count);
             IF roc_auc < 0 THEN roc_auc := 0; END IF;
             IF roc_auc > 1 THEN roc_auc := 1; END IF;
@@ -3448,10 +3435,8 @@ BEGIN
     END IF;
 
     -- ------------------------------------------
-    -- 5. Вычисление max_prob_change (стабильность) с фильтрацией редких переходов и сглаживанием
-    --    Используем разбиение на 3 сегмента
+    -- 4. max_prob_change (стабильность) – все вспомогательные таблицы также с ON COMMIT DROP
     -- ------------------------------------------
-    -- Определяем границы трёх сегментов
     v_mid1 := p_learn_start + (p_learn_end - p_learn_start) / 3;
     v_mid2 := p_learn_start + 2 * (p_learn_end - p_learn_start) / 3;
     v_seg_start1 := p_learn_start;
@@ -3461,18 +3446,16 @@ BEGIN
     v_seg_start3 := v_mid2;
     v_seg_end3   := p_learn_end;
 
-    -- Отбираем только пары с суммарным числом переходов >= p_min_transitions
     DROP TABLE IF EXISTS tmp_valid_pairs;
-    CREATE TEMP TABLE tmp_valid_pairs AS
+    CREATE TEMP TABLE tmp_valid_pairs ON COMMIT DROP AS
     SELECT from_state, to_state
     FROM transition_log
     WHERE ts >= p_learn_start AND ts < p_learn_end
     GROUP BY from_state, to_state
     HAVING COUNT(*) >= p_min_transitions;
 
-    -- Создаём таблицы частот для каждого сегмента (только для валидных пар)
     DROP TABLE IF EXISTS tmp_seg1_freq;
-    CREATE TEMP TABLE tmp_seg1_freq AS
+    CREATE TEMP TABLE tmp_seg1_freq ON COMMIT DROP AS
     SELECT v.from_state, v.to_state, COALESCE(t.cnt, 0) AS cnt
     FROM tmp_valid_pairs v
     LEFT JOIN (
@@ -3483,7 +3466,7 @@ BEGIN
     ) t ON v.from_state = t.from_state AND v.to_state = t.to_state;
 
     DROP TABLE IF EXISTS tmp_seg2_freq;
-    CREATE TEMP TABLE tmp_seg2_freq AS
+    CREATE TEMP TABLE tmp_seg2_freq ON COMMIT DROP AS
     SELECT v.from_state, v.to_state, COALESCE(t.cnt, 0) AS cnt
     FROM tmp_valid_pairs v
     LEFT JOIN (
@@ -3494,7 +3477,7 @@ BEGIN
     ) t ON v.from_state = t.from_state AND v.to_state = t.to_state;
 
     DROP TABLE IF EXISTS tmp_seg3_freq;
-    CREATE TEMP TABLE tmp_seg3_freq AS
+    CREATE TEMP TABLE tmp_seg3_freq ON COMMIT DROP AS
     SELECT v.from_state, v.to_state, COALESCE(t.cnt, 0) AS cnt
     FROM tmp_valid_pairs v
     LEFT JOIN (
@@ -3504,31 +3487,29 @@ BEGIN
         GROUP BY from_state, to_state
     ) t ON v.from_state = t.from_state AND v.to_state = t.to_state;
 
-    -- Общее число переходов из каждого from_state в каждом сегменте (по всем to_state)
     DROP TABLE IF EXISTS tmp_seg1_total;
-    CREATE TEMP TABLE tmp_seg1_total AS
+    CREATE TEMP TABLE tmp_seg1_total ON COMMIT DROP AS
     SELECT from_state, COUNT(*) AS total_cnt
     FROM transition_log
     WHERE ts >= v_seg_start1 AND ts < v_seg_end1
     GROUP BY from_state;
 
     DROP TABLE IF EXISTS tmp_seg2_total;
-    CREATE TEMP TABLE tmp_seg2_total AS
+    CREATE TEMP TABLE tmp_seg2_total ON COMMIT DROP AS
     SELECT from_state, COUNT(*) AS total_cnt
     FROM transition_log
     WHERE ts >= v_seg_start2 AND ts < v_seg_end2
     GROUP BY from_state;
 
     DROP TABLE IF EXISTS tmp_seg3_total;
-    CREATE TEMP TABLE tmp_seg3_total AS
+    CREATE TEMP TABLE tmp_seg3_total ON COMMIT DROP AS
     SELECT from_state, COUNT(*) AS total_cnt
     FROM transition_log
     WHERE ts >= v_seg_start3 AND ts < v_seg_end3
     GROUP BY from_state;
 
-    -- Вычисляем вероятности с аддитивным сглаживанием для каждой пары в каждом сегменте
     DROP TABLE IF EXISTS tmp_prob_seg1;
-    CREATE TEMP TABLE tmp_prob_seg1 AS
+    CREATE TEMP TABLE tmp_prob_seg1 ON COMMIT DROP AS
     SELECT
         f.from_state,
         f.to_state,
@@ -3537,7 +3518,7 @@ BEGIN
     LEFT JOIN tmp_seg1_total t ON f.from_state = t.from_state;
 
     DROP TABLE IF EXISTS tmp_prob_seg2;
-    CREATE TEMP TABLE tmp_prob_seg2 AS
+    CREATE TEMP TABLE tmp_prob_seg2 ON COMMIT DROP AS
     SELECT
         f.from_state,
         f.to_state,
@@ -3546,7 +3527,7 @@ BEGIN
     LEFT JOIN tmp_seg2_total t ON f.from_state = t.from_state;
 
     DROP TABLE IF EXISTS tmp_prob_seg3;
-    CREATE TEMP TABLE tmp_prob_seg3 AS
+    CREATE TEMP TABLE tmp_prob_seg3 ON COMMIT DROP AS
     SELECT
         f.from_state,
         f.to_state,
@@ -3554,9 +3535,8 @@ BEGIN
     FROM tmp_seg3_freq f
     LEFT JOIN tmp_seg3_total t ON f.from_state = t.from_state;
 
-    -- Объединяем и находим максимальную разницу между любыми двумя сегментами для каждой пары
     DROP TABLE IF EXISTS tmp_pair_diffs;
-    CREATE TEMP TABLE tmp_pair_diffs AS
+    CREATE TEMP TABLE tmp_pair_diffs ON COMMIT DROP AS
     SELECT
         COALESCE(p1.from_state, p2.from_state, p3.from_state) AS from_state,
         COALESCE(p1.to_state, p2.to_state, p3.to_state) AS to_state,
@@ -3573,17 +3553,14 @@ BEGIN
     FULL JOIN tmp_prob_seg3 p3 ON COALESCE(p1.from_state, p2.from_state) = p3.from_state
                               AND COALESCE(p1.to_state, p2.to_state) = p3.to_state;
 
-    -- Берём максимум по всем парам
     SELECT COALESCE(MAX(max_diff), 1.0) INTO v_max_prob_change
     FROM tmp_pair_diffs;
-
     max_prob_change := v_max_prob_change;
 
     -- ------------------------------------------
-    -- 6. Вычисление coverage_pct (покрытие частых состояний)
+    -- 5. coverage_pct
     -- ------------------------------------------
     SELECT COUNT(*) INTO v_total_transitions FROM transition_log WHERE ts >= p_learn_start AND ts < p_learn_end;
-
     IF v_total_transitions > 0 THEN
         WITH state_stats AS (
             SELECT from_state, COUNT(*) AS n_i,
@@ -3619,10 +3596,10 @@ BEGIN
     ELSE
         v_coverage_pct := 0;
     END IF;
-
     coverage_pct := v_coverage_pct;
 
-    -- Очистка временных таблиц
+    -- Явные DROP TABLE не обязательны, но оставлены для совместимости
+    -- (они не вызовут ошибки, так как таблицы ещё существуют до конца функции)
     DROP TABLE IF EXISTS tmp_weighted_freq;
     DROP TABLE IF EXISTS tmp_prob;
     DROP TABLE IF EXISTS tmp_valid_pairs;
@@ -3640,8 +3617,7 @@ BEGIN
     RETURN NEXT;
 END;
 $$;
-
-COMMENT ON FUNCTION evaluate_forgetting_params IS 'Эмпирический подбор параметров адаптивного забывания';
+COMMENT ON FUNCTION evaluate_forgetting_params IS 'Эмпирический подбор параметров адаптивного забывания. Все временные таблицы созданы с ON COMMIT DROP для автоматического освобождения блокировок.';
 
 
 -- =====================================================================================
@@ -3718,16 +3694,22 @@ COMMENT ON FUNCTION mchain_predict_risk_k_v2_with_matrix IS 'Функция дл
 /*
 Использование
 Запуск с выводом прогресса (по умолчанию):
-SELECT optimize_forgetting_params();
+CALL optimize_forgetting_params();
 
 Сухой запуск (только оценка, без обновления конфига):
 SELECT optimize_forgetting_params(p_dry_run => TRUE);
 
 Отключить детальный вывод:
-SELECT optimize_forgetting_params(p_verbose => FALSE);
+CALL optimize_forgetting_params(p_verbose => FALSE);
 
 Принудительное обновление (даже без значительного улучшения):
-SELECT optimize_forgetting_params(p_force_update => TRUE);
+CALL optimize_forgetting_params(p_force_update => TRUE);
+
+Запуск с периодическим коммитом после каждой итерации (рекомендуется для быстрого освобождения блокировок):
+CALL optimize_forgetting_params(p_commit_every => 1);
+Если требуется реже фиксировать транзакции для повышения производительности (но с риском повторной ошибки при большом числе комбинаций), можно увеличить p_commit_every, например, до 10:
+CALL optimize_forgetting_params(p_commit_every => 10);
+
 
 Настройка сетки параметров
 Для изменения диапазонов поиска отредактируйте массивы в начале функции:
@@ -3735,19 +3717,31 @@ v_alphas – возможные значения base_alpha (скорость з
 v_halfs – возможные значения incident_half_life_days (период полураспада).
 v_mins – возможные значения min_alpha (минимальный коэффициент забывания).
 v_intervals – возможные значения interval_minute (период между применениями забывания).
+
+ТЕСТ:
+
+DO $$
+DECLARE
+    res TEXT;
+BEGIN
+	CALL optimize_forgetting_params(res , p_dry_run => TRUE , p_verbose => TRUE ,p_commit_every => 1);
+    RAISE NOTICE 'Result: %', res;
+END $$;
+ТЕСТ:
+
 */
-CREATE OR REPLACE FUNCTION optimize_forgetting_params(
-    p_dry_run BOOLEAN DEFAULT FALSE,
-    p_force_update BOOLEAN DEFAULT FALSE,
-    p_verbose BOOLEAN DEFAULT TRUE,
-    p_min_transitions INT DEFAULT 5,      -- минимальное число переходов для пары (стабильность)
-    p_smoothing REAL DEFAULT 0.01         -- коэффициент аддитивного сглаживания
+CREATE OR REPLACE PROCEDURE optimize_forgetting_params(
+    INOUT result TEXT,                                   -- <-- первым, без DEFAULT
+    IN p_dry_run BOOLEAN DEFAULT FALSE,
+    IN p_force_update BOOLEAN DEFAULT FALSE,
+    IN p_verbose BOOLEAN DEFAULT TRUE,
+    IN p_min_transitions INT DEFAULT 5,
+    IN p_smoothing REAL DEFAULT 0.01,
+    IN p_commit_every INT DEFAULT 1                     -- COMMIT после каждых N итераций
 )
-RETURNS TEXT
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    -- Сетка параметров (легко настраивается)
     v_alphas REAL[] := ARRAY[0.05, 0.1, 0.15, 0.2, 0.25];
     v_halfs REAL[] := ARRAY[2, 4, 7, 10, 14];
     v_mins REAL[] := ARRAY[0.005, 0.01, 0.015, 0.02];
@@ -3758,21 +3752,19 @@ DECLARE
     v_min_alpha REAL;
     v_interval INT;
 
-    -- Периоды (будут вычислены динамически)
     v_learn_start DATE;
     v_learn_end DATE;
     v_eval_start DATE;
     v_eval_end DATE;
 
-    -- Вспомогательные переменные для динамического расчёта периодов
     v_min_trans_ts TIMESTAMPTZ;
     v_max_trans_ts TIMESTAMPTZ;
     v_min_pred_ts TIMESTAMPTZ;
     v_max_pred_ts TIMESTAMPTZ;
-    v_learn_days INT := 14;   
-    v_eval_days  INT := 14;   
-    v_min_learn_days INT := 14; -- минимальная длительность обучения для проведения оптимизации
-    v_min_eval_preds INT := 50; -- минимальное число прогнозов с исходами для оценки
+    v_learn_days INT := 14;
+    v_eval_days  INT := 14;
+    v_min_learn_days INT := 14;
+    v_min_eval_preds INT := 50;
 
     v_best_brier REAL := 999;
     v_best_params JSONB;
@@ -3782,17 +3774,15 @@ DECLARE
     v_log_id INT;
     v_current_config RECORD;
     v_improvement_threshold REAL := 0.01;
+    v_commit_counter INT := 0;
 BEGIN
     -- ========================================================================
-    -- 1. Динамическое определение периодов на основе фактических данных
+    -- 1. Динамическое определение периодов
     -- ========================================================================
-    -- Получаем границы переходов
     SELECT MIN(ts), MAX(ts) INTO v_min_trans_ts, v_max_trans_ts FROM transition_log;
-    -- Получаем границы прогнозов с известными исходами
     SELECT MIN(prediction_time), MAX(prediction_time) INTO v_min_pred_ts, v_max_pred_ts
     FROM prediction_log WHERE actual_outcome IS NOT NULL;
 
-    -- Вычисляем периоды с защитой от NULL
     v_learn_start := GREATEST(
         COALESCE(v_min_trans_ts, CURRENT_DATE - v_learn_days),
         CURRENT_DATE - v_learn_days
@@ -3804,11 +3794,11 @@ BEGIN
     )::DATE;
     v_eval_end := COALESCE(v_max_pred_ts, CURRENT_DATE - INTERVAL '1 day')::DATE;
 
-    -- Проверка достаточности данных
     IF (v_learn_end - v_learn_start) < v_min_learn_days THEN
         RAISE NOTICE 'Недостаточно данных для обучения (доступно % дней, требуется минимум % дней). Оптимизация отменена.',
             (v_learn_end - v_learn_start), v_min_learn_days;
-        RETURN 'Optimization skipped: insufficient training data (need at least 14 days).';
+        result := 'Optimization skipped: insufficient training data (need at least 14 days).';
+        RETURN;
     END IF;
 
     IF (SELECT COUNT(*) FROM prediction_log
@@ -3818,11 +3808,12 @@ BEGIN
             (SELECT COUNT(*) FROM prediction_log
              WHERE prediction_time BETWEEN v_eval_start AND v_eval_end
                AND actual_outcome IS NOT NULL), v_min_eval_preds;
-        RETURN 'Optimization skipped: insufficient evaluation data (need at least 50 predictions with outcomes).';
+        result := 'Optimization skipped: insufficient evaluation data (need at least 50 predictions with outcomes).';
+        RETURN;
     END IF;
 
     -- ========================================================================
-    -- 2. Получение текущей конфигурации и очистка лога
+    -- 2. Получение текущей конфигурации
     -- ========================================================================
     SELECT base_alpha, incident_half_life_days, min_alpha, interval_minute
     INTO v_current_config
@@ -3831,7 +3822,7 @@ BEGIN
     DELETE FROM forgetting_optimization_log WHERE ts < CURRENT_DATE - 90;
 
     -- ========================================================================
-    -- 3. Перебор комбинаций параметров
+    -- 3. Перебор комбинаций с периодическим COMMIT
     -- ========================================================================
     v_total_combos := array_length(v_alphas, 1) * array_length(v_halfs, 1) *
                       array_length(v_mins, 1) * array_length(v_intervals, 1);
@@ -3851,6 +3842,7 @@ BEGIN
                 FOR v_interval IN (SELECT unnest(v_intervals))
                 LOOP
                     v_counter := v_counter + 1;
+                    v_commit_counter := v_commit_counter + 1;
 
                     IF p_verbose AND v_counter % 10 = 0 THEN
                         RAISE NOTICE 'INFO: Progress: %/% (%), current: base=%, half=%, min=%, interval=%, best Brier=%',
@@ -3860,7 +3852,7 @@ BEGIN
                             round(v_best_brier::NUMERIC, 4);
                     END IF;
 
-                    -- Вызов функции оценки с динамическими периодами и новыми параметрами
+                    -- Вызов функции оценки
                     SELECT * INTO v_result
                     FROM evaluate_forgetting_params(
                         v_base_alpha, v_half_life, v_min_alpha, v_interval,
@@ -3872,10 +3864,14 @@ BEGIN
                     );
 
                     IF v_result.total_predictions < 50 THEN
+                        IF v_commit_counter >= p_commit_every THEN
+                            COMMIT;
+                            v_commit_counter := 0;
+                        END IF;
                         CONTINUE;
                     END IF;
 
-                    -- Запись в лог
+                    -- Логирование
                     INSERT INTO forgetting_optimization_log (
                         base_alpha, half_life, min_alpha, interval_minute,
                         period_start, period_end, eval_start, eval_end,
@@ -3918,10 +3914,21 @@ BEGIN
                                 v_base_alpha, v_half_life, v_min_alpha, v_interval;
                         END IF;
                     END IF;
+
+                    -- Периодический COMMIT
+                    IF v_commit_counter >= p_commit_every THEN
+                        COMMIT;
+                        v_commit_counter := 0;
+                    END IF;
                 END LOOP;
             END LOOP;
         END LOOP;
     END LOOP;
+
+    -- Фиксация остатков
+    IF v_commit_counter > 0 THEN
+        COMMIT;
+    END IF;
 
     -- ========================================================================
     -- 4. Итоговый вывод
@@ -3929,7 +3936,7 @@ BEGIN
     IF p_verbose THEN
         RAISE NOTICE 'INFO: Optimization finished. Total combinations evaluated: %', v_counter;
         IF v_best_params IS NOT NULL THEN
-            RAISE NOTICE 'INFO:  Best params: base=%, half=%, min=%, interval=%, Brier=%, ROC-AUC=%',
+            RAISE NOTICE 'INFO: Best params: base=%, half=%, min=%, interval=%, Brier=%, ROC-AUC=%',
                 v_best_params->>'base_alpha',
                 v_best_params->>'half_life',
                 v_best_params->>'min_alpha',
@@ -3950,26 +3957,26 @@ BEGIN
             interval_minute = (v_best_params->>'interval_minute')::INT
         WHERE TRUE;
 
-        RETURN format('Optimization completed. Updated config with params: base_alpha=%s, half_life=%s, min_alpha=%s, interval=%s, Brier=%s',
+        result := format('Optimization completed. Updated config with params: base_alpha=%s, half_life=%s, min_alpha=%s, interval=%s, Brier=%s',
             v_best_params->>'base_alpha',
             v_best_params->>'half_life',
             v_best_params->>'min_alpha',
             v_best_params->>'interval_minute',
             v_best_brier);
     ELSIF p_dry_run AND v_best_params IS NOT NULL THEN
-        RETURN format('Dry run completed. Best params found: base_alpha=%s, half_life=%s, min_alpha=%s, interval=%s, Brier=%s',
+        result := format('Dry run completed. Best params found: base_alpha=%s, half_life=%s, min_alpha=%s, interval=%s, Brier=%s',
             v_best_params->>'base_alpha',
             v_best_params->>'half_life',
             v_best_params->>'min_alpha',
             v_best_params->>'interval_minute',
             v_best_brier);
     ELSE
-        RETURN 'Optimization failed: no valid parameters found.';
+        result := 'Optimization failed: no valid parameters found.';
     END IF;
 END;
 $$;
 
-COMMENT ON FUNCTION optimize_forgetting_params IS 'Функция оптимизации (поиск по сетке)';
+COMMENT ON PROCEDURE optimize_forgetting_params IS 'Эмпирический подбор параметров адаптивного забывания с периодическим COMMIT. Параметр result возвращает итоговое сообщение.';
 
 -- ==========================================================
 -- Мониторинг стабильности вероятностей
@@ -4478,6 +4485,9 @@ COMMENT ON FUNCTION report_forgetting_effectiveness() IS 'Возвращает �
 --   p_end    DATE – конец периода (по умолчанию вчера)
 -- Возвращает: TEXT[] – каждая строка массива соответствует строке Markdown-отчёта.
 -- =============================================================================
+/*
+ psql -d expecto_db -U expecto_user -c "select unnest(generate_full_analytical_report())" > /tmp/full_analytical_report.txt
+*/
 CREATE OR REPLACE FUNCTION generate_full_analytical_report(
     p_start DATE DEFAULT CURRENT_DATE - INTERVAL '7 days',
     p_end   DATE DEFAULT CURRENT_DATE - INTERVAL '1 day'
@@ -4564,17 +4574,11 @@ BEGIN
     v_report_lines := array_append(v_report_lines, '');
     v_report_lines := array_append(v_report_lines, '## 4. Стабильность вероятностей (по 7‑дневным периодам)');
     BEGIN
-        SELECT report_stability_trend(v_lookback_days) INTO v_section_text;
-        -- Функция возвращает таблицу, но мы хотим текстовый отчёт. В текущей реализации она возвращает набор строк.
-        -- Чтобы получить читаемый текст, мы можем сами отформатировать результаты.
-        -- Создадим временную таблицу или используем курсор.
-        -- Перепишем: будем использовать report_stability_trend как возвращающую таблицу, и сформируем текст.
-        -- Для простоты: создадим локальную переменную и пройдём по записям.
         v_section_text := '| Период | max_prob_change | coverage_pct | total_transitions | stability_factor |' || E'\n' ||
                           '|--------|----------------|-------------|-------------------|------------------|' || E'\n';
         FOR v_rec IN
             SELECT period_start, period_end, max_prob_change, coverage_pct, total_transitions, stability_factor
-            FROM report_stability_trend(v_lookback_days)
+            FROM report_stability_trend(v_lookback_days) AS t(period_start DATE, period_end DATE, max_prob_change REAL, coverage_pct INT, total_transitions BIGINT, stability_factor REAL)
         LOOP
             v_section_text := v_section_text || format(
                 '| %s – %s | %s | %s | %s | %s |' || E'\n',
@@ -4589,6 +4593,7 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
         v_report_lines := array_append(v_report_lines, '⚠ Ошибка при получении стабильности: ' || SQLERRM);
     END;
+	
 
     -- ------------------------------------------------------------------
     -- 7. Секция: Скользящее качество прогнозов (report_quality_sliding)
