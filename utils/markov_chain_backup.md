@@ -232,7 +232,7 @@ $ ./markov_chain_backup.sh restore
 
 ## 📄 Лицензия и авторство
 
-Разработано Ринатом (markov_chain) в рамках проекта Expecto.  
+Разработано Ринатом (markov_chain) в рамках проекта [pg_expecto](https://github.com/pg-expecto/pg_expecto/tree/main).  
 Распространяется под лицензией Apache 2.0.  
 Версия 12.2.
 
