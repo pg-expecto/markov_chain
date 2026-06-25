@@ -364,23 +364,20 @@ DECLARE
     total_transitions BIGINT;
     max_change REAL;
     v_stability_factor REAL := 1.0;
-    min_freq_for_stability INT := 200;   -- порог частоты состояний для расчёта стабильности
+    min_freq_for_stability INT := 200;
 BEGIN
-    -- Получаем порог из конфигурации, если не передан явно
     IF min_transitions IS NULL THEN
         SELECT COALESCE(min_transitions_for_forgetting, 5000) INTO cfg_min_transitions FROM markov_config LIMIT 1;
     ELSE
         cfg_min_transitions := min_transitions;
     END IF;
 
-    -- 1. Проверка общего числа переходов (единственное условие для sufficient)
     SELECT COUNT(*) INTO total_transitions FROM transition_log;
     IF total_transitions < cfg_min_transitions THEN
-        RETURN QUERY SELECT FALSE, 1.0;
+        RETURN QUERY SELECT FALSE, 1.0::REAL;   -- ← исправлено
         RETURN;
     END IF;
 
-    -- 2. Вычисляем max_prob_change (для stability_factor), исключая критические и редкие состояния
     IF total_transitions >= 5000 THEN
         WITH frequent_states AS (
             SELECT from_state
@@ -415,7 +412,6 @@ BEGIN
         max_change := 0.0;
     END IF;
 
-    -- 3. Определяем stability_factor на основе max_change
     IF max_change <= 0.05 THEN
         v_stability_factor := 1.0;
     ELSIF max_change <= 0.2 THEN
@@ -426,7 +422,6 @@ BEGIN
         v_stability_factor := 3.0;
     END IF;
 
-    -- 4. Возвращаем результат
     RETURN QUERY SELECT TRUE, v_stability_factor;
 END;
 $$;
