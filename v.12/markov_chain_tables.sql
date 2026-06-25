@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_tables.sql
--- version 12.1
+-- version 12.2
 --------------------------------------------------------------------------------
 -- Таблицы для расчета цепи Маркова 
 --------------------------------------------------------------------------------
@@ -76,7 +76,9 @@ CREATE UNLOGGED TABLE IF NOT EXISTS markov_config (
     min_transitions_for_forgetting INT DEFAULT 5000,    -- Минимальное число переходов для начала забывания
 	
 	--Горизонт
-	forecast_horizon_minutes INT DEFAULT 30
+	forecast_horizon_minutes INT DEFAULT 30 ,
+	
+	min_freq_for_stability INT DEFAULT 200
 );
 COMMENT ON TABLE markov_config IS 'Конфигурация цепи Маркова (используется mchain_*)';
 COMMENT ON COLUMN markov_config.last_forget_time IS 'Время последнего забывания (для проверки interval_minute)';
@@ -92,6 +94,7 @@ COMMENT ON COLUMN markov_config.incident_half_life_days IS ' Период пол
 COMMENT ON COLUMN markov_config.last_incident_time IS 'Автоматически обновляется триггером при аварийном переходе';
 COMMENT ON COLUMN markov_config.min_transitions_for_forgetting IS 'Пока общее число переходов меньше этого порога, забывание не применяется (alpha=0)';
 COMMENT ON COLUMN markov_config.forecast_horizon_minutes IS 'Основной горизонт прогноза (минуты), используемый в collect и отчётах';
+COMMENT ON COLUMN markov_config.min_freq_for_stability IS 'Минимальное число переходов из состояния за анализируемый период для включения в расчёт стабильности вероятностей.';
 
 -- Начальная инициализация (если таблица пуста)
 INSERT INTO markov_config (last_forget_time) VALUES (now()) ON CONFLICT DO NOTHING;
