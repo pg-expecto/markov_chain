@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_functions.sql
--- version 12.1
+-- version 12.2
 /*
 - **Обучение цепи Маркова**
   - mchain_train_step :  Основной шаг обучения (вызов каждую минуту): получает состояние, логирует переход, обновляет цепь, вызывает плановое забывание
@@ -46,6 +46,7 @@
   - get_critical_states : Возвращает список аварийных состояний
   - get_critical_state_ids : Упрощённая версия – только state_id (для быстрого использования)
   - format_timestamptz_to_minute : Сервисная функция: форматирование TIMESTAMPTZ до минут (без секунд). Используется для вывода в сообщениях health_check и других отчётах.
+  - refresh_stability_threshold : Адаптивная настройка min_freq_for_stability
 
   - **Прогнозирование риска**
   - mchain_predict_risk_current_horizon : возвращает прогноз риска на горизонт, заданный в 
@@ -125,6 +126,9 @@
 -- #12. Эмпирический подбор параметров адаптивного забывания
 -- # Еженедельный подбор параметров забывания (воскресенье в 04:00)
 -- 0 4 * * 0 /postgres/pg_expecto/sh/optimize_forgetting.sh false true 1 >> /postgres/pg_expecto/sh/forgetting_optimization.log 2>&1
+
+-- # Еженедельная адаптивная настройка min_freq_for_stability (воскресенье в 01:00)
+-- 0 1 * * 0 psql -d expecto_db -U expecto_user -c "SELECT refresh_stability_threshold();"
 
 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 --------------------------------------------------------------------------------
@@ -364,8 +368,11 @@ DECLARE
     total_transitions BIGINT;
     max_change REAL;
     v_stability_factor REAL := 1.0;
-    min_freq_for_stability INT := 200;
+    v_min_freq INT;           -- переименовано
 BEGIN
+    SELECT mc.min_freq_for_stability INTO v_min_freq
+    FROM markov_config mc LIMIT 1;
+
     IF min_transitions IS NULL THEN
         SELECT COALESCE(min_transitions_for_forgetting, 5000) INTO cfg_min_transitions FROM markov_config LIMIT 1;
     ELSE
@@ -374,7 +381,7 @@ BEGIN
 
     SELECT COUNT(*) INTO total_transitions FROM transition_log;
     IF total_transitions < cfg_min_transitions THEN
-        RETURN QUERY SELECT FALSE, 1.0::REAL;   -- ← исправлено
+        RETURN QUERY SELECT FALSE, 1.0::REAL;
         RETURN;
     END IF;
 
@@ -384,7 +391,7 @@ BEGIN
             FROM transition_log
             WHERE ts >= now() - (weeks_history || ' weeks')::INTERVAL
             GROUP BY from_state
-            HAVING COUNT(*) >= min_freq_for_stability
+            HAVING COUNT(*) >= v_min_freq      -- используем переменную
         ),
         recent AS (
             SELECT from_state, to_state,
@@ -425,7 +432,6 @@ BEGIN
     RETURN QUERY SELECT TRUE, v_stability_factor;
 END;
 $$;
-
 COMMENT ON FUNCTION mchain_check_sufficiency(INT, REAL, INT) IS 'Проверяет достаточность данных для забывания (только по объёму) и возвращает коэффициент нестабильности для адаптации alpha. Исключает переходы в критические состояния и состояния с числом переходов < 200 за анализируемый период.';
 
 --------------------------------------------------------------------------------
@@ -707,11 +713,13 @@ DECLARE
     base_score INT := 0;
     stability_bonus INT := 0;
     coverage_bonus INT := 0;
-    min_freq_for_stability INT := 200;   -- порог частоты состояний для расчёта стабильности
+    v_min_freq INT;
 BEGIN
+    SELECT mc.min_freq_for_stability INTO v_min_freq
+    FROM markov_config mc LIMIT 1;
+
     SELECT COUNT(*) INTO total_transitions FROM transition_log;
 
-    -- 1. Базовая оценка по объёму данных (0-3)
     IF total_transitions < 100 THEN
         RETURN 0;
     ELSIF total_transitions < 500 THEN
@@ -722,19 +730,16 @@ BEGIN
         base_score := 3;
     END IF;
 
-    -- Если данных мало (<5000), возвращаем базовый рейтинг без учёта стабильности
     IF total_transitions < 5000 THEN
         RETURN base_score;
     END IF;
 
-    -- 2. Стабильность вероятностей (максимальное изменение за 14 дней)
-    -- Исключаем переходы в критические состояния и состояния с малым числом переходов
     WITH frequent_states AS (
         SELECT from_state
         FROM transition_log
         WHERE ts >= now() - INTERVAL '14 days'
         GROUP BY from_state
-        HAVING COUNT(*) >= min_freq_for_stability
+        HAVING COUNT(*) >= v_min_freq
     ),
     recent AS (
         SELECT from_state, to_state,
@@ -759,14 +764,13 @@ BEGIN
     FROM recent r
     FULL JOIN current c USING (from_state, to_state);
 
-    -- 3. Покрытие частых состояний (без изменений)
     WITH state_stats AS (
         SELECT from_state, COUNT(*) AS n_i,
                COUNT(*)::REAL / total_transitions AS freq
         FROM transition_log
         GROUP BY from_state
     ),
-    frequent_states AS (
+    frequent_states2 AS (
         SELECT from_state
         FROM state_stats
         WHERE freq > 0.01
@@ -777,7 +781,7 @@ BEGIN
             SUM(CASE WHEN n_i >= 50 THEN 1 ELSE 0 END) AS covered_frequent
         FROM (
             SELECT s.from_state, ss.n_i
-            FROM frequent_states s
+            FROM frequent_states2 s
             CROSS JOIN LATERAL (
                 SELECT COUNT(*) AS n_i FROM transition_log WHERE from_state = s.from_state
             ) ss
@@ -789,14 +793,12 @@ BEGIN
         END INTO coverage_pct
     FROM coverage;
 
-    -- 4. Штрафы за нестабильность (снижаем базовый рейтинг)
     IF max_prob_change > 0.5 THEN
         base_score := GREATEST(base_score - 2, 0);
     ELSIF max_prob_change > 0.2 THEN
         base_score := GREATEST(base_score - 1, 0);
     END IF;
 
-    -- 5. Бонус стабильности (0-2)
     IF max_prob_change < 0.02 THEN
         stability_bonus := 2;
     ELSIF max_prob_change < 0.05 THEN
@@ -805,16 +807,13 @@ BEGIN
         stability_bonus := 0;
     END IF;
 
-    -- 6. Бонус покрытия (0-1) – только если нестабильность не слишком высока
     IF max_prob_change < 0.2 AND coverage_pct >= 90 THEN
         coverage_bonus := 1;
     END IF;
 
-    -- Итоговый рейтинг (ограничиваем 5)
     RETURN LEAST(base_score + stability_bonus + coverage_bonus, 5);
 END;
 $$;
-
 COMMENT ON FUNCTION mchain_forecast_reliability() IS 'Оценивает достоверность прогнозов от 0 до 5 (объём данных, стабильность, покрытие частых состояний). Исключает переходы в критические состояния и состояния с числом переходов < 200 за 14 дней из расчёта стабильности.';
 
 
@@ -877,21 +876,23 @@ DECLARE
     reliability_score INT;
     report TEXT := '';
     line_sep CONSTANT TEXT := E'\n--------------------------------------------------------------------\n';
-    min_freq_for_stability INT := 200;   -- порог частоты состояний для расчёта стабильности
+    v_min_freq INT;
 BEGIN
+    SELECT mc.min_freq_for_stability INTO v_min_freq
+    FROM markov_config mc LIMIT 1;
+
     SELECT COALESCE(min_transitions_for_forgetting, 5000) INTO min_transitions_threshold
     FROM markov_config LIMIT 1;
 
     SELECT COUNT(*) INTO total_transitions FROM transition_log;
 
-    -- Расчёт max_prob_change с исключением критических состояний и редких состояний
     IF total_transitions >= 5000 THEN
         WITH frequent_states AS (
             SELECT from_state
             FROM transition_log
             WHERE ts >= now() - INTERVAL '14 days'
             GROUP BY from_state
-            HAVING COUNT(*) >= min_freq_for_stability
+            HAVING COUNT(*) >= v_min_freq
         ),
         recent AS (
             SELECT from_state, to_state,
@@ -919,7 +920,6 @@ BEGIN
         max_prob_change := NULL;
     END IF;
 
-    -- Расчёт покрытия частых состояний (без изменений)
     IF total_transitions >= 5000 THEN
         WITH state_stats AS (
             SELECT from_state, COUNT(*) AS n_i,
@@ -927,7 +927,7 @@ BEGIN
             FROM transition_log
             GROUP BY from_state
         ),
-        frequent_states AS (
+        frequent_states2 AS (
             SELECT from_state
             FROM state_stats
             WHERE freq > 0.01
@@ -938,7 +938,7 @@ BEGIN
                 SUM(CASE WHEN n_i >= 50 THEN 1 ELSE 0 END) AS covered_frequent
             FROM (
                 SELECT s.from_state, ss.n_i
-                FROM frequent_states s
+                FROM frequent_states2 s
                 CROSS JOIN LATERAL (
                     SELECT COUNT(*) AS n_i FROM transition_log WHERE from_state = s.from_state
                 ) ss
@@ -953,10 +953,9 @@ BEGIN
         coverage_pct := NULL;
     END IF;
 
-    -- Получение рейтинга достоверности (уже использует фильтр внутри)
     SELECT mchain_forecast_reliability() INTO reliability_score;
 
-    -- Формирование отчёта (без изменений)
+    -- Формирование отчёта
     report := report || 'ОТЧЁТ О ДОСТОВЕРНОСТИ ПРОГНОЗОВ ЦЕПИ МАРКОВА' || line_sep;
     report := report || E'\n1. ОБЩИЙ РЕЙТИНГ ДОСТОВЕРНОСТИ (0-5): ' || reliability_score::TEXT || E'\n';
     
@@ -976,7 +975,7 @@ BEGIN
     END CASE;
 
     report := report || line_sep;
-    report := report || E'\n2. ДЕТАЛИЗАЦИЯ ПО МЕТРИКАМ\n';
+    report := report || E'\n2. ДЕТАЛИЗАЦИЯ ПО МЕТРИКАХ\n';
 
     report := report || E'\n   Общее число переходов (total_transitions): ' || total_transitions::TEXT;
     report := report || E'\n   Рекомендуемое минимальное значение: ' || min_transitions_threshold::TEXT || ' (min_transitions_for_forgetting)';
@@ -1036,7 +1035,6 @@ BEGIN
     RETURN report;
 END;
 $$;
-
 COMMENT ON FUNCTION mchain_reliability_report() IS 'Возвращает расширенный текстовый отчёт о достоверности прогнозов с метриками, порогами и рекомендациями. Исключает переходы в критические состояния и состояния с малым числом переходов (<50 за 14 дней) из расчёта max_prob_change.';
 
 --------------------------------------------------------------------------------
@@ -4074,15 +4072,14 @@ AS $$
 DECLARE
     v_end   DATE := CURRENT_DATE;
     v_start DATE := v_end - p_lookback_days;
-    v_rec   RECORD;                     -- переменная цикла
-    v_metrics RECORD;                   -- для результатов расчёта по периоду
+    v_rec   RECORD;
+    v_metrics RECORD;
     v_report TEXT := '';
     v_line_sep CONSTANT TEXT := E'\n' || repeat('=', 100) || E'\n';
     v_sub_sep CONSTANT TEXT := E'\n' || repeat('-', 100) || E'\n';
     v_row TEXT;
     v_total_periods INT := 0;
-    min_freq_for_stability INT := 200;
-
+    v_min_freq INT;
     v_first_max_change REAL;
     v_first_coverage   INT;
     v_first_period_start DATE;
@@ -4091,10 +4088,12 @@ DECLARE
     v_last_coverage    INT;
     v_last_period_start DATE;
     v_last_period_end   DATE;
-
     v_overall_stability TEXT;
     v_trend_text TEXT;
 BEGIN
+    SELECT mc.min_freq_for_stability INTO v_min_freq
+    FROM markov_config mc LIMIT 1;
+
     -- Заголовок отчёта
     v_report := v_report || 'ОТЧЁТ О СТАБИЛЬНОСТИ ВЕРОЯТНОСТЕЙ ЦЕПИ МАРКОВА' || v_line_sep;
     v_report := v_report || 'Период анализа: ' || v_start::TEXT || ' – ' || v_end::TEXT || E'\n';
@@ -4109,7 +4108,6 @@ BEGIN
                 rpad('stability_factor', 18) || E'\n';
     v_report := v_report || repeat('-', 25+18+14+20+18) || E'\n';
 
-    -- Цикл по периодам (CTE помещены внутрь запроса цикла)
     FOR v_rec IN (
         WITH RECURSIVE periods AS (
             SELECT v_start AS start_date, v_start + 7 AS end_date
@@ -4123,13 +4121,12 @@ BEGIN
         ORDER BY start_date
     ) LOOP
 
-        -- Вычисляем метрики для текущего периода
         WITH frequent_states AS (
             SELECT from_state
             FROM transition_log
             WHERE ts >= v_start AND ts < v_end + 1
             GROUP BY from_state
-            HAVING COUNT(*) >= min_freq_for_stability
+            HAVING COUNT(*) >= v_min_freq
         ),
         period_data AS (
             SELECT
@@ -4225,14 +4222,12 @@ BEGIN
         CROSS JOIN cov_pct cp
         CROSS JOIN stab st;
 
-        -- Если данных нет, пропускаем
         IF v_metrics.total_trans = 0 THEN
             CONTINUE;
         END IF;
 
         v_total_periods := v_total_periods + 1;
 
-        -- Сохраняем первый период
         IF v_total_periods = 1 THEN
             v_first_max_change := v_metrics.max_prob_change;
             v_first_coverage   := v_metrics.coverage_pct;
@@ -4240,13 +4235,11 @@ BEGIN
             v_first_period_end   := v_metrics.period_end;
         END IF;
 
-        -- Сохраняем последний период
         v_last_max_change := v_metrics.max_prob_change;
         v_last_coverage   := v_metrics.coverage_pct;
         v_last_period_start := v_metrics.period_start;
         v_last_period_end   := v_metrics.period_end;
 
-        -- Формируем строку таблицы
         v_row := rpad(v_metrics.period_start::TEXT || ' – ' || v_metrics.period_end::TEXT, 25) ||
                  rpad(round(v_metrics.max_prob_change::NUMERIC, 4)::TEXT, 18) ||
                  rpad(v_metrics.coverage_pct::TEXT, 14) ||
@@ -4263,7 +4256,7 @@ BEGIN
 
     v_report := v_report || v_sub_sep;
 
-    -- ОПИСАНИЕ СТОЛБЦОВ (без изменений)
+    -- ОПИСАНИЕ СТОЛБЦОВ
     v_report := v_report || 'ОПИСАНИЕ СТОЛБЦОВ' || E'\n';
     v_report := v_report || '  Период – 7‑дневный интервал, для которого рассчитаны метрики.' || E'\n';
     v_report := v_report || '  max_prob_change – максимальное изменение вероятностей перехода между двумя половинами периода (первая vs вторая).' || E'\n';
@@ -4759,3 +4752,58 @@ END;
 $$;
 
 COMMENT ON FUNCTION generate_full_analytical_report(DATE, DATE) IS 'Формирует сводный аналитический отчёт по цепи Маркова за указанный период в формате Markdown (массив строк). Включает: общее состояние, качество прогнозов, матрицу переходов, стабильность, скользящее качество, распределение состояний, эффективность забывания и калибровку за последний день. Параметры: p_start (по умолч. 7 дней назад), p_end (по умолч. вчера). Возвращает массив строк, каждая строка — строка Markdown-отчёта.';
+
+-- ==========================================================
+-- Адаптивная настройка min_freq_for_stability
+-- ==========================================================
+-- ==========================================================
+-- Адаптивная настройка min_freq_for_stability
+-- Модификация: выполнять обновление только если обучение цепи достаточно
+-- (общее число переходов >= min_transitions_for_forgetting)
+-- ==========================================================
+CREATE OR REPLACE FUNCTION refresh_stability_threshold()
+RETURNS TEXT LANGUAGE plpgsql AS $$
+DECLARE
+    v_total BIGINT;
+    v_total_all BIGINT;
+    v_min_transitions INT;
+    v_new_threshold INT;
+    v_current INT;
+    v_max_limit INT := 500;
+    v_min_limit INT := 10;
+BEGIN
+    -- Проверка достаточности обучения: общее число переходов должно быть >= min_transitions_for_forgetting
+    SELECT min_transitions_for_forgetting INTO v_min_transitions FROM markov_config LIMIT 1;
+    SELECT COUNT(*) INTO v_total_all FROM transition_log;
+    IF v_total_all < v_min_transitions THEN
+        RETURN format('Insufficient data: total transitions %s < %s, threshold unchanged.', v_total_all, v_min_transitions);
+    END IF;
+
+    -- Суммарные переходы за последние 14 дней
+    SELECT COUNT(*) INTO v_total
+    FROM transition_log
+    WHERE ts >= now() - INTERVAL '14 days';
+
+    IF v_total = 0 THEN
+        RETURN 'No transitions in last 14 days, threshold unchanged.';
+    END IF;
+
+    -- 1% от общего числа, но не менее 10 и не более 500
+    v_new_threshold := GREATEST(v_min_limit, LEAST(v_max_limit, round(v_total * 0.01)));
+
+    -- Дополнительно ограничим средним значением на состояние * 3
+    v_new_threshold := LEAST(v_new_threshold, round(v_total / 189.0 * 3));
+
+    SELECT min_freq_for_stability INTO v_current FROM markov_config LIMIT 1;
+
+    -- Сглаживание: если новый порог отличается более чем на 20%, обновляем
+    IF abs(v_new_threshold - v_current) > v_current * 0.2 THEN
+        UPDATE markov_config SET min_freq_for_stability = v_new_threshold;
+        RETURN format('Threshold updated from %s to %s', v_current, v_new_threshold);
+    ELSE
+        RETURN format('Threshold unchanged (current %s, computed %s)', v_current, v_new_threshold);
+    END IF;
+END;
+$$;
+
+COMMENT ON FUNCTION refresh_stability_threshold() IS 'Адаптивная настройка min_freq_for_stability, выполняемая только при достаточном обучении (общее число переходов >= min_transitions_for_forgetting).';
