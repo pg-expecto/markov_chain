@@ -13,8 +13,10 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_functions.sql
--- version 13.1
+-- version 13.8
 /*
+ Функция: adaptive_configure_markov_chain
+ Назначение: Адаптивная настройка параметров цепи Маркова с периодом анализа, определяемым из markov_config.transition_log_retention_days
 
  Процедура: mchain_initial_train_from_history 
  Назначение: первоначальное обучение цепи Маркова на основе исторических данных
@@ -87,6 +89,8 @@
   - refresh_stability_threshold : Адаптивная настройка min_freq_for_stability
   - mchain_log_transition_at : Логирование перехода с указанием времени (для исторического обучения)
   - trigger_recalculate_risks_on_config_change : Триггерная функция для автоматического пересчёта прогнозов при изменении конфигурации
+  - find_optimal_horizon : Функция подбора оптимального горизонта прогноза на основе исторических переходов и критических состояний
+
 
 
   - **Прогнозирование риска**
@@ -5847,3 +5851,242 @@ END;
 $$;
 
 COMMENT ON FUNCTION report_prediction_incident_summary(TIMESTAMPTZ, TIMESTAMPTZ) IS 'Сводный отчёт по таблицам prediction_log и performance_incident за указанный период. Возвращает массив строк с ключевыми метриками: - общее количество прогнозов и с известным исходом; - доля инцидентов (actual_outcome=1); - средний предсказанный риск; - количество прогнозов, после которых наступил инцидент в течение горизонта; - accuracy, precision, recall (при пороге 0.5) для известных исходов; - общее количество инцидентов производительности, незавершённые, распределение по приоритетам. Параметры по умолчанию: последние 7 дней. ';
+
+-- Функция адаптивной настройки параметров цепи Маркова 
+-- с периодом анализа, определяемым из markov_config.transition_log_retention_days
+CREATE OR REPLACE FUNCTION adaptive_configure_markov_chain(
+    p_end TIMESTAMPTZ DEFAULT now()
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    -- Параметры анализа
+    v_start TIMESTAMPTZ;
+    v_days NUMERIC;
+    v_incidents_count BIGINT;
+    v_lambda_day NUMERIC;
+    v_lambda_min NUMERIC;
+
+    -- Общее число переходов
+    v_total_transitions BIGINT;
+
+    -- Целевая доля положительных исходов
+    v_target_pos CONSTANT REAL := 0.15;
+
+    -- Вычисляемые параметры
+    v_new_horizon INT;
+    v_new_base_alpha REAL;
+    v_new_half_life REAL;
+    v_new_interval INT;
+    v_new_min_transitions INT;
+    v_new_min_freq INT;
+
+    -- Старые значения для отчёта
+    v_old_config RECORD;
+
+    -- Вспомогательные
+    v_retention_days INT;
+    v_report TEXT := '';
+    v_newline CONSTANT TEXT := chr(10);
+BEGIN
+    -- ========================================================================
+    -- Шаг 1. Определение периода анализа на основе transition_log_retention_days
+    -- ========================================================================
+    SELECT COALESCE(transition_log_retention_days, 30) INTO v_retention_days
+    FROM markov_config LIMIT 1;
+
+    v_start := p_end - (v_retention_days || ' days')::INTERVAL;
+    RAISE NOTICE 'Шаг 1: Период анализа с % по % (ретеншн % дней)', v_start, p_end, v_retention_days;
+
+    -- ========================================================================
+    -- Шаг 2. Расчёт частоты инцидентов
+    -- ========================================================================
+    SELECT COUNT(*) INTO v_incidents_count
+    FROM performance_incident
+    WHERE start_timepoint BETWEEN v_start AND p_end;
+
+    v_days := EXTRACT(EPOCH FROM (p_end - v_start)) / 86400.0;
+    IF v_days <= 0 THEN
+        v_days := 1;
+    END IF;
+
+    v_lambda_day := v_incidents_count / v_days;
+    v_lambda_min := v_lambda_day / 1440.0;
+
+    RAISE NOTICE 'Шаг 2: Найдено % инцидентов за % дней, частота: % сут⁻¹, % мин⁻¹',
+                 v_incidents_count, round(v_days, 1), round(v_lambda_day, 2), round(v_lambda_min, 6);
+
+    -- ========================================================================
+    -- Шаг 3. Получение общего числа переходов (для порогов)
+    -- ========================================================================
+    SELECT COUNT(*) INTO v_total_transitions FROM transition_log;
+    RAISE NOTICE 'Шаг 3: Всего переходов в журнале: %', v_total_transitions;
+
+    -- ========================================================================
+    -- Шаг 4. Расчёт новых параметров
+    -- ========================================================================
+    RAISE NOTICE 'Шаг 4: Расчёт параметров...';
+
+    -- 4.1 Горизонт прогноза (минут)
+    IF v_lambda_min > 0 THEN
+        v_new_horizon := round(v_target_pos / v_lambda_min)::INT;
+        v_new_horizon := GREATEST(5, LEAST(120, v_new_horizon));
+    ELSE
+        v_new_horizon := 60;
+    END IF;
+
+    -- 4.2 base_alpha (скорость забывания)
+    v_new_base_alpha := 0.01 + 0.15 * (v_lambda_day / 20.0);
+    v_new_base_alpha := GREATEST(0.01, LEAST(0.25, v_new_base_alpha));
+
+    -- 4.3 incident_half_life_days
+    v_new_half_life := 60.0 / (1.0 + v_lambda_day / 5.0);
+    v_new_half_life := GREATEST(7.0, LEAST(60.0, v_new_half_life));
+
+    -- 4.4 interval_minute (период между применениями забывания)
+    v_new_interval := round(v_new_horizon * 2.0)::INT;
+    v_new_interval := GREATEST(30, LEAST(720, v_new_interval));
+
+    -- 4.5 min_transitions_for_forgetting (порог для включения забывания)
+    IF v_total_transitions > 0 THEN
+        v_new_min_transitions := GREATEST(1000, round(v_total_transitions * 0.01)::INT);
+    ELSE
+        v_new_min_transitions := 1000;
+    END IF;
+
+    -- 4.6 min_freq_for_stability (минимальное число переходов из состояния для оценки стабильности)
+    IF v_total_transitions > 0 THEN
+        v_new_min_freq := GREATEST(10, LEAST(500, round(v_total_transitions * 0.005)::INT));
+    ELSE
+        v_new_min_freq := 10;
+    END IF;
+
+    -- ========================================================================
+    -- Шаг 5. Получение текущих значений (для отчёта)
+    -- ========================================================================
+    SELECT
+        forecast_horizon_minutes,
+        base_alpha,
+        incident_half_life_days,
+        interval_minute,
+        min_transitions_for_forgetting,
+        min_freq_for_stability
+    INTO v_old_config
+    FROM markov_config LIMIT 1;
+
+    -- ========================================================================
+    -- Шаг 6. Обновление конфигурации
+    -- ========================================================================
+    RAISE NOTICE 'Шаг 6: Обновление markov_config...';
+    UPDATE markov_config SET
+        forecast_horizon_minutes = v_new_horizon,
+        base_alpha = v_new_base_alpha,
+        incident_half_life_days = v_new_half_life,
+        interval_minute = v_new_interval,
+        min_transitions_for_forgetting = v_new_min_transitions,
+        min_freq_for_stability = v_new_min_freq,
+        use_adaptive_alpha = TRUE,
+        adaptive_forgetting_enabled = TRUE;
+
+    -- ========================================================================
+    -- Шаг 7. Формирование итогового отчёта
+    -- ========================================================================
+    RAISE NOTICE 'Шаг 7: Формирование отчёта...';
+
+    v_report := '=== АДАПТИВНАЯ НАСТРОЙКА ЦЕПИ МАРКОВА ===' || v_newline;
+    v_report := v_report || 'Период анализа: ' || v_start::TEXT || ' – ' || p_end::TEXT || v_newline;
+    v_report := v_report || 'Длительность периода (дней): ' || round(v_days, 1)::TEXT || v_newline;
+    v_report := v_report || 'Количество инцидентов: ' || v_incidents_count::TEXT || v_newline;
+    v_report := v_report || 'Частота (сут⁻¹): ' || round(v_lambda_day, 2)::TEXT || v_newline;
+    v_report := v_report || 'Общее число переходов: ' || v_total_transitions::TEXT || v_newline;
+    v_report := v_report || v_newline;
+    v_report := v_report || '=== ПАРАМЕТРЫ (СТАРЫЕ → НОВЫЕ) ===' || v_newline;
+    v_report := v_report || 'forecast_horizon_minutes: ' || v_old_config.forecast_horizon_minutes::TEXT || ' → ' || v_new_horizon::TEXT || v_newline;
+    -- Исправление: приводим к numeric для round
+    v_report := v_report || 'base_alpha: ' || v_old_config.base_alpha::TEXT || ' → ' || round(v_new_base_alpha::NUMERIC, 4)::TEXT || v_newline;
+    v_report := v_report || 'incident_half_life_days: ' || v_old_config.incident_half_life_days::TEXT || ' → ' || round(v_new_half_life::NUMERIC, 2)::TEXT || v_newline;
+    v_report := v_report || 'interval_minute: ' || v_old_config.interval_minute::TEXT || ' → ' || v_new_interval::TEXT || v_newline;
+    v_report := v_report || 'min_transitions_for_forgetting: ' || v_old_config.min_transitions_for_forgetting::TEXT || ' → ' || v_new_min_transitions::TEXT || v_newline;
+    v_report := v_report || 'min_freq_for_stability: ' || v_old_config.min_freq_for_stability::TEXT || ' → ' || v_new_min_freq::TEXT || v_newline;
+    v_report := v_report || v_newline;
+    v_report := v_report || '=== РЕКОМЕНДАЦИИ ===' || v_newline;
+    IF v_incidents_count = 0 THEN
+        v_report := v_report || '⚠ Инциденты за период отсутствуют. Установлены параметры для редких событий (горизонт 60 мин, низкий alpha).' || v_newline;
+        v_report := v_report || '   Рекомендуется пересмотреть определение инцидентов или увеличить период анализа (изменив transition_log_retention_days).' || v_newline;
+    ELSIF v_lambda_day > 20 THEN
+        v_report := v_report || '⚠ Высокая частота инцидентов (>20/сут). Горизонт установлен минимальным (5 мин) для сохранения калибровки.' || v_newline;
+        v_report := v_report || '   Рассмотрите возможность уменьшения целевой доли положительных исходов или сокращения горизонта.' || v_newline;
+    ELSE
+        v_report := v_report || '✔ Параметры адаптированы к текущей частоте инцидентов. Ожидаемая доля положительных исходов ≈ ' || (v_target_pos * 100)::INT || '%.' || v_newline;
+    END IF;
+
+    RAISE NOTICE '%', v_report;
+    RETURN v_report;
+END;
+$$;
+
+COMMENT ON FUNCTION adaptive_configure_markov_chain(TIMESTAMPTZ) IS 'Адаптивная настройка параметров цепи Маркова на основе частоты инцидентов за период, равный transition_log_retention_days (из markov_config).Вычисляет и обновляет: forecast_horizon_minutes, base_alpha, incident_half_life_days,interval_minute, min_transitions_for_forgetting, min_freq_for_stability.Выводит прогресс через RAISE NOTICE и возвращает текстовый отчёт.';
+
+-- Функция подбора оптимального горизонта прогноза на основе исторических переходов и критических состояний
+CREATE OR REPLACE FUNCTION find_optimal_horizon(
+    p_target REAL DEFAULT 0.15,
+    p_min INT DEFAULT 5,
+    p_max INT DEFAULT 120,
+    p_step INT DEFAULT 5
+)
+RETURNS INT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_horizon INT;
+    v_best INT := p_min;
+    v_best_diff REAL := 999;
+    v_ratio REAL;
+    v_critical_ids INT[];
+    v_total_transitions BIGINT;
+BEGIN
+    -- Получаем список критических состояний
+    SELECT array_agg(state_id) INTO v_critical_ids FROM critical_states;
+    IF v_critical_ids IS NULL OR array_length(v_critical_ids, 1) = 0 THEN
+        RETURN 30; -- fallback, если нет критических состояний
+    END IF;
+
+    -- Проверяем, есть ли переходы
+    SELECT COUNT(*) INTO v_total_transitions FROM transition_log WHERE from_state IS NOT NULL;
+    IF v_total_transitions = 0 THEN
+        RETURN 30; -- нет данных
+    END IF;
+
+    -- Перебираем горизонты
+    FOR v_horizon IN p_min..p_max BY p_step LOOP
+        WITH transitions AS (
+            SELECT ts, from_state
+            FROM transition_log
+            WHERE from_state IS NOT NULL
+        ),
+        incidents AS (
+            SELECT ts AS incident_ts
+            FROM transition_log
+            WHERE to_state = ANY(v_critical_ids)
+        )
+        SELECT COUNT(*) FILTER (WHERE EXISTS (
+            SELECT 1 FROM incidents i
+            WHERE i.incident_ts > t.ts
+              AND i.incident_ts <= t.ts + (v_horizon || ' minutes')::INTERVAL
+        ))::REAL / COUNT(*) INTO v_ratio
+        FROM transitions t;
+
+        IF v_ratio IS NOT NULL THEN
+            IF abs(v_ratio - p_target) < v_best_diff THEN
+                v_best_diff := abs(v_ratio - p_target);
+                v_best := v_horizon;
+            END IF;
+        END IF;
+    END LOOP;
+
+    RETURN v_best;
+END;
+$$;
+
+COMMENT ON FUNCTION find_optimal_horizon(REAL, INT, INT, INT) IS 'Подбирает горизонт прогноза, при котором доля переходов, за которыми следует инцидент (попадание в критическое состояние), наиболее близка к целевому значению p_target. Возвращает оптимальный горизонт в минутах.';
