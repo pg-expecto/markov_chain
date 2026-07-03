@@ -1,0 +1,35 @@
+﻿#################################################################
+# Markov chain 
+# ============================================================
+# Ежедневная очистка журналов и обновление статистик
+# ============================================================
+# Очистка transition_log (в 01:15)
+15 1 * * * psql -d expecto_db -U expecto_user -c "SELECT mchain_clean_transition_log();"
+
+# ============================================================
+# Очистка архивных данных (раз в неделю)
+# ============================================================
+# Очистка apply_forgetting_log (ежедневно в 02:00)
+0 2 * * * psql -d expecto_db -U expecto_user -c "SELECT mchain_clean_apply_forgetting_log();"
+
+# ============================================================
+# Анализ качества прогноза
+# ============================================================
+
+# Обновление critical_states еженедельно (суббота в 03:00)
+0 3 * * 6 psql -d expecto_db -U expecto_user -c "SELECT refresh_critical_states();" >/postgres/pg_expecto/sh/refresh_critical_states.log 2>&1
+
+# Обновление исходов каждые 5 минут 
+*/5 * * * * psql -d expecto_db -U expecto_user -c "SELECT update_prediction_outcomes();"
+
+# Расчёт суточных метрик в 02:00
+0 2 * * * psql -d expecto_db -U expecto_user -c "SELECT calculate_daily_quality_metrics(CURRENT_DATE - 1);"
+
+
+# Еженедельная адаптивная настройка min_freq_for_stability (воскресенье в 01:00)
+0 1 * * 0 psql -d expecto_db -U expecto_user -c "SELECT refresh_stability_threshold();"
+
+# Markov chain
+#################################################################
+
+

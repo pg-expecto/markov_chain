@@ -1,0 +1,21 @@
+# Расчет метрик профиля нагрузки на основе цепи Маркова 
+# Оперативный профиль (каждые 5 минут)
+*/5 * * * * psql -d expecto_db -U expecto_user -c "SELECT save_operational_profile();" > /postgres/pg_expecto/sh/save_operational_profile.log 2>&1
+
+# Суточный профиль (каждый час)
+0 * * * * psql -d expecto_db -U expecto_user -c "SELECT save_daily_profile();" > /postgres/pg_expecto/sh/save_daily_profile.log 2>&1
+
+# Недельный профиль (раз в день, в 01:00)
+0 1 * * * psql -d expecto_db -U expecto_user -c "SELECT save_weekly_profile();" > /postgres/pg_expecto/sh/save_weekly_profile.log  2>&1
+
+# Очистка старых профилей
+# Оперативные профили можно хранить 7 дней, суточные – 30 дней, недельные – 90 дней.
+# Удаление оперативных профилей старше 7 дней (каждый день в 02:00)
+0 2 * * * psql -d expecto_db -U expecto_user -c "DELETE FROM profile_aggregated WHERE profile_type='operational' AND ts < now() - interval '7 days';" > /postgres/pg_expecto/sh/operational.log 2>&1
+
+# Удаление суточных профилей старше 30 дней
+0 3 * * * psql -d expecto_db -U expecto_user -c "DELETE FROM profile_aggregated WHERE profile_type='daily' AND ts < now() - interval '30 days';" > /postgres/pg_expecto/sh/daily.log 2>&1
+
+# Удаление недельных профилей старше 90 дней
+0 4 * * * psql -d expecto_db -U expecto_user -c "DELETE FROM profile_aggregated WHERE profile_type='weekly' AND ts < now() - interval '90 days';" > /postgres/pg_expecto/sh/weekly.log 2>&1
+# Расчет метрик профиля нагрузки на основе цепи Маркова 
