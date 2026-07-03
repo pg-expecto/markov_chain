@@ -50,6 +50,16 @@
 --
 -- append_performance_history
 -- Назначение: Инкрементально добавляет или обновляет записи в performance_history за указанный период (без TRUNCATE). Использует cluster_stat_median как источник.
+--
+-- Функция: generate_profile_summary_report
+-- Назначение: формирует краткий отчёт по текущему состоянию профилей нагрузки
+--             (operational, daily, weekly) на основе данных из profile_aggregated.
+--
+-- Функция: generate_detailed_profile_report
+-- Назначение: формирует расширенный отчёт по профилям нагрузки (operational, daily, weekly)
+--             с подробной интерпретацией каждой метрики, анализом аномалий и
+--             общей оценкой стабильности системы.
+
 
 
 -- -----------------------------------------------------------------------------
@@ -376,22 +386,25 @@ COMMENT ON FUNCTION save_weekly_profile() IS
 -- =============================================================================
 -- 2.2. Функции для работы с эталоном
 -- =============================================================================
-
--- -----------------------------------------------------------------------------
--- build_baseline_profile
+-- =============================================================================
+-- Функция: build_baseline_profile (исправленная версия, с ограничением периода 30 дней)
 -- Назначение: строит эталонный профиль на основе исторических данных за период,
---             исключая инцидентные окна.
+--             исключая инцидентные окна. Заполняет все метрики, исправляет расчёт
+--             энтропии, период по умолчанию – 30 дней.
 -- Параметры:
---   p_start          TIMESTAMPTZ – начало периода
---   p_end            TIMESTAMPTZ – конец периода
---   p_baseline_name  TEXT        – имя эталона
---   p_exclude_incident_window_min INT – длительность окна вокруг инцидента (мин)
--- -----------------------------------------------------------------------------
+--   p_start                     TIMESTAMPTZ – начало периода (по умолч. now() - interval '30 days')
+--   p_end                       TIMESTAMPTZ – конец периода (по умолч. now())
+--   p_baseline_name             TEXT        – имя эталона (по умолч. 'default')
+--   p_exclude_incident_window_min INT       – длительность окна вокруг инцидента (мин) (по умолч. 30)
+--   p_min_hours_per_slot        INT         – минимальное число часов в слоте для включения (по умолч. 3)
+-- Возвращает: TEXT – отчёт о количестве заполненных слотов.
+-- =============================================================================
 CREATE OR REPLACE FUNCTION build_baseline_profile(
-    p_start          TIMESTAMPTZ,
-    p_end            TIMESTAMPTZ,
-    p_baseline_name  TEXT,
-    p_exclude_incident_window_min INT DEFAULT 60
+    p_start                     TIMESTAMPTZ DEFAULT now() - INTERVAL '30 days',
+    p_end                       TIMESTAMPTZ DEFAULT now(),
+    p_baseline_name             TEXT        DEFAULT 'default',
+    p_exclude_incident_window_min INT        DEFAULT 30,
+    p_min_hours_per_slot        INT         DEFAULT 1
 )
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -401,13 +414,20 @@ DECLARE
     v_metrics RECORD;
     v_hour INT;
     v_dow INT;
-    v_total_samples INT := 0;
+    v_total_slots INT := 0;
+    v_processed_slots INT := 0;
+    v_total_slots_all CONSTANT INT := 24 * 7;
 BEGIN
     DELETE FROM profile_baseline WHERE baseline_name = p_baseline_name;
 
+    RAISE NOTICE 'Начало построения эталона "%s" за период с %s по %s. Всего слотов: %s',
+                 p_baseline_name, p_start, p_end, v_total_slots_all;
+
     FOR v_hour IN 0..23 LOOP
+        RAISE NOTICE 'Обработка часа %s из 24', v_hour;
         FOR v_dow IN 0..6 LOOP
-            WITH candidate_times AS (
+
+            WITH candidate_hours AS (
                 SELECT DISTINCT
                     date_trunc('hour', ph.ts) AS hour_ts
                 FROM performance_history ph
@@ -421,8 +441,9 @@ BEGIN
                             ph.ts - v_exclude_interval AND ph.ts + v_exclude_interval
                   )
             ),
-            metrics AS (
+            perf_agg AS (
                 SELECT
+                    date_trunc('hour', ph.ts) AS hour_ts,
                     AVG(ph.correlation) AS avg_corr,
                     STDDEV(ph.correlation) AS std_corr,
                     AVG(ph.os_angle) AS avg_os,
@@ -432,68 +453,140 @@ BEGIN
                     COUNT(*) AS sample_count
                 FROM performance_history ph
                 WHERE EXISTS (
-                    SELECT 1 FROM candidate_times ct
-                    WHERE ph.ts >= ct.hour_ts
-                      AND ph.ts < ct.hour_ts + INTERVAL '1 hour'
+                    SELECT 1 FROM candidate_hours ch
+                    WHERE ph.ts >= ch.hour_ts AND ph.ts < ch.hour_ts + INTERVAL '1 hour'
                 )
+                GROUP BY date_trunc('hour', ph.ts)
             ),
-            trans_hourly AS (
+            trans_agg AS (
                 SELECT
-                    hour_ts,
-                    AVG(CASE WHEN from_state = to_state THEN 1.0 ELSE 0.0 END) AS avg_self_loop,
-                    AVG(CASE WHEN to_state = ANY(SELECT state_id FROM critical_states) THEN 1.0 ELSE 0.0 END) AS avg_crit,
-                    (-SUM(CASE WHEN cnt > 0 THEN cnt * LOG(2, cnt) ELSE 0 END) / NULLIF(SUM(cnt), 0)) AS entropy
+                    tl.hour_ts,
+                    COUNT(*) AS total_trans,
+                    AVG(CASE WHEN tl.from_state = tl.to_state THEN 1.0 ELSE 0.0 END) AS self_loop_ratio,
+                    AVG(CASE WHEN tl.to_state = ANY(SELECT state_id FROM critical_states) THEN 1.0 ELSE 0.0 END) AS critical_ratio,
+                    COUNT(DISTINCT tl.to_state) AS unique_states,
+                    AVG(ABS(tl.to_state - tl.from_state)) AS avg_transition_length,
+                    top.top_transition,
+                    ent.entropy
                 FROM (
                     SELECT
-                        date_trunc('hour', tl.ts) AS hour_ts,
-                        tl.from_state,
-                        tl.to_state,
-                        COUNT(*) AS cnt
-                    FROM transition_log tl
-                    WHERE tl.ts >= p_start AND tl.ts < p_end
-                      AND EXTRACT(HOUR FROM tl.ts) = v_hour
-                      AND EXTRACT(DOW FROM tl.ts) = v_dow
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM performance_incident pi
-                          WHERE pi.start_timepoint BETWEEN
-                                tl.ts - v_exclude_interval AND tl.ts + v_exclude_interval
-                      )
-                    GROUP BY date_trunc('hour', tl.ts), tl.from_state, tl.to_state
-                ) state_counts
-                GROUP BY hour_ts
+                        date_trunc('hour', ts) AS hour_ts,
+                        from_state,
+                        to_state
+                    FROM transition_log
+                    WHERE EXISTS (
+                        SELECT 1 FROM candidate_hours ch
+                        WHERE ts >= ch.hour_ts AND ts < ch.hour_ts + INTERVAL '1 hour'
+                    )
+                ) tl
+                CROSS JOIN LATERAL (
+                    SELECT jsonb_build_object('from_state', from_state, 'to_state', to_state, 'cnt', cnt) AS top_transition
+                    FROM (
+                        SELECT from_state, to_state, COUNT(*) AS cnt,
+                               ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS rn
+                        FROM transition_log tl2
+                        WHERE date_trunc('hour', tl2.ts) = tl.hour_ts
+                        GROUP BY from_state, to_state
+                    ) t
+                    WHERE rn = 1
+                ) top
+                CROSS JOIN LATERAL (
+                    SELECT -SUM(p * ln(p) / ln(2)) AS entropy
+                    FROM (
+                        SELECT COUNT(*)::REAL / SUM(COUNT(*)) OVER () AS p
+                        FROM transition_log tl2
+                        WHERE date_trunc('hour', tl2.ts) = tl.hour_ts
+                        GROUP BY to_state
+                    ) probs
+                    WHERE p > 0
+                ) ent
+                GROUP BY tl.hour_ts, top.top_transition, ent.entropy
             ),
-            trans_metrics AS (
+            hour_metrics AS (
                 SELECT
-                    AVG(avg_self_loop) AS avg_self_loop_mean,
-                    STDDEV(avg_self_loop) AS avg_self_loop_std,
-                    AVG(avg_crit) AS avg_crit_mean,
-                    STDDEV(avg_crit) AS avg_crit_std,
+                    COALESCE(p.hour_ts, t.hour_ts) AS hour_ts,
+                    p.avg_corr,
+                    p.std_corr,
+                    p.avg_os,
+                    p.std_os,
+                    p.avg_wait,
+                    p.std_wait,
+                    p.sample_count AS perf_samples,
+                    t.total_trans,
+                    t.self_loop_ratio,
+                    t.critical_ratio,
+                    t.unique_states,
+                    t.avg_transition_length,
+                    t.top_transition,
+                    t.entropy
+                FROM perf_agg p
+                FULL JOIN trans_agg t ON p.hour_ts = t.hour_ts
+            ),
+            hourly_distribution AS (
+                SELECT
+                    to_state AS state_id,
+                    date_trunc('hour', ts) AS hour_ts,
+                    COUNT(*)::REAL / SUM(COUNT(*)) OVER (PARTITION BY date_trunc('hour', ts)) AS dolya
+                FROM transition_log
+                WHERE EXISTS (
+                    SELECT 1 FROM candidate_hours ch
+                    WHERE ts >= ch.hour_ts AND ts < ch.hour_ts + INTERVAL '1 hour'
+                )
+                GROUP BY date_trunc('hour', ts), to_state
+            ),
+            slot_agg AS (
+                SELECT
+                    COUNT(*) AS hour_count,
+                    AVG(avg_corr) AS avg_correlation_mean,
+                    COALESCE(STDDEV(avg_corr), 0) AS avg_correlation_std,
                     AVG(entropy) AS entropy_mean,
-                    STDDEV(entropy) AS entropy_std,
-                    COUNT(*) AS hourly_count
-                FROM trans_hourly
+                    COALESCE(STDDEV(entropy), 0) AS entropy_std,
+                    AVG(critical_ratio) AS critical_ratio_mean,
+                    COALESCE(STDDEV(critical_ratio), 0) AS critical_ratio_std,
+                    AVG(avg_os) AS avg_os_angle_mean,
+                    COALESCE(STDDEV(avg_os), 0) AS avg_os_angle_std,
+                    AVG(avg_wait) AS avg_wait_angle_mean,
+                    COALESCE(STDDEV(avg_wait), 0) AS avg_wait_angle_std,
+                    AVG(self_loop_ratio) AS self_loop_ratio_mean,
+                    COALESCE(STDDEV(self_loop_ratio), 0) AS self_loop_ratio_std,
+                    AVG(unique_states) AS unique_states_count_mean,
+                    COALESCE(STDDEV(unique_states), 0) AS unique_states_count_std,
+                    AVG(avg_transition_length) AS avg_transition_length_mean,
+                    COALESCE(STDDEV(avg_transition_length), 0) AS avg_transition_length_std,
+                    AVG((top_transition->>'cnt')::REAL) AS top_transition_freq_mean,
+                    COALESCE(STDDEV((top_transition->>'cnt')::REAL), 0) AS top_transition_freq_std,
+                    (SELECT jsonb_build_object('from_state', from_state, 'to_state', to_state)
+                     FROM (
+                         SELECT (top_transition->>'from_state')::SMALLINT AS from_state,
+                                (top_transition->>'to_state')::SMALLINT AS to_state,
+                                COUNT(*) AS freq
+                         FROM hour_metrics
+                         WHERE top_transition IS NOT NULL
+                         GROUP BY from_state, to_state
+                         ORDER BY COUNT(*) DESC
+                         LIMIT 1
+                     ) top_pair) AS top_transition_pair,
+                    (SELECT jsonb_object_agg(state_id, avg_dolya)
+                     FROM (
+                         SELECT state_id, AVG(dolya) AS avg_dolya
+                         FROM hourly_distribution
+                         GROUP BY state_id
+                     ) dist_avg
+                    ) AS state_histogram_mean,
+                    (SELECT jsonb_object_agg(state_id, stddev_dolya)
+                     FROM (
+                         SELECT state_id, STDDEV(dolya) AS stddev_dolya
+                         FROM hourly_distribution
+                         GROUP BY state_id
+                     ) dist_std
+                    ) AS state_histogram_std
+                FROM hour_metrics
+                WHERE avg_corr IS NOT NULL OR entropy IS NOT NULL
             )
-            -- Исправленный SELECT:
-            SELECT
-                m.avg_corr AS avg_correlation_mean,
-                m.std_corr AS avg_correlation_std,
-                tm.entropy_mean,
-                tm.entropy_std,
-                tm.avg_crit_mean AS critical_ratio_mean,
-                tm.avg_crit_std AS critical_ratio_std,
-                m.avg_os AS avg_os_angle_mean,
-                m.std_os AS avg_os_angle_std,
-                m.avg_wait AS avg_wait_angle_mean,
-                m.std_wait AS avg_wait_angle_std,
-                tm.avg_self_loop_mean AS self_loop_ratio_mean,
-                tm.avg_self_loop_std AS self_loop_ratio_std,
-                COALESCE(tm.hourly_count, 0) AS sample_size
-            INTO v_metrics
-            FROM metrics m
-            CROSS JOIN trans_metrics tm;
+            SELECT * INTO v_metrics
+            FROM slot_agg;
 
-            IF v_metrics.sample_size > 0 THEN
+            IF v_metrics.hour_count >= p_min_hours_per_slot THEN
                 INSERT INTO profile_baseline (
                     baseline_name, hour, dow,
                     period_start, period_end,
@@ -503,11 +596,11 @@ BEGIN
                     avg_os_angle_mean, avg_os_angle_std,
                     avg_wait_angle_mean, avg_wait_angle_std,
                     self_loop_ratio_mean, self_loop_ratio_std,
-                    state_histogram_mean, state_histogram_std,
                     unique_states_count_mean, unique_states_count_std,
                     avg_transition_length_mean, avg_transition_length_std,
                     top_transition_freq_mean, top_transition_freq_std,
-                    top_transition_pair
+                    top_transition_pair,
+                    state_histogram_mean, state_histogram_std
                 ) VALUES (
                     p_baseline_name, v_hour, v_dow,
                     p_start, p_end,
@@ -517,19 +610,36 @@ BEGIN
                     v_metrics.avg_os_angle_mean, v_metrics.avg_os_angle_std,
                     v_metrics.avg_wait_angle_mean, v_metrics.avg_wait_angle_std,
                     v_metrics.self_loop_ratio_mean, v_metrics.self_loop_ratio_std,
-                    '{}'::JSONB, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+                    v_metrics.unique_states_count_mean, v_metrics.unique_states_count_std,
+                    v_metrics.avg_transition_length_mean, v_metrics.avg_transition_length_std,
+                    v_metrics.top_transition_freq_mean, v_metrics.top_transition_freq_std,
+                    v_metrics.top_transition_pair,
+                    COALESCE(v_metrics.state_histogram_mean, '{}'::JSONB),
+                    COALESCE(v_metrics.state_histogram_std, '{}'::JSONB)
                 );
-                v_total_samples := v_total_samples + 1;
+                v_total_slots := v_total_slots + 1;
             END IF;
         END LOOP;
+
+        -- Обновление прогресса после обработки всех дней для текущего часа
+        v_processed_slots := v_processed_slots + 7;
+        RAISE NOTICE 'Прогресс: % из % слотов обработано (%.1f%%). Заполнено слотов: %',
+                     v_processed_slots, v_total_slots_all,
+                     (v_processed_slots::numeric / v_total_slots_all * 100),
+                     v_total_slots;
     END LOOP;
 
-    RETURN format('Baseline "%s" built with %s hour/day slots filled.', p_baseline_name, v_total_samples);
+    RAISE NOTICE 'Построение эталона "%s" завершено. Заполнено %s слотов (минимум %s часов на слот).',
+                 p_baseline_name, v_total_slots, p_min_hours_per_slot;
+
+    RETURN format('Baseline "%s" rebuilt with %s slots filled (minimum %s hours per slot).',
+                  p_baseline_name, v_total_slots, p_min_hours_per_slot);
 END;
 $$;
 
-COMMENT ON FUNCTION build_baseline_profile(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INT) IS
-'Строит эталонный профиль на основе исторических данных за период, исключая окна вокруг инцидентов. Сохраняет в profile_baseline с усреднением по часу дня и дню недели.';
+COMMENT ON FUNCTION build_baseline_profile(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INT, INT) IS
+'Строит эталонный профиль с исправленным расчётом энтропии, заполнением всех метрик и периодом по умолчанию 30 дней.';
+
 
 
 -- -----------------------------------------------------------------------------
@@ -1108,3 +1218,580 @@ $$;
 
 COMMENT ON FUNCTION append_performance_history(TIMESTAMPTZ, TIMESTAMPTZ) IS
 'Инкрементально добавляет или обновляет записи в performance_history за указанный период (без TRUNCATE). Использует cluster_stat_median как источник.';
+
+-- Функция: generate_profile_summary_report (исправленная)
+-- Назначение: формирует краткий отчёт по текущему состоянию профилей нагрузки
+--             (operational, daily, weekly) на основе данных из profile_aggregated.
+-- Возвращает: TEXT[] – массив строк с отформатированным отчётом.
+-- Использует функцию get_deviation_report для оценки аномалий относительно эталона.
+-- Если эталон отсутствует, выводится предупреждение.
+
+-- Функция: generate_profile_summary_report (исправленная)
+-- Назначение: формирует краткий отчёт по текущему состоянию профилей нагрузки
+--             (operational, daily, weekly) на основе данных из profile_aggregated.
+-- Возвращает: TEXT[] – массив строк с отформатированным отчётом.
+-- Использует функцию get_deviation_report для оценки аномалий относительно эталона.
+-- Если эталон отсутствует, выводится предупреждение.
+
+CREATE OR REPLACE FUNCTION generate_profile_summary_report()
+RETURNS TEXT[]
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_report TEXT[] := '{}';
+    v_line_sep CONSTANT TEXT := E'\n';
+    v_header TEXT := '=== СВОДНЫЙ ОТЧЁТ ПО ПРОФИЛЯМ НАГРУЗКИ ===';
+    v_ts TIMESTAMPTZ := now();
+    v_rec RECORD;
+    v_dev RECORD;
+    v_anomaly_text TEXT;
+    v_profile_types TEXT[] := ARRAY['operational', 'daily', 'weekly'];
+    v_type TEXT;
+    v_last_profile RECORD;
+    v_has_baseline BOOLEAN;
+    v_metrics_text TEXT;
+    v_line TEXT;
+BEGIN
+    -- Добавляем заголовок и время формирования
+    v_report := array_append(v_report, v_header);
+    v_report := array_append(v_report, 'Отчёт сформирован: ' || to_char(v_ts, 'YYYY-MM-DD HH24:MI'));
+    v_report := array_append(v_report, '');
+
+    FOREACH v_type IN ARRAY v_profile_types
+    LOOP
+        -- Получаем последний профиль данного типа
+        SELECT
+            profile_type,
+            ts,
+            window_start,
+            window_end,
+            avg_correlation,
+            critical_ratio,
+            entropy,
+            self_loop_ratio,
+            hour,
+            dow
+        INTO v_last_profile
+        FROM profile_aggregated
+        WHERE profile_type = v_type
+        ORDER BY ts DESC
+        LIMIT 1;
+
+        -- Если профиля нет, пропускаем
+        IF NOT FOUND THEN
+            v_report := array_append(v_report, 'Тип "' || v_type || '": нет данных');
+            v_report := array_append(v_report, '');
+            CONTINUE;
+        END IF;
+
+        -- Заголовок секции
+        v_report := array_append(v_report, '--- ' || upper(v_type) || ' ПРОФИЛЬ ---');
+        v_report := array_append(v_report, '  Окно: ' ||
+            to_char(v_last_profile.window_start, 'YYYY-MM-DD HH24:MI') ||
+            ' – ' ||
+            to_char(v_last_profile.window_end, 'YYYY-MM-DD HH24:MI'));
+        v_report := array_append(v_report, '  Час дня: ' || v_last_profile.hour || ', день недели: ' || v_last_profile.dow);
+
+        -- Основные метрики
+        v_report := array_append(v_report, '  Средняя корреляция: ' || COALESCE(round(v_last_profile.avg_correlation::NUMERIC, 3)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '  Доля критических: ' || COALESCE(round(v_last_profile.critical_ratio::NUMERIC, 3)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '  Энтропия: ' || COALESCE(round(v_last_profile.entropy::NUMERIC, 3)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '  Доля петель: ' || COALESCE(round(v_last_profile.self_loop_ratio::NUMERIC, 3)::TEXT, 'NULL'));
+
+        -- Проверка наличия эталона для данного слота
+        SELECT EXISTS (
+            SELECT 1
+            FROM profile_baseline
+            WHERE baseline_name = 'default'
+              AND hour = v_last_profile.hour
+              AND dow = v_last_profile.dow
+        ) INTO v_has_baseline;
+
+        IF NOT v_has_baseline THEN
+            v_report := array_append(v_report, '  ⚠ Эталон для данного слота отсутствует. Сравнение с эталоном невозможно.');
+        ELSE
+            -- Получаем отклонения и собираем текст
+            v_anomaly_text := '';
+            FOR v_dev IN
+                SELECT metric_name, current_value, baseline_mean, baseline_std, z_score, severity
+                FROM get_deviation_report(v_type, v_last_profile.ts)
+            LOOP
+                IF v_dev.metric_name = 'NO_ANOMALIES' THEN
+                    v_anomaly_text := '  Аномалий не обнаружено.';
+                ELSE
+                    IF v_anomaly_text = '' THEN
+                        v_anomaly_text := '  Обнаружены аномалии:';
+                    END IF;
+                    -- Формируем строку без использования format с несколькими спецификаторами
+                    v_line := '    ' || v_dev.metric_name ||
+                              ': Z=' || to_char(v_dev.z_score, '999.99') ||
+                              ' (' || v_dev.severity || ')' ||
+                              ' [тек. ' || to_char(v_dev.current_value, '999.999') ||
+                              ', эталон ' || to_char(v_dev.baseline_mean, '999.999') ||
+                              '±' || to_char(v_dev.baseline_std, '999.999') || ']';
+                    v_anomaly_text := v_anomaly_text || E'\n' || v_line;
+                END IF;
+            END LOOP;
+
+            IF v_anomaly_text = '' THEN
+                v_anomaly_text := '  Аномалий не обнаружено.';
+            END IF;
+            v_report := array_append(v_report, v_anomaly_text);
+        END IF;
+
+        v_report := array_append(v_report, '');
+    END LOOP;
+
+    -- Добавляем информацию о последних аномалиях из лога (кратко)
+    v_report := array_append(v_report, '--- ПОСЛЕДНИЕ АНОМАЛИИ В ЛОГЕ ---');
+    FOR v_rec IN
+        SELECT profile_type, detected_at, anomaly_score
+        FROM anomaly_log
+        ORDER BY detected_at DESC
+        LIMIT 5
+    LOOP
+        v_report := array_append(v_report,
+            '  ' || v_rec.profile_type ||
+            ': ' || to_char(v_rec.detected_at, 'YYYY-MM-DD HH24:MI') ||
+            ' (score=' || to_char(COALESCE(v_rec.anomaly_score, 0.0), '999.99') || ')'
+        );
+    END LOOP;
+    IF NOT FOUND THEN
+        v_report := array_append(v_report, '  Нет зафиксированных аномалий.');
+    END IF;
+
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
+
+    RETURN v_report;
+END;
+$$;
+
+
+COMMENT ON FUNCTION generate_profile_summary_report() IS
+'Генерирует краткий отчёт по текущим профилям нагрузки (operational, daily, weekly).
+Включает основные метрики последних профилей, сравнение с эталоном (если доступен)
+и последние записи из anomaly_log. Возвращает массив строк для удобного отображения.';
+
+-- =============================================================================
+-- Функция: generate_detailed_profile_report (расширенная версия)
+-- Назначение: формирует расширенный отчёт по профилям нагрузки (operational, daily, weekly)
+--             с подробной интерпретацией каждой метрики, анализом аномалий,
+--             контекстными метриками производительности, связью с инцидентами,
+--             динамикой изменений и прогнозными метриками.
+-- Возвращает: TEXT[] – массив строк с отформатированным отчётом.
+-- =============================================================================
+CREATE OR REPLACE FUNCTION generate_detailed_profile_report()
+RETURNS TEXT[]
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_report TEXT[] := '{}';
+    v_line_sep CONSTANT TEXT := E'\n';
+    v_header TEXT := '=== РАСШИРЕННЫЙ АНАЛИТИЧЕСКИЙ ОТЧЁТ ПО ПРОФИЛЯМ НАГРУЗКИ ===';
+    v_ts TIMESTAMPTZ := now();
+    v_rec RECORD;
+    v_dev RECORD;
+    v_anomaly_text TEXT;
+    v_profile_types TEXT[] := ARRAY['operational', 'daily', 'weekly'];
+    v_type TEXT;
+    v_last_profile RECORD;
+    v_has_baseline BOOLEAN;
+    v_metrics_text TEXT;
+    v_line TEXT;
+    v_interpretation TEXT;
+    v_overall_status TEXT := 'СТАБИЛЬНО';
+    v_anomaly_count INT := 0;
+    v_critical_anomalies INT := 0;
+    v_last_anomalies RECORD;
+
+    -- Дополнительные переменные для новых метрик
+    v_avg_op_speed REAL;
+    v_avg_waitings REAL;
+    v_cv_op_speed REAL;
+    v_cv_waitings REAL;
+    v_incident_count INT;
+    v_avg_time_to_incident_min REAL;
+    v_prev_profile RECORD;
+    v_entropy_change REAL;
+    v_critical_ratio_change REAL;
+    v_self_loop_change REAL;
+    v_risk_30min REAL;
+    v_reliability INT;
+    v_forecast_reliability_text TEXT;
+BEGIN
+    -- Заголовок
+    v_report := array_append(v_report, v_header);
+    v_report := array_append(v_report, 'Отчёт сформирован: ' || to_char(v_ts, 'YYYY-MM-DD HH24:MI'));
+    v_report := array_append(v_report, '');
+
+    -- Обработка каждого типа профиля
+    FOREACH v_type IN ARRAY v_profile_types
+    LOOP
+        -- Получаем последний профиль данного типа
+        SELECT
+            profile_type,
+            ts,
+            window_start,
+            window_end,
+            avg_correlation,
+            critical_ratio,
+            entropy,
+            self_loop_ratio,
+            hour,
+            dow,
+            avg_os_angle,
+            avg_wait_angle,
+            unique_states_count,
+            avg_transition_length
+        INTO v_last_profile
+        FROM profile_aggregated
+        WHERE profile_type = v_type
+        ORDER BY ts DESC
+        LIMIT 1;
+
+        IF NOT FOUND THEN
+            v_report := array_append(v_report, 'Тип "' || v_type || '": нет данных');
+            v_report := array_append(v_report, '');
+            CONTINUE;
+        END IF;
+
+        -- ====================================================================
+        -- 1. Контекстные метрики производительности (пункт 5)
+        -- ====================================================================
+        SELECT
+            AVG(ph.op_speed) AS avg_op_speed,
+            AVG(ph.waitings) AS avg_waitings,
+            STDDEV(ph.op_speed) / NULLIF(AVG(ph.op_speed), 0) AS cv_op_speed,
+            STDDEV(ph.waitings) / NULLIF(AVG(ph.waitings), 0) AS cv_waitings
+        INTO
+            v_avg_op_speed, v_avg_waitings, v_cv_op_speed, v_cv_waitings
+        FROM performance_history ph
+        WHERE ph.ts >= v_last_profile.window_start
+          AND ph.ts < v_last_profile.window_end;
+
+        -- ====================================================================
+        -- 2. Связь с инцидентами (пункт 6)
+        -- ====================================================================
+        -- Количество инцидентов в окне
+        SELECT COUNT(*) INTO v_incident_count
+        FROM performance_incident pi
+        WHERE pi.start_timepoint >= v_last_profile.window_start
+          AND pi.start_timepoint < v_last_profile.window_end;
+
+        -- Среднее время до инцидента после попадания в критическое состояние
+        WITH critical_transitions AS (
+            SELECT tl.ts AS trans_ts
+            FROM transition_log tl
+            WHERE tl.to_state IN (SELECT state_id FROM critical_states)
+              AND tl.ts >= v_last_profile.window_start
+              AND tl.ts < v_last_profile.window_end
+        ),
+        incident_times AS (
+            SELECT pi.start_timepoint AS inc_ts
+            FROM performance_incident pi
+            WHERE pi.start_timepoint >= v_last_profile.window_start
+              AND pi.start_timepoint < v_last_profile.window_end
+        ),
+        time_diffs AS (
+            SELECT EXTRACT(EPOCH FROM (MIN(i.inc_ts) - ct.trans_ts)) / 60 AS diff_min
+            FROM critical_transitions ct
+            CROSS JOIN LATERAL (
+                SELECT inc_ts
+                FROM incident_times
+                WHERE inc_ts > ct.trans_ts
+                ORDER BY inc_ts
+                LIMIT 1
+            ) i
+            GROUP BY ct.trans_ts
+        )
+        SELECT AVG(diff_min) INTO v_avg_time_to_incident_min
+        FROM time_diffs
+        WHERE diff_min IS NOT NULL;
+
+        -- ====================================================================
+        -- 3. Сравнение с предыдущим периодом (пункт 7)
+        -- ====================================================================
+        -- Для каждого типа профиля выбираем предыдущий профиль того же типа
+        -- (для operational – предыдущий час, для daily – предыдущий день, для weekly – предыдущая неделя)
+        -- Упрощённо: берём предыдущую запись по времени того же типа
+        SELECT
+            entropy,
+            critical_ratio,
+            self_loop_ratio
+        INTO v_prev_profile
+        FROM profile_aggregated
+        WHERE profile_type = v_type
+          AND ts < v_last_profile.ts
+        ORDER BY ts DESC
+        LIMIT 1;
+
+        IF FOUND THEN
+            v_entropy_change := COALESCE(v_last_profile.entropy - v_prev_profile.entropy, 0);
+            v_critical_ratio_change := COALESCE(v_last_profile.critical_ratio - v_prev_profile.critical_ratio, 0);
+            v_self_loop_change := COALESCE(v_last_profile.self_loop_ratio - v_prev_profile.self_loop_ratio, 0);
+        ELSE
+            v_entropy_change := NULL;
+            v_critical_ratio_change := NULL;
+            v_self_loop_change := NULL;
+        END IF;
+
+        -- ====================================================================
+        -- Формирование секции отчёта для данного типа профиля
+        -- ====================================================================
+        v_report := array_append(v_report, '--- ' || upper(v_type) || ' ПРОФИЛЬ ---');
+        v_report := array_append(v_report, '  Окно: ' ||
+            to_char(v_last_profile.window_start, 'YYYY-MM-DD HH24:MI') ||
+            ' – ' ||
+            to_char(v_last_profile.window_end, 'YYYY-MM-DD HH24:MI'));
+        v_report := array_append(v_report, '  Час дня: ' || v_last_profile.hour || ', день недели: ' || v_last_profile.dow);
+
+        -- Основные метрики цепи Маркова
+        v_report := array_append(v_report, '  Метрики цепи Маркова:');
+        v_report := array_append(v_report, '    - Средняя корреляция: ' || COALESCE(round(v_last_profile.avg_correlation::NUMERIC, 3)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '    - Доля критических состояний: ' || COALESCE(round(v_last_profile.critical_ratio::NUMERIC, 3)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '    - Энтропия распределения: ' || COALESCE(round(v_last_profile.entropy::NUMERIC, 3)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '    - Доля петель (self-loop): ' || COALESCE(round(v_last_profile.self_loop_ratio::NUMERIC, 3)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '    - Угол тренда OS: ' || COALESCE(round(v_last_profile.avg_os_angle::NUMERIC, 3)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '    - Угол тренда ожиданий: ' || COALESCE(round(v_last_profile.avg_wait_angle::NUMERIC, 3)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '    - Уникальных состояний: ' || COALESCE(v_last_profile.unique_states_count::TEXT, 'NULL'));
+        v_report := array_append(v_report, '    - Средняя длина перехода: ' || COALESCE(round(v_last_profile.avg_transition_length::NUMERIC, 3)::TEXT, 'NULL'));
+
+        -- Контекстные метрики производительности (пункт 5)
+        v_report := array_append(v_report, '  Контекстные метрики производительности:');
+        IF v_avg_op_speed IS NOT NULL THEN
+            v_report := array_append(v_report, '    - Средняя операционная скорость: ' || round(v_avg_op_speed::NUMERIC, 2)::TEXT);
+            v_report := array_append(v_report, '    - Коэффициент вариации операционной скорости: ' || COALESCE(round(v_cv_op_speed::NUMERIC, 3)::TEXT, 'NULL'));
+        ELSE
+            v_report := array_append(v_report, '    - Нет данных о производительности в окне.');
+        END IF;
+        IF v_avg_waitings IS NOT NULL THEN
+            v_report := array_append(v_report, '    - Среднее время ожиданий: ' || round(v_avg_waitings::NUMERIC, 2)::TEXT);
+            v_report := array_append(v_report, '    - Коэффициент вариации времени ожиданий: ' || COALESCE(round(v_cv_waitings::NUMERIC, 3)::TEXT, 'NULL'));
+        END IF;
+
+        -- Связь с инцидентами (пункт 6)
+        v_report := array_append(v_report, '  Связь с инцидентами:');
+        v_report := array_append(v_report, '    - Количество инцидентов в окне: ' || COALESCE(v_incident_count::TEXT, '0'));
+        IF v_avg_time_to_incident_min IS NOT NULL THEN
+            v_report := array_append(v_report, '    - Среднее время до инцидента после критического перехода: ' || round(v_avg_time_to_incident_min::NUMERIC, 1)::TEXT || ' мин');
+        ELSE
+            v_report := array_append(v_report, '    - Нет данных о времени до инцидента (нет критических переходов или инцидентов).');
+        END IF;
+
+        -- Сравнение с предыдущим периодом (пункт 7)
+        v_report := array_append(v_report, '  Изменение по сравнению с предыдущим периодом:');
+        IF v_entropy_change IS NOT NULL THEN
+            v_report := array_append(v_report, '    - Энтропия: ' || round(v_entropy_change::NUMERIC, 3)::TEXT || ' (Δ)');
+            v_report := array_append(v_report, '    - Доля критических: ' || round(v_critical_ratio_change::NUMERIC, 3)::TEXT || ' (Δ)');
+            v_report := array_append(v_report, '    - Доля петель: ' || round(v_self_loop_change::NUMERIC, 3)::TEXT || ' (Δ)');
+        ELSE
+            v_report := array_append(v_report, '    - Нет предыдущего периода для сравнения.');
+        END IF;
+
+        -- Интерпретация метрик (существующая логика)
+        v_report := array_append(v_report, '  Интерпретация:');
+        -- Корреляция
+        IF v_last_profile.avg_correlation IS NOT NULL THEN
+            IF v_last_profile.avg_correlation > 0.5 THEN
+                v_interpretation := 'Сильная положительная связь между скоростью и ожиданиями – система чувствительна к нагрузке.';
+            ELSIF v_last_profile.avg_correlation > 0.3 THEN
+                v_interpretation := 'Умеренная положительная связь – возможна зависимость производительности от нагрузки.';
+            ELSIF v_last_profile.avg_correlation > -0.3 THEN
+                v_interpretation := 'Слабая или отсутствующая связь – производительность слабо зависит от нагрузки.';
+            ELSIF v_last_profile.avg_correlation > -0.5 THEN
+                v_interpretation := 'Умеренная отрицательная связь – рост нагрузки сопровождается снижением скорости.';
+            ELSE
+                v_interpretation := 'Сильная отрицательная связь – критическая зависимость, требуется анализ.';
+            END IF;
+            v_report := array_append(v_report, '    - Корреляция: ' || v_interpretation);
+        END IF;
+
+        -- Доля критических
+        IF v_last_profile.critical_ratio IS NOT NULL THEN
+            IF v_last_profile.critical_ratio > 0.2 THEN
+                v_interpretation := 'Высокая доля критических состояний (>20%) – система часто находится в рискованных режимах.';
+            ELSIF v_last_profile.critical_ratio > 0.1 THEN
+                v_interpretation := 'Умеренная доля критических состояний (10-20%) – периодические риски.';
+            ELSE
+                v_interpretation := 'Низкая доля критических состояний (<10%) – система в основном стабильна.';
+            END IF;
+            v_report := array_append(v_report, '    - Критическая доля: ' || v_interpretation);
+        END IF;
+
+        -- Энтропия
+        IF v_last_profile.entropy IS NOT NULL THEN
+            IF v_last_profile.entropy > 5.0 THEN
+                v_interpretation := 'Высокая энтропия (>5) – большое разнообразие состояний, система динамична, возможна нестабильность.';
+            ELSIF v_last_profile.entropy > 2.0 THEN
+                v_interpretation := 'Средняя энтропия (2-5) – умеренное разнообразие, типично для нормальной работы.';
+            ELSE
+                v_interpretation := 'Низкая энтропия (<2) – система зациклена в небольшом наборе состояний, возможна стагнация или перегрузка.';
+            END IF;
+            v_report := array_append(v_report, '    - Энтропия: ' || v_interpretation);
+        END IF;
+
+        -- Self-loop
+        IF v_last_profile.self_loop_ratio IS NOT NULL THEN
+            IF v_last_profile.self_loop_ratio > 0.6 THEN
+                v_interpretation := 'Очень высокая доля петель (>60%) – система склонна "застревать" в состояниях, малая изменчивость.';
+            ELSIF v_last_profile.self_loop_ratio > 0.4 THEN
+                v_interpretation := 'Умеренная доля петель (40-60%) – смешанное поведение.';
+            ELSE
+                v_interpretation := 'Низкая доля петель (<40%) – система активно переключается между состояниями.';
+            END IF;
+            v_report := array_append(v_report, '    - Петли: ' || v_interpretation);
+        END IF;
+
+        -- Проверка эталона и аномалий (существующая логика)
+        SELECT EXISTS (
+            SELECT 1
+            FROM profile_baseline
+            WHERE baseline_name = 'default'
+              AND hour = v_last_profile.hour
+              AND dow = v_last_profile.dow
+        ) INTO v_has_baseline;
+
+        IF NOT v_has_baseline THEN
+            v_report := array_append(v_report, '  ⚠ Эталон для данного слота отсутствует. Сравнение с эталоном невозможно.');
+        ELSE
+            v_anomaly_text := '';
+            FOR v_dev IN
+                SELECT metric_name, current_value, baseline_mean, baseline_std, z_score, severity
+                FROM get_deviation_report(v_type, v_last_profile.ts)
+            LOOP
+                IF v_dev.metric_name = 'NO_ANOMALIES' THEN
+                    v_anomaly_text := '  Аномалий не обнаружено.';
+                ELSE
+                    IF v_anomaly_text = '' THEN
+                        v_anomaly_text := '  Обнаружены отклонения от эталона:';
+                    END IF;
+                    v_line := '    ' || v_dev.metric_name ||
+                              ': Z=' || to_char(v_dev.z_score, '999.99') ||
+                              ' (' || v_dev.severity || ')' ||
+                              ' [тек. ' || to_char(v_dev.current_value, '999.999') ||
+                              ', эталон ' || to_char(v_dev.baseline_mean, '999.999') ||
+                              '±' || to_char(v_dev.baseline_std, '999.999') || ']';
+                    v_anomaly_text := v_anomaly_text || E'\n' || v_line;
+
+                    -- Дополнительная интерпретация отклонения
+                    IF v_dev.metric_name = 'avg_correlation' THEN
+                        IF v_dev.z_score > 2 THEN
+                            v_anomaly_text := v_anomaly_text || E'\n      → Корреляция значительно выше эталона – усиление связи, возможно увеличение нагрузки.';
+                        ELSIF v_dev.z_score < -2 THEN
+                            v_anomaly_text := v_anomaly_text || E'\n      → Корреляция значительно ниже эталона – ослабление связи, возможно изменение характера нагрузки.';
+                        END IF;
+                    ELSIF v_dev.metric_name = 'entropy' THEN
+                        IF v_dev.z_score > 2 THEN
+                            v_anomaly_text := v_anomaly_text || E'\n      → Энтропия выше нормы – система стала более хаотичной, возможна нестабильность.';
+                        ELSIF v_dev.z_score < -2 THEN
+                            v_anomaly_text := v_anomaly_text || E'\n      → Энтропия ниже нормы – система стала более предсказуемой, но возможно застревание.';
+                        END IF;
+                    ELSIF v_dev.metric_name = 'critical_ratio' THEN
+                        IF v_dev.z_score > 2 THEN
+                            v_anomaly_text := v_anomaly_text || E'\n      → Доля критических состояний выше нормы – повышенный риск инцидентов.';
+                        END IF;
+                    ELSIF v_dev.metric_name = 'self_loop_ratio' THEN
+                        IF v_dev.z_score > 2 THEN
+                            v_anomaly_text := v_anomaly_text || E'\n      → Доля петель выше нормы – система менее динамична, возможен застой.';
+                        END IF;
+                    END IF;
+
+                    v_anomaly_count := v_anomaly_count + 1;
+                    IF v_dev.severity IN ('CRITICAL', 'HIGH') THEN
+                        v_critical_anomalies := v_critical_anomalies + 1;
+                    END IF;
+                END IF;
+            END LOOP;
+
+            IF v_anomaly_text = '' THEN
+                v_anomaly_text := '  Аномалий не обнаружено.';
+            END IF;
+            v_report := array_append(v_report, v_anomaly_text);
+        END IF;
+
+        v_report := array_append(v_report, '');
+    END LOOP;
+
+    -- ====================================================================
+    -- 8. Прогнозные метрики (пункт 8) – глобальные для всей системы
+    -- ====================================================================
+    v_report := array_append(v_report, '--- ПРОГНОЗНЫЕ МЕТРИКИ ---');
+
+    -- Риск на 30 минут
+    BEGIN
+        v_risk_30min := mchain_predict_risk_current_horizon();
+        IF v_risk_30min IS NOT NULL THEN
+            v_report := array_append(v_report, '  Прогноз риска на 30 минут: ' || round(v_risk_30min::NUMERIC, 4)::TEXT);
+        ELSE
+            v_report := array_append(v_report, '  Прогноз риска на 30 минут: недоступен (нет текущего состояния)');
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        v_report := array_append(v_report, '  Прогноз риска на 30 минут: ошибка (' || SQLERRM || ')');
+    END;
+
+    -- Достоверность прогноза
+    BEGIN
+        v_reliability := mchain_forecast_reliability();
+        v_report := array_append(v_report, '  Рейтинг достоверности прогнозов (0-5): ' || v_reliability::TEXT);
+        v_forecast_reliability_text := CASE
+            WHEN v_reliability = 0 THEN 'Модель не обучена (нет данных)'
+            WHEN v_reliability = 1 THEN 'Крайне низкая достоверность'
+            WHEN v_reliability = 2 THEN 'Низкая достоверность'
+            WHEN v_reliability = 3 THEN 'Минимально достаточная'
+            WHEN v_reliability = 4 THEN 'Хорошая достоверность'
+            WHEN v_reliability = 5 THEN 'Отличная достоверность'
+            ELSE 'Неизвестно'
+        END;
+        v_report := array_append(v_report, '  Интерпретация: ' || v_forecast_reliability_text);
+    EXCEPTION WHEN OTHERS THEN
+        v_report := array_append(v_report, '  Достоверность прогнозов: ошибка (' || SQLERRM || ')');
+    END;
+
+    v_report := array_append(v_report, '');
+
+    -- Общая оценка состояния системы
+    v_report := array_append(v_report, '--- ОБЩАЯ ОЦЕНКА СОСТОЯНИЯ СИСТЕМЫ ---');
+    IF v_critical_anomalies > 0 THEN
+        v_overall_status := 'КРИТИЧЕСКОЕ – обнаружены сильные аномалии, требуется немедленное вмешательство.';
+    ELSIF v_anomaly_count > 0 THEN
+        v_overall_status := 'НЕСТАБИЛЬНОЕ – выявлены отклонения, рекомендуется анализ и мониторинг.';
+    ELSE
+        v_overall_status := 'СТАБИЛЬНОЕ – все профили в пределах нормы, система работает штатно.';
+    END IF;
+    v_report := array_append(v_report, '  Статус: ' || v_overall_status);
+    v_report := array_append(v_report, '');
+
+    -- Последние зафиксированные аномалии из лога (кратко)
+    v_report := array_append(v_report, '--- ПОСЛЕДНИЕ АНОМАЛИИ В ЛОГЕ ---');
+    FOR v_last_anomalies IN
+        SELECT profile_type, detected_at, anomaly_score, affected_metrics
+        FROM anomaly_log
+        ORDER BY detected_at DESC
+        LIMIT 5
+    LOOP
+        v_report := array_append(v_report,
+            '  ' || v_last_anomalies.profile_type ||
+            ': ' || to_char(v_last_anomalies.detected_at, 'YYYY-MM-DD HH24:MI') ||
+            ' (score=' || to_char(COALESCE(v_last_anomalies.anomaly_score, 0.0), '999.99') || ')'
+        );
+    END LOOP;
+    IF NOT FOUND THEN
+        v_report := array_append(v_report, '  Нет зафиксированных аномалий.');
+    END IF;
+
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
+
+    RETURN v_report;
+END;
+$$;
+
+COMMENT ON FUNCTION generate_detailed_profile_report() IS
+'Формирует расширенный аналитический отчёт по профилям нагрузки с добавлением:
+- контекстных метрик производительности (средние и CV op_speed, waitings),
+- связи с инцидентами (количество в окне, среднее время до инцидента после критического перехода),
+- сравнения с предыдущим периодом (изменение энтропии, критической доли, петель),
+- прогнозных метрик (риск на 30 минут и достоверность прогнозов).';
