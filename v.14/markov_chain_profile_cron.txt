@@ -18,4 +18,11 @@
 
 # Удаление недельных профилей старше 90 дней
 0 4 * * * psql -d expecto_db -U expecto_user -c "DELETE FROM profile_aggregated WHERE profile_type='weekly' AND ts < now() - interval '90 days';" > /postgres/pg_expecto/sh/weekly.log 2>&1
+
+# Обновление performance_history каждую минуту
+*/1 * * * * psql -d expecto_db -U expecto_user -c "SELECT refresh_performance_history();" > /postgres/pg_expecto/sh/refresh_performance_history.log 2>&1
+
+# Ежедневная очистка (в 03:00)
+0 3 * * * psql -d expecto_db -U expecto_user -c "SELECT clean_profile_comparison_log();"
+
 # Расчет метрик профиля нагрузки на основе цепи Маркова 
