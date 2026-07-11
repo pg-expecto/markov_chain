@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_profile_functions.sql
--- version 14.1
+-- version 14.4
 --------------------------------------------------------------------------------
 -- Функции для расчета метрик профиля нагрузки на основе цепи Маркова 
 --------------------------------------------------------------------------------
@@ -59,7 +59,53 @@
 -- Назначение: формирует расширенный отчёт по профилям нагрузки (operational, daily, weekly)
 --             с подробной интерпретацией каждой метрики, анализом аномалий и
 --             общей оценкой стабильности системы.
+--
+-- Функция: compare_profile_windows
+-- Назначение: сравнивает метрики профилей нагрузки для двух временных окон
+--             (например, час до инцидента и предыдущий час) и возвращает
+--             таблицу с абсолютными и относительными изменениями, а также
+--             интерпретацией для каждой метрики.
+--
+-- Функция: refresh_performance_history
+-- Назначение: Дополнить таблицу performance_history
+--
+-- Функция: find_incident_free_window
+-- Назначение: найти отрезок времени заданной длины (в минутах), свободный от
+--             инцидентов производительности, максимально близкий к текущему
+--             моменту (now()).
+--
+-- Функция: save_baseline_profile
+-- Назначение: Сохранение эталонного профиля на основе incident_free_window_current
+--
+-- Функция: save_current_profile
+-- Назначение: Сохранение текущего профиля от текущего времени
+--
+-- Функция: compare_profiles
+-- Назначение: Сравнение эталонного и текущего профилей с анализом аномалий
+-- 
+-- Функция: histogram_divergence
+-- Назначение: Сравнение гистограм эталонного и текущего профилей с анализом аномалий
+-- 
+-- Функция: clean_profile_comparison_log
+-- Назначение: Функция очистки старых записей из profile_comparison_log
+--
+-- Функция: get_incident_free_window_before
+-- Назначение: Получить безынцидентное окно длины p_window_minutes,
+-- заканчивающееся не позже p_ts, с максимальным концом.
+-- 
+-- Функция: historical_fill_profile_comparison_log
+-- Назначение: Процедура исторического заполнения
+--
+-- Функция: generate_profile_incident_analytics_report
+-- Назначение: формирует аналитический отчёт по сводному анализу сравнения
+--             профилей производительности и инцидентов на основе данных
+--             из profile_comparison_log и performance_incident.
+--
+-- Функция: generate_comprehensive_analytical_report
+-- Назначение: формирует сводный аналитический отчёт по производительности,
+--             прогнозированию и профилям нагрузки за указанный период.
 
+-- =============================================================================
 
 
 -- -----------------------------------------------------------------------------
@@ -403,14 +449,16 @@ CREATE OR REPLACE FUNCTION build_baseline_profile(
     p_start                     TIMESTAMPTZ DEFAULT now() - INTERVAL '30 days',
     p_end                       TIMESTAMPTZ DEFAULT now(),
     p_baseline_name             TEXT        DEFAULT 'default',
-    p_exclude_incident_window_min INT        DEFAULT 30,
+    p_exclude_before_min        INT         DEFAULT 30,   -- минуты до инцидента
+    p_exclude_after_min         INT         DEFAULT 60,   -- минуты после инцидента
     p_min_hours_per_slot        INT         DEFAULT 1
 )
 RETURNS TEXT
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_exclude_interval INTERVAL := (p_exclude_incident_window_min || ' minutes')::INTERVAL;
+    v_before_interval INTERVAL := (p_exclude_before_min || ' minutes')::INTERVAL;
+    v_after_interval  INTERVAL := (p_exclude_after_min  || ' minutes')::INTERVAL;
     v_metrics RECORD;
     v_hour INT;
     v_dow INT;
@@ -420,8 +468,8 @@ DECLARE
 BEGIN
     DELETE FROM profile_baseline WHERE baseline_name = p_baseline_name;
 
-    RAISE NOTICE 'Начало построения эталона "%s" за период с %s по %s. Всего слотов: %s',
-                 p_baseline_name, p_start, p_end, v_total_slots_all;
+    RAISE NOTICE 'Начало построения эталона "%s" за период с %s по %s. Буферы: %s мин до, %s мин после.',
+                 p_baseline_name, p_start, p_end, p_exclude_before_min, p_exclude_after_min;
 
     FOR v_hour IN 0..23 LOOP
         RAISE NOTICE 'Обработка часа %s из 24', v_hour;
@@ -438,7 +486,7 @@ BEGIN
                       SELECT 1
                       FROM performance_incident pi
                       WHERE pi.start_timepoint BETWEEN
-                            ph.ts - v_exclude_interval AND ph.ts + v_exclude_interval
+                            ph.ts - v_before_interval AND ph.ts + v_after_interval
                   )
             ),
             perf_agg AS (
@@ -621,7 +669,6 @@ BEGIN
             END IF;
         END LOOP;
 
-        -- Обновление прогресса после обработки всех дней для текущего часа
         v_processed_slots := v_processed_slots + 7;
         RAISE NOTICE 'Прогресс: % из % слотов обработано (%.1f%%). Заполнено слотов: %',
                      v_processed_slots, v_total_slots_all,
@@ -632,13 +679,14 @@ BEGIN
     RAISE NOTICE 'Построение эталона "%s" завершено. Заполнено %s слотов (минимум %s часов на слот).',
                  p_baseline_name, v_total_slots, p_min_hours_per_slot;
 
-    RETURN format('Baseline "%s" rebuilt with %s slots filled (minimum %s hours per slot).',
-                  p_baseline_name, v_total_slots, p_min_hours_per_slot);
+    RETURN format('Baseline "%s" rebuilt with %s slots filled (buffers: %s before, %s after).',
+                  p_baseline_name, v_total_slots, p_exclude_before_min, p_exclude_after_min);
 END;
 $$;
 
-COMMENT ON FUNCTION build_baseline_profile(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INT, INT) IS
-'Строит эталонный профиль с исправленным расчётом энтропии, заполнением всех метрик и периодом по умолчанию 30 дней.';
+COMMENT ON FUNCTION build_baseline_profile(TIMESTAMPTZ, TIMESTAMPTZ, TEXT, INT, INT, INT) IS
+'Строит эталонный профиль с асимметричными буферами до (p_exclude_before_min) и после (p_exclude_after_min) инцидента. По умолчанию: 30 мин до, 60 мин после.';
+
 
 
 
@@ -1365,9 +1413,9 @@ BEGIN
     v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
 
     RETURN v_report;
+		
 END;
 $$;
-
 
 COMMENT ON FUNCTION generate_profile_summary_report() IS
 'Генерирует краткий отчёт по текущим профилям нагрузки (operational, daily, weekly).
@@ -1795,3 +1843,1914 @@ COMMENT ON FUNCTION generate_detailed_profile_report() IS
 - связи с инцидентами (количество в окне, среднее время до инцидента после критического перехода),
 - сравнения с предыдущим периодом (изменение энтропии, критической доли, петель),
 - прогнозных метрик (риск на 30 минут и достоверность прогнозов).';
+
+
+-- =============================================================================
+-- Функция: compare_profile_windows (возвращает text[] для отчёта)
+-- Назначение: сравнивает метрики профилей нагрузки для двух временных окон,
+--             задаваемых строками в формате 'YYYY-MM-DD HH24:MI',
+--             и возвращает форматированный отчёт в виде массива строк.
+-- Параметры:
+--   p_window1_start, p_window1_end – первое окно (базовое)
+--   p_window2_start, p_window2_end – второе окно (анализируемое)
+-- Возвращает: TEXT[] – строки отчёта с заголовком, описанием окон,
+--             строками по каждой метрике и итоговой оценкой.
+-- =============================================================================
+CREATE OR REPLACE FUNCTION compare_profile_windows(
+    p_window1_start TEXT,
+    p_window1_end   TEXT,
+    p_window2_start TEXT,
+    p_window2_end   TEXT
+)
+RETURNS TEXT[]
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v1_start TIMESTAMPTZ;
+    v1_end   TIMESTAMPTZ;
+    v2_start TIMESTAMPTZ;
+    v2_end   TIMESTAMPTZ;
+    w1 RECORD;
+    w2 RECORD;
+    v_report TEXT[] := '{}';
+    v_line TEXT;
+    v_delta_abs REAL;
+    v_delta_pct REAL;
+    v_interp TEXT;
+    v_metric_name TEXT;
+    v_w1_val TEXT;
+    v_w2_val TEXT;
+    v_overall_status TEXT := 'НОРМА';
+    v_critical_cnt INT := 0;
+BEGIN
+    -- Преобразование входных строк в TIMESTAMPTZ
+    BEGIN
+        v1_start := to_timestamp(p_window1_start, 'YYYY-MM-DD HH24:MI');
+        v1_end   := to_timestamp(p_window1_end,   'YYYY-MM-DD HH24:MI');
+        v2_start := to_timestamp(p_window2_start, 'YYYY-MM-DD HH24:MI');
+        v2_end   := to_timestamp(p_window2_end,   'YYYY-MM-DD HH24:MI');
+    EXCEPTION WHEN OTHERS THEN
+        RAISE EXCEPTION 'Неверный формат даты/времени. Ожидается "YYYY-MM-DD HH24:MI" (например, "2026-07-01 10:21").';
+    END;
+
+    -- Проверка корректности интервалов
+    IF v1_start >= v1_end THEN
+        RAISE EXCEPTION 'Начало первого окна должно быть раньше конца.';
+    END IF;
+    IF v2_start >= v2_end THEN
+        RAISE EXCEPTION 'Начало второго окна должно быть раньше конца.';
+    END IF;
+
+    -- Получаем метрики для обоих окон
+    SELECT * INTO w1 FROM calculate_profile_metrics(v1_start, v1_end);
+    SELECT * INTO w2 FROM calculate_profile_metrics(v2_start, v2_end);
+
+    -- Заголовок отчёта
+    v_report := array_append(v_report, '=== СРАВНИТЕЛЬНЫЙ АНАЛИЗ ПРОФИЛЕЙ НАГРУЗКИ ===');
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, format('Окно 1 (базовое): %s – %s',
+        to_char(v1_start, 'YYYY-MM-DD HH24:MI'),
+        to_char(v1_end,   'YYYY-MM-DD HH24:MI')));
+    v_report := array_append(v_report, format('Окно 2 (анализируемое): %s – %s',
+        to_char(v2_start, 'YYYY-MM-DD HH24:MI'),
+        to_char(v2_end,   'YYYY-MM-DD HH24:MI')));
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, '--- МЕТРИКИ И ИЗМЕНЕНИЯ ---');
+
+    -- Вспомогательная функция для добавления строки метрики
+    -- Объявляем локальную процедуру (используем блок DO, но проще в цикле)
+
+    -- 1. avg_correlation
+    v_metric_name := 'Средняя корреляция';
+    v_w1_val := COALESCE(w1.avg_correlation::TEXT, 'NULL');
+    v_w2_val := COALESCE(w2.avg_correlation::TEXT, 'NULL');
+    v_delta_abs := COALESCE(w2.avg_correlation - w1.avg_correlation, 0);
+    v_delta_pct := CASE WHEN COALESCE(w1.avg_correlation, 0) <> 0 
+                        THEN (v_delta_abs / w1.avg_correlation) * 100 
+                        ELSE NULL END;
+    v_interp := CASE 
+        WHEN v_delta_abs > 0.2 THEN 'Значительный рост связи'
+        WHEN v_delta_abs < -0.2 THEN 'Значительное ослабление связи'
+        WHEN v_delta_abs > 0.05 THEN 'Умеренный рост связи'
+        WHEN v_delta_abs < -0.05 THEN 'Умеренное ослабление связи'
+        ELSE 'Без изменений'
+    END;
+    v_line := format('%s: %s → %s (Δ=%s, %s%%) – %s',
+        v_metric_name, v_w1_val, v_w2_val,
+        round(v_delta_abs::NUMERIC, 3),
+        COALESCE(round(v_delta_pct::NUMERIC, 1)::TEXT, '∞'),
+        v_interp);
+    v_report := array_append(v_report, v_line);
+    IF v_delta_abs > 0.2 OR v_delta_abs < -0.2 THEN v_critical_cnt := v_critical_cnt + 1; END IF;
+
+    -- 2. critical_ratio
+    v_metric_name := 'Доля критических состояний';
+    v_w1_val := COALESCE(w1.critical_ratio::TEXT, 'NULL');
+    v_w2_val := COALESCE(w2.critical_ratio::TEXT, 'NULL');
+    v_delta_abs := COALESCE(w2.critical_ratio - w1.critical_ratio, 0);
+    v_delta_pct := CASE WHEN COALESCE(w1.critical_ratio, 0) <> 0 
+                        THEN (v_delta_abs / w1.critical_ratio) * 100 
+                        ELSE NULL END;
+    v_interp := CASE 
+        WHEN v_delta_abs > 0.05 THEN 'Существенный рост риска'
+        WHEN v_delta_abs > 0.02 THEN 'Умеренный рост риска'
+        WHEN v_delta_abs < -0.05 THEN 'Значительное снижение риска'
+        WHEN v_delta_abs < -0.02 THEN 'Умеренное снижение риска'
+        ELSE 'Без изменений'
+    END;
+    v_line := format('%s: %s → %s (Δ=%s, %s%%) – %s',
+        v_metric_name, v_w1_val, v_w2_val,
+        round(v_delta_abs::NUMERIC, 3),
+        COALESCE(round(v_delta_pct::NUMERIC, 1)::TEXT, '∞'),
+        v_interp);
+    v_report := array_append(v_report, v_line);
+    IF v_delta_abs > 0.05 THEN v_critical_cnt := v_critical_cnt + 2; END IF;
+
+    -- 3. entropy
+    v_metric_name := 'Энтропия';
+    v_w1_val := COALESCE(w1.entropy::TEXT, 'NULL');
+    v_w2_val := COALESCE(w2.entropy::TEXT, 'NULL');
+    v_delta_abs := COALESCE(w2.entropy - w1.entropy, 0);
+    v_delta_pct := CASE WHEN COALESCE(w1.entropy, 0) <> 0 
+                        THEN (v_delta_abs / w1.entropy) * 100 
+                        ELSE NULL END;
+    v_interp := CASE 
+        WHEN v_delta_abs > 0.5 THEN 'Критический рост хаоса'
+        WHEN v_delta_abs > 0.2 THEN 'Умеренный рост разнообразия'
+        WHEN v_delta_abs < -0.5 THEN 'Резкое снижение разнообразия'
+        WHEN v_delta_abs < -0.2 THEN 'Умеренное снижение разнообразия'
+        ELSE 'Без изменений'
+    END;
+    v_line := format('%s: %s → %s (Δ=%s, %s%%) – %s',
+        v_metric_name, v_w1_val, v_w2_val,
+        round(v_delta_abs::NUMERIC, 3),
+        COALESCE(round(v_delta_pct::NUMERIC, 1)::TEXT, '∞'),
+        v_interp);
+    v_report := array_append(v_report, v_line);
+    IF v_delta_abs > 0.5 THEN v_critical_cnt := v_critical_cnt + 2; END IF;
+
+    -- 4. self_loop_ratio
+    v_metric_name := 'Доля петель (self-loop)';
+    v_w1_val := COALESCE(w1.self_loop_ratio::TEXT, 'NULL');
+    v_w2_val := COALESCE(w2.self_loop_ratio::TEXT, 'NULL');
+    v_delta_abs := COALESCE(w2.self_loop_ratio - w1.self_loop_ratio, 0);
+    v_delta_pct := CASE WHEN COALESCE(w1.self_loop_ratio, 0) <> 0 
+                        THEN (v_delta_abs / w1.self_loop_ratio) * 100 
+                        ELSE NULL END;
+    v_interp := CASE 
+        WHEN v_delta_abs > 0.1 THEN 'Сильный рост инерционности'
+        WHEN v_delta_abs > 0.05 THEN 'Умеренный рост петель'
+        WHEN v_delta_abs < -0.1 THEN 'Сильное снижение петель'
+        WHEN v_delta_abs < -0.05 THEN 'Умеренное снижение петель'
+        ELSE 'Без изменений'
+    END;
+    v_line := format('%s: %s → %s (Δ=%s, %s%%) – %s',
+        v_metric_name, v_w1_val, v_w2_val,
+        round(v_delta_abs::NUMERIC, 3),
+        COALESCE(round(v_delta_pct::NUMERIC, 1)::TEXT, '∞'),
+        v_interp);
+    v_report := array_append(v_report, v_line);
+    IF v_delta_abs > 0.1 THEN v_critical_cnt := v_critical_cnt + 1; END IF;
+
+    -- 5. avg_os_angle
+    v_metric_name := 'Угол тренда OS (градусы)';
+    v_w1_val := COALESCE(w1.avg_os_angle::TEXT, 'NULL');
+    v_w2_val := COALESCE(w2.avg_os_angle::TEXT, 'NULL');
+    v_delta_abs := COALESCE(w2.avg_os_angle - w1.avg_os_angle, 0);
+    v_delta_pct := CASE WHEN COALESCE(w1.avg_os_angle, 0) <> 0 
+                        THEN (v_delta_abs / w1.avg_os_angle) * 100 
+                        ELSE NULL END;
+    v_interp := CASE 
+        WHEN v_delta_abs > 10 THEN 'Значительное изменение угла'
+        WHEN v_delta_abs > 5 THEN 'Умеренное изменение угла'
+        WHEN v_delta_abs < -10 THEN 'Значительное изменение в отрицательную сторону'
+        WHEN v_delta_abs < -5 THEN 'Умеренное изменение в отрицательную сторону'
+        ELSE 'Без изменений'
+    END;
+    v_line := format('%s: %s → %s (Δ=%s, %s%%) – %s',
+        v_metric_name, v_w1_val, v_w2_val,
+        round(v_delta_abs::NUMERIC, 1),
+        COALESCE(round(v_delta_pct::NUMERIC, 1)::TEXT, '∞'),
+        v_interp);
+    v_report := array_append(v_report, v_line);
+    IF v_delta_abs > 10 THEN v_critical_cnt := v_critical_cnt + 1; END IF;
+
+    -- 6. avg_wait_angle
+    v_metric_name := 'Угол тренда ожиданий (градусы)';
+    v_w1_val := COALESCE(w1.avg_wait_angle::TEXT, 'NULL');
+    v_w2_val := COALESCE(w2.avg_wait_angle::TEXT, 'NULL');
+    v_delta_abs := COALESCE(w2.avg_wait_angle - w1.avg_wait_angle, 0);
+    v_delta_pct := CASE WHEN COALESCE(w1.avg_wait_angle, 0) <> 0 
+                        THEN (v_delta_abs / w1.avg_wait_angle) * 100 
+                        ELSE NULL END;
+    v_interp := CASE 
+        WHEN v_delta_abs > 10 THEN 'Значительное изменение угла'
+        WHEN v_delta_abs > 5 THEN 'Умеренное изменение угла'
+        WHEN v_delta_abs < -10 THEN 'Значительное изменение в отрицательную сторону'
+        WHEN v_delta_abs < -5 THEN 'Умеренное изменение в отрицательную сторону'
+        ELSE 'Без изменений'
+    END;
+    v_line := format('%s: %s → %s (Δ=%s, %s%%) – %s',
+        v_metric_name, v_w1_val, v_w2_val,
+        round(v_delta_abs::NUMERIC, 1),
+        COALESCE(round(v_delta_pct::NUMERIC, 1)::TEXT, '∞'),
+        v_interp);
+    v_report := array_append(v_report, v_line);
+    IF v_delta_abs > 10 THEN v_critical_cnt := v_critical_cnt + 1; END IF;
+
+    -- 7. unique_states_count
+    v_metric_name := 'Количество уникальных состояний';
+    v_w1_val := COALESCE(w1.unique_states_count::TEXT, 'NULL');
+    v_w2_val := COALESCE(w2.unique_states_count::TEXT, 'NULL');
+    v_delta_abs := COALESCE(w2.unique_states_count - w1.unique_states_count, 0);
+    v_delta_pct := CASE WHEN COALESCE(w1.unique_states_count, 0) <> 0 
+                        THEN (v_delta_abs / w1.unique_states_count) * 100 
+                        ELSE NULL END;
+    v_interp := CASE 
+        WHEN v_delta_abs > 10 THEN 'Резкое расширение набора состояний'
+        WHEN v_delta_abs > 5 THEN 'Умеренное расширение'
+        WHEN v_delta_abs < -10 THEN 'Резкое сужение набора состояний'
+        WHEN v_delta_abs < -5 THEN 'Умеренное сужение'
+        ELSE 'Без изменений'
+    END;
+    v_line := format('%s: %s → %s (Δ=%s, %s%%) – %s',
+        v_metric_name, v_w1_val, v_w2_val,
+        v_delta_abs::TEXT,
+        COALESCE(round(v_delta_pct::NUMERIC, 1)::TEXT, '∞'),
+        v_interp);
+    v_report := array_append(v_report, v_line);
+    IF v_delta_abs > 10 THEN v_critical_cnt := v_critical_cnt + 1; END IF;
+
+    -- 8. avg_transition_length
+    v_metric_name := 'Средняя длина перехода';
+    v_w1_val := COALESCE(w1.avg_transition_length::TEXT, 'NULL');
+    v_w2_val := COALESCE(w2.avg_transition_length::TEXT, 'NULL');
+    v_delta_abs := COALESCE(w2.avg_transition_length - w1.avg_transition_length, 0);
+    v_delta_pct := CASE WHEN COALESCE(w1.avg_transition_length, 0) <> 0 
+                        THEN (v_delta_abs / w1.avg_transition_length) * 100 
+                        ELSE NULL END;
+    v_interp := CASE 
+        WHEN v_delta_abs > 0.5 THEN 'Значительное увеличение (скачки между состояниями)'
+        WHEN v_delta_abs > 0.2 THEN 'Умеренное увеличение'
+        WHEN v_delta_abs < -0.5 THEN 'Значительное уменьшение (близкие переходы)'
+        WHEN v_delta_abs < -0.2 THEN 'Умеренное уменьшение'
+        ELSE 'Без изменений'
+    END;
+    v_line := format('%s: %s → %s (Δ=%s, %s%%) – %s',
+        v_metric_name, v_w1_val, v_w2_val,
+        round(v_delta_abs::NUMERIC, 3),
+        COALESCE(round(v_delta_pct::NUMERIC, 1)::TEXT, '∞'),
+        v_interp);
+    v_report := array_append(v_report, v_line);
+    IF v_delta_abs > 0.5 THEN v_critical_cnt := v_critical_cnt + 1; END IF;
+
+    -- 9. state_histogram (JSON) – только текст
+    v_metric_name := 'Гистограмма состояний (JSON)';
+    v_w1_val := COALESCE(w1.state_histogram::TEXT, 'NULL');
+    v_w2_val := COALESCE(w2.state_histogram::TEXT, 'NULL');
+    v_line := format('%s: %s → %s (только для справки)',
+        v_metric_name, v_w1_val, v_w2_val);
+    v_report := array_append(v_report, v_line);
+
+    -- 10. top_transition (JSON)
+    v_metric_name := 'Самый частый переход (JSON)';
+    v_w1_val := COALESCE(w1.top_transition::TEXT, 'NULL');
+    v_w2_val := COALESCE(w2.top_transition::TEXT, 'NULL');
+    v_line := format('%s: %s → %s (только для справки)',
+        v_metric_name, v_w1_val, v_w2_val);
+    v_report := array_append(v_report, v_line);
+
+    -- Итоговая оценка
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, '--- ИТОГОВАЯ ОЦЕНКА ---');
+    IF v_critical_cnt >= 3 THEN
+        v_overall_status := 'КРИТИЧЕСКОЕ – обнаружены значительные изменения, требуется немедленный анализ';
+    ELSIF v_critical_cnt >= 1 THEN
+        v_overall_status := 'НЕСТАБИЛЬНОЕ – выявлены отклонения, рекомендуется мониторинг';
+    ELSE
+        v_overall_status := 'НОРМА – значимых изменений не обнаружено';
+    END IF;
+    v_report := array_append(v_report, format('Статус: %s', v_overall_status));
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
+
+    RETURN v_report;
+END;
+$$;
+
+COMMENT ON FUNCTION compare_profile_windows(TEXT, TEXT, TEXT, TEXT) IS
+'Сравнивает профили нагрузки для двух окон, задаваемых строками в формате "YYYY-MM-DD HH24:MI". Возвращает форматированный отчёт в виде массива строк с метриками, изменениями, интерпретацией и итоговой оценкой.';
+
+-- =============================================================================
+-- Функция: refresh_performance_history
+-- Назначение: Дополнить таблицу performance_history
+CREATE OR REPLACE FUNCTION refresh_performance_history()
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    last_ts TIMESTAMPTZ;
+    start_ts TIMESTAMPTZ;
+    end_ts TIMESTAMPTZ := now();
+    result TEXT;
+BEGIN
+    -- Определяем последнюю запись в performance_history
+    SELECT MAX(ts) INTO last_ts FROM performance_history;
+    
+    IF last_ts IS NULL THEN
+        -- Если таблица пуста, берём самую раннюю минуту из cluster_stat_median
+        SELECT MIN(curr_timestamp) INTO start_ts FROM cluster_stat_median;
+        IF start_ts IS NULL THEN
+            RETURN 'Нет данных в cluster_stat_median';
+        END IF;
+    ELSE
+        -- Начинаем со следующей минуты
+        start_ts := last_ts + INTERVAL '1 minute';
+    END IF;
+    
+    IF start_ts > end_ts THEN
+        RETURN 'Новых данных нет';
+    END IF;
+    
+    -- Вызываем инкрементальное добавление
+    result := append_performance_history(start_ts, end_ts);
+    RETURN result;
+END;
+$$;
+
+
+-- =============================================================================
+-- Функция: find_incident_free_window (исправленная – оконные функции в WHERE)
+-- Назначение: найти отрезок времени заданной длины, свободный от инцидентов,
+--             максимально близкий к последнему завершённому инциденту.
+--             Результат сохраняется в таблицу incident_free_window_current.
+-- Входные параметры:
+--   p_window_minutes INT – требуемая длина окна в минутах (по умолчанию 60)
+-- Возвращает:
+--   TEXT – сообщение о результате
+-- =============================================================================
+CREATE OR REPLACE FUNCTION find_incident_free_window(
+    p_window_minutes      INT DEFAULT 60,
+    p_exclude_before_min  INT DEFAULT 30,
+    p_exclude_after_min   INT DEFAULT 60
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    v_now          TIMESTAMPTZ := now();
+    v_interval     INTERVAL := (p_window_minutes || ' minutes')::INTERVAL;
+    v_before       INTERVAL := (p_exclude_before_min || ' minutes')::INTERVAL;
+    v_after        INTERVAL := (p_exclude_after_min || ' minutes')::INTERVAL;
+    v_last_finish  TIMESTAMPTZ;
+    v_best_start   TIMESTAMPTZ;
+    v_best_end     TIMESTAMPTZ;
+    v_has_incidents BOOLEAN;
+BEGIN
+    IF p_window_minutes <= 0 THEN
+        RAISE EXCEPTION 'Длина окна должна быть положительной, получено %', p_window_minutes;
+    END IF;
+
+    -- 1. Определяем последний завершённый инцидент
+    SELECT MAX(finish_timepoint) INTO v_last_finish
+    FROM performance_incident
+    WHERE finish_timepoint IS NOT NULL;
+
+    -- 2. Если нет ни одного завершённого инцидента, используем текущее время как точку отсчёта
+    IF v_last_finish IS NULL THEN
+        v_last_finish := v_now;
+    END IF;
+
+    -- 3. Проверяем, есть ли инциденты вообще (если нет, то всё время свободно)
+    SELECT EXISTS (SELECT 1 FROM performance_incident) INTO v_has_incidents;
+    IF NOT v_has_incidents THEN
+        -- Весь временной промежуток свободен, выбираем окно от текущего момента
+        v_best_start := v_now;
+        v_best_end   := v_now + v_interval;
+    ELSE
+        WITH
+        -- 3.1 Интервалы инцидентов с расширением (буферы до и после)
+        incident_intervals AS (
+            SELECT
+                start_timepoint - v_before AS start_ts,
+                COALESCE(finish_timepoint, 'infinity'::timestamptz) + v_after AS end_ts
+            FROM performance_incident
+            WHERE start_timepoint IS NOT NULL
+              AND (finish_timepoint IS NULL OR finish_timepoint >= start_timepoint)
+        ),
+        -- 3.2 Объединение перекрывающихся/соприкасающихся интервалов
+        merged_intervals AS (
+            SELECT
+                MIN(start_ts) AS start_ts,
+                MAX(end_ts) AS end_ts
+            FROM (
+                SELECT
+                    start_ts,
+                    end_ts,
+                    SUM(CASE WHEN prev_end >= start_ts THEN 0 ELSE 1 END)
+                        OVER (ORDER BY start_ts, end_ts) AS grp
+                FROM (
+                    SELECT
+                        start_ts,
+                        end_ts,
+                        LAG(end_ts) OVER (ORDER BY start_ts, end_ts) AS prev_end
+                    FROM incident_intervals
+                ) t
+            ) t
+            GROUP BY grp
+        ),
+        -- 3.3 Вычисляем предыдущий конец для каждого интервала (для поиска разрывов)
+        intervals_with_prev AS (
+            SELECT
+                start_ts,
+                end_ts,
+                LAG(end_ts) OVER (ORDER BY start_ts) AS prev_end
+            FROM merged_intervals
+        ),
+        -- 3.4 Строим свободные промежутки (между расширенными зонами)
+        free_windows AS (
+            -- от -infinity до первого расширенного интервала
+            SELECT
+                '-infinity'::timestamptz AS start_ts,
+                (SELECT MIN(start_ts) FROM merged_intervals) AS end_ts
+            WHERE EXISTS (SELECT 1 FROM merged_intervals)
+            UNION ALL
+            -- между расширенными интервалами
+            SELECT
+                prev_end AS start_ts,
+                start_ts AS end_ts
+            FROM intervals_with_prev
+            WHERE prev_end < start_ts
+            UNION ALL
+            -- после последнего расширенного интервала
+            SELECT
+                MAX(end_ts) AS start_ts,
+                'infinity'::timestamptz AS end_ts
+            FROM merged_intervals
+        ),
+        -- 3.5 Только промежутки достаточной длины
+        valid_free AS (
+            SELECT
+                start_ts,
+                end_ts,
+                (end_ts - start_ts) AS duration
+            FROM free_windows
+            WHERE start_ts < end_ts
+              AND (end_ts - start_ts) >= v_interval
+        ),
+        -- 3.6 Оцениваем расстояние до точки отсчёта (последний завершённый инцидент)
+        scored AS (
+            SELECT
+                start_ts,
+                end_ts,
+                CASE
+                    WHEN start_ts >= v_last_finish THEN start_ts - v_last_finish
+                    WHEN end_ts <= v_last_finish THEN INTERVAL '1000 years'
+                    ELSE INTERVAL '0'
+                END AS distance
+            FROM valid_free
+        ),
+        -- 3.7 Выбираем промежуток с минимальным расстоянием
+        best_candidate AS (
+            SELECT
+                start_ts,
+                end_ts
+            FROM scored
+            ORDER BY distance ASC, start_ts ASC
+            LIMIT 1
+        )
+        -- 3.8 Выделяем подынтервал длины v_interval внутри выбранного промежутка
+        SELECT
+            CASE
+                WHEN v_last_finish BETWEEN bc.start_ts AND bc.end_ts THEN
+                    CASE
+                        WHEN v_last_finish + v_interval <= bc.end_ts THEN v_last_finish
+                        WHEN v_last_finish - v_interval >= bc.start_ts THEN v_last_finish - v_interval
+                        ELSE GREATEST(bc.start_ts, v_last_finish - v_interval / 2)
+                    END
+                WHEN bc.start_ts >= v_last_finish THEN
+                    bc.start_ts
+                ELSE
+                    bc.end_ts - v_interval
+            END AS start_ts,
+            CASE
+                WHEN v_last_finish BETWEEN bc.start_ts AND bc.end_ts THEN
+                    CASE
+                        WHEN v_last_finish + v_interval <= bc.end_ts THEN v_last_finish + v_interval
+                        WHEN v_last_finish - v_interval >= bc.start_ts THEN v_last_finish
+                        ELSE LEAST(bc.end_ts, v_last_finish + v_interval / 2)
+                    END
+                WHEN bc.start_ts >= v_last_finish THEN
+                    bc.start_ts + v_interval
+                ELSE
+                    bc.end_ts
+            END AS end_ts
+        INTO v_best_start, v_best_end
+        FROM best_candidate bc;
+    END IF;
+
+    -- 4. Обработка результата
+    IF v_best_start IS NULL THEN
+        DELETE FROM incident_free_window_current;
+        RETURN 'Окно не найдено: нет свободного промежутка длиной ' || p_window_minutes || ' минут с учётом буферов ' || p_exclude_before_min || ' мин до и ' || p_exclude_after_min || ' мин после инцидентов.';
+    END IF;
+
+    -- 5. Обновляем таблицу
+    DELETE FROM incident_free_window_current;
+    INSERT INTO incident_free_window_current (window_start, window_end, updated_at)
+    VALUES (v_best_start, v_best_end, v_now);
+
+    RETURN format('Окно обновлено: %s – %s (длина %s минут, буферы: %s до, %s после, относительно последнего завершённого инцидента %s)',
+                  v_best_start, v_best_end, p_window_minutes,
+                  p_exclude_before_min, p_exclude_after_min,
+                  v_last_finish);
+END;
+$$;
+
+COMMENT ON FUNCTION find_incident_free_window IS
+'Вычисляет безынцидентное окно заданной длины, максимально близкое к последнему завершённому инциденту,
+и сохраняет его в таблицу incident_free_window_current. Если такого окна нет, ищется ближайшее к текущему моменту.
+При повторных вызовах (пока не появится новый завершённый инцидент) окно остаётся неизменным.';
+
+-- =============================================================================
+-- Дополнительные функции для профилирования производительности:
+-- 1) Сохранение эталонного профиля на основе incident_free_window_current
+-- 2) Сохранение текущего профиля от текущего времени
+-- 3) Сравнение эталонного и текущего профилей с анализом аномалий
+
+-- =============================================================================
+-- Обновлённые функции для профилирования производительности
+-- (без использования отдельной таблицы baseline_state)
+-- =============================================================================
+-- Copyright 2026 Ринат (markov_chain)
+-- Лицензия Apache 2.0
+-- =============================================================================
+
+--------------------------------------------------------------------------------
+-- 2. Функция сохранения эталонного профиля (переработанная)
+--    Использует incident_free_window_current как источник актуального окна,
+--    а для проверки изменений сравнивает с последним сохранённым профилем
+--    в profile_aggregated (profile_type='baseline').
+--------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION save_baseline_profile()
+RETURNS TEXT
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    v_win_start TIMESTAMPTZ;
+    v_win_end   TIMESTAMPTZ;
+    v_last_baseline RECORD;
+    v_metrics   RECORD;
+    v_hour      SMALLINT;
+    v_dow       SMALLINT;
+BEGIN
+    -- 1. Получаем текущее безынцидентное окно
+    SELECT window_start, window_end INTO v_win_start, v_win_end
+    FROM incident_free_window_current
+    LIMIT 1;
+
+    IF v_win_start IS NULL OR v_win_end IS NULL THEN
+        RETURN 'Ошибка: таблица incident_free_window_current пуста. Сначала выполните find_incident_free_window().';
+    END IF;
+
+    -- 2. Проверяем, совпадает ли текущее окно с последним сохранённым эталонным профилем
+    SELECT window_start, window_end INTO v_last_baseline
+    FROM profile_aggregated
+    WHERE profile_type = 'baseline'
+    ORDER BY ts DESC
+    LIMIT 1;
+
+    IF FOUND AND v_last_baseline.window_start = v_win_start AND v_last_baseline.window_end = v_win_end THEN
+        RETURN format('Эталонный профиль уже сохранён для окна %s – %s, пропуск.',
+                      v_win_start, v_win_end);
+    END IF;
+
+    -- 3. Удаляем старый эталонный профиль (если есть)
+    DELETE FROM profile_aggregated WHERE profile_type = 'baseline';
+
+    -- 4. Вычисляем метрики для нового окна
+    SELECT * INTO v_metrics
+    FROM calculate_profile_metrics(v_win_start, v_win_end);
+
+    v_hour := EXTRACT(HOUR FROM now())::SMALLINT;
+    v_dow  := EXTRACT(DOW FROM now())::SMALLINT;
+
+    -- 5. Вставляем новый эталонный профиль
+    INSERT INTO profile_aggregated (
+        profile_type, ts, hour, dow, window_start, window_end,
+        state_histogram, avg_correlation, critical_ratio, entropy,
+        avg_os_angle, avg_wait_angle, unique_states_count,
+        avg_transition_length, self_loop_ratio, top_transition
+    ) VALUES (
+        'baseline', now(), v_hour, v_dow, v_win_start, v_win_end,
+        v_metrics.state_histogram, v_metrics.avg_correlation,
+        v_metrics.critical_ratio, v_metrics.entropy,
+        v_metrics.avg_os_angle, v_metrics.avg_wait_angle,
+        v_metrics.unique_states_count,
+        v_metrics.avg_transition_length, v_metrics.self_loop_ratio,
+        v_metrics.top_transition
+    );
+
+    RETURN format('Эталонный профиль сохранён: %s – %s (длина %s мин)',
+                  v_win_start, v_win_end,
+                  EXTRACT(EPOCH FROM (v_win_end - v_win_start)) / 60);
+END;
+$$;
+
+COMMENT ON FUNCTION save_baseline_profile() IS
+'Сохраняет эталонный профиль на основе текущего окна из incident_free_window_current.
+Если окно совпадает с последним сохранённым эталоном – пропускает.
+Старый эталон удаляется.';
+
+--------------------------------------------------------------------------------
+-- 3. Функция сохранения текущего профиля производительности (без изменений)
+--------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION save_current_profile(
+    p_window_minutes INT DEFAULT 60
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+DECLARE
+    v_end   TIMESTAMPTZ := now();
+    v_start TIMESTAMPTZ := v_end - (p_window_minutes || ' minutes')::INTERVAL;
+    v_metrics RECORD;
+    v_hour  SMALLINT := EXTRACT(HOUR FROM v_end)::SMALLINT;
+    v_dow   SMALLINT := EXTRACT(DOW FROM v_end)::SMALLINT;
+BEGIN
+    IF p_window_minutes <= 0 THEN
+        RAISE EXCEPTION 'Размер окна должен быть положительным, получено %', p_window_minutes;
+    END IF;
+
+    DELETE FROM profile_aggregated WHERE profile_type = 'current';
+
+    SELECT * INTO v_metrics
+    FROM calculate_profile_metrics(v_start, v_end);
+
+    INSERT INTO profile_aggregated (
+        profile_type, ts, hour, dow, window_start, window_end,
+        state_histogram, avg_correlation, critical_ratio, entropy,
+        avg_os_angle, avg_wait_angle, unique_states_count,
+        avg_transition_length, self_loop_ratio, top_transition
+    ) VALUES (
+        'current', v_end, v_hour, v_dow, v_start, v_end,
+        v_metrics.state_histogram, v_metrics.avg_correlation,
+        v_metrics.critical_ratio, v_metrics.entropy,
+        v_metrics.avg_os_angle, v_metrics.avg_wait_angle,
+        v_metrics.unique_states_count,
+        v_metrics.avg_transition_length, v_metrics.self_loop_ratio,
+        v_metrics.top_transition
+    );
+
+    RETURN format('Текущий профиль сохранён: %s – %s (длина %s мин)',
+                  v_start, v_end, p_window_minutes);
+END;
+$$;
+
+COMMENT ON FUNCTION save_current_profile(INT) IS
+'Сохраняет текущий профиль за последние p_window_minutes минут, удаляя старый.';
+
+--------------------------------------------------------------------------------
+-- 4. Вспомогательная функция для расчёта расхождения гистограмм (JS-дивергенция) – без изменений
+--------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION histogram_divergence(
+    h1 JSONB,
+    h2 JSONB
+)
+RETURNS REAL
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    v_keys TEXT[];
+    v_key TEXT;
+    v_p REAL;
+    v_q REAL;
+    v_m REAL;
+    v_kl1 REAL := 0.0;
+    v_kl2 REAL := 0.0;
+    v_js REAL := 0.0;
+    v_epsilon CONSTANT REAL := 1e-12;
+BEGIN
+    IF h1 IS NULL OR h2 IS NULL THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT array_agg(DISTINCT key) INTO v_keys
+    FROM (
+        SELECT key FROM jsonb_each(h1)
+        UNION
+        SELECT key FROM jsonb_each(h2)
+    ) t;
+
+    IF v_keys IS NULL OR array_length(v_keys, 1) = 0 THEN
+        RETURN 0.0;
+    END IF;
+
+    FOREACH v_key IN ARRAY v_keys
+    LOOP
+        SELECT (h1->v_key->>'pct')::REAL INTO v_p;
+        SELECT (h2->v_key->>'pct')::REAL INTO v_q;
+        v_p := COALESCE(v_p, 0.0) / 100.0;
+        v_q := COALESCE(v_q, 0.0) / 100.0;
+        v_m := (v_p + v_q) / 2.0;
+
+        IF v_p > v_epsilon AND v_m > v_epsilon THEN
+            v_kl1 := v_kl1 + v_p * ln(v_p / v_m);
+        END IF;
+        IF v_q > v_epsilon AND v_m > v_epsilon THEN
+            v_kl2 := v_kl2 + v_q * ln(v_q / v_m);
+        END IF;
+    END LOOP;
+
+    v_js := 0.5 * v_kl1 + 0.5 * v_kl2;
+    IF v_js < 0 THEN
+        v_js := 0;
+    ELSIF v_js > 10 THEN
+        v_js := 10;
+    END IF;
+    RETURN v_js::REAL;
+END;
+$$;
+
+COMMENT ON FUNCTION histogram_divergence(JSONB, JSONB) IS
+'Вычисляет JS-дивергенцию между двумя гистограммами (поля pct в процентах).';
+
+--------------------------------------------------------------------------------
+-- 5. Функция сравнения эталонного и текущего профилей – без изменений
+--    (использует compare_profile_windows и histogram_divergence)
+--------------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION compare_profiles()
+RETURNS TEXT[]
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_baseline RECORD;
+    v_current  RECORD;
+    v_report   TEXT[] := '{}';
+    v_js       REAL;
+    v_metrics_report TEXT[];
+    v_status_line TEXT;
+    v_status TEXT;
+    v_details JSONB;
+    v_log_report JSONB;
+BEGIN
+    -- 1. Получаем эталонный профиль
+    SELECT * INTO v_baseline
+    FROM profile_aggregated
+    WHERE profile_type = 'baseline'
+    ORDER BY ts DESC
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        RETURN ARRAY['Ошибка: эталонный профиль не найден. Сначала выполните save_baseline_profile().'];
+    END IF;
+
+    -- 2. Получаем текущий профиль
+    SELECT * INTO v_current
+    FROM profile_aggregated
+    WHERE profile_type = 'current'
+    ORDER BY ts DESC
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        RETURN ARRAY['Ошибка: текущий профиль не найден. Сначала выполните save_current_profile().'];
+    END IF;
+
+    -- 3. Сравнение через существующую функцию
+    SELECT compare_profile_windows(
+        to_char(v_baseline.window_start, 'YYYY-MM-DD HH24:MI'),
+        to_char(v_baseline.window_end,   'YYYY-MM-DD HH24:MI'),
+        to_char(v_current.window_start,  'YYYY-MM-DD HH24:MI'),
+        to_char(v_current.window_end,    'YYYY-MM-DD HH24:MI')
+    ) INTO v_metrics_report;
+
+    -- 4. Формирование отчёта
+    v_report := array_append(v_report, '=== СРАВНЕНИЕ ЭТАЛОННОГО И ТЕКУЩЕГО ПРОФИЛЕЙ ===');
+    v_report := array_append(v_report, format('Эталонное окно: %s – %s',
+        to_char(v_baseline.window_start, 'YYYY-MM-DD HH24:MI'),
+        to_char(v_baseline.window_end, 'YYYY-MM-DD HH24:MI')));
+    v_report := array_append(v_report, format('Текущее окно: %s – %s',
+        to_char(v_current.window_start, 'YYYY-MM-DD HH24:MI'),
+        to_char(v_current.window_end, 'YYYY-MM-DD HH24:MI')));
+
+    -- Добавляем таблицу метрик (пропускаем первые 2 строки с окнами)
+    IF array_length(v_metrics_report, 1) > 2 THEN
+        FOR i IN 3..array_length(v_metrics_report, 1) LOOP
+            v_report := array_append(v_report, v_metrics_report[i]);
+        END LOOP;
+    END IF;
+
+    -- 5. JS-дивергенция гистограмм
+    v_js := histogram_divergence(v_baseline.state_histogram, v_current.state_histogram);
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, '--- АНАЛИЗ ГИСТОГРАММЫ СОСТОЯНИЙ ---');
+    IF v_js IS NOT NULL THEN
+        v_report := array_append(v_report, format('  JS-дивергенция гистограмм: %s', round(v_js::NUMERIC, 4)::TEXT));
+        IF v_js < 0.01 THEN
+            v_report := array_append(v_report, '  Интерпретация: гистограммы практически идентичны.');
+        ELSIF v_js < 0.05 THEN
+            v_report := array_append(v_report, '  Интерпретация: незначительные изменения.');
+        ELSIF v_js < 0.1 THEN
+            v_report := array_append(v_report, '  Интерпретация: заметные изменения – возможна смена характера нагрузки.');
+        ELSE
+            v_report := array_append(v_report, '  Интерпретация: значительные изменения – система работает в другом режиме.');
+        END IF;
+    ELSE
+        v_report := array_append(v_report, '  Не удалось вычислить JS-дивергенцию (отсутствуют данные гистограмм).');
+    END IF;
+
+    -- 6. Извлекаем статус из v_metrics_report (строка "Статус: ...")
+    FOR i IN 1..array_length(v_metrics_report, 1) LOOP
+        IF v_metrics_report[i] LIKE '%Статус:%' THEN
+            v_status_line := v_metrics_report[i];
+            v_status := trim(replace(v_status_line, 'Статус:', ''));
+            EXIT;
+        END IF;
+    END LOOP;
+
+    -- Если не нашли статус, генерируем свой
+    IF v_status IS NULL THEN
+        IF v_js >= 0.1 OR (v_current.avg_correlation IS NOT NULL AND v_baseline.avg_correlation IS NOT NULL AND ABS(v_current.avg_correlation - v_baseline.avg_correlation) > 0.15) THEN
+            v_status := 'НЕСТАБИЛЬНОЕ – выявлены значительные отклонения';
+        ELSE
+            v_status := 'НОРМА – профиль соответствует эталону';
+        END IF;
+        v_report := array_append(v_report, '');
+        v_report := array_append(v_report, '--- ИТОГОВАЯ ОЦЕНКА ---');
+        v_report := array_append(v_report, format('  Статус: %s', v_status));
+    END IF;
+
+    v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
+
+    -- 7. Сохраняем результат в таблицу profile_comparison_log
+    v_log_report := to_jsonb(v_report);
+    v_details := jsonb_build_object(
+        'baseline_avg_correlation', v_baseline.avg_correlation,
+        'baseline_critical_ratio', v_baseline.critical_ratio,
+        'baseline_entropy', v_baseline.entropy,
+        'baseline_self_loop_ratio', v_baseline.self_loop_ratio,
+        'current_avg_correlation', v_current.avg_correlation,
+        'current_critical_ratio', v_current.critical_ratio,
+        'current_entropy', v_current.entropy,
+        'current_self_loop_ratio', v_current.self_loop_ratio
+    );
+
+    INSERT INTO profile_comparison_log (
+        baseline_window_start,
+        baseline_window_end,
+        current_window_start,
+        current_window_end,
+        status,
+        js_divergence,
+        report,
+        details
+    ) VALUES (
+        v_baseline.window_start,
+        v_baseline.window_end,
+        v_current.window_start,
+        v_current.window_end,
+        v_status,
+        v_js,
+        v_log_report,
+        v_details
+    );
+
+    RETURN v_report;
+END;
+$$;
+
+COMMENT ON FUNCTION compare_profiles() IS 'Сравнивает эталонный и текущий профили, сохраняет результат в profile_comparison_log и возвращает отчёт в виде массива строк.';
+
+--------------------------------------------------------------------------------
+-- 6. Пример использования (для справки)
+--------------------------------------------------------------------------------
+/*
+-- Предварительно нужно убедиться, что incident_free_window_current содержит актуальное окно
+SELECT find_incident_free_window(60);  -- если ещё не было
+
+-- Сохранение эталонного профиля
+SELECT save_baseline_profile();
+
+-- Сохранение текущего профиля (например, за 60 минут)
+SELECT save_current_profile(60);
+
+-- Сравнение
+SELECT unnest(compare_profiles());
+*/
+
+
+-- =============================================================================
+-- 4. Функция очистки старых записей из profile_comparison_log
+-- =============================================================================
+CREATE OR REPLACE FUNCTION clean_profile_comparison_log()
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_retention_days INT;
+    v_deleted_rows BIGINT;
+BEGIN
+    -- Получаем срок хранения из конфигурации
+    SELECT COALESCE(profile_comparison_retention_days, 60) INTO v_retention_days
+    FROM markov_config LIMIT 1;
+
+    -- Удаляем записи старше указанного числа дней
+    DELETE FROM profile_comparison_log
+    WHERE created_at < now() - (v_retention_days || ' days')::INTERVAL;
+
+    GET DIAGNOSTICS v_deleted_rows = ROW_COUNT;
+    RETURN format('Удалено %s записей из profile_comparison_log (глубина хранения %s дней)',
+                  v_deleted_rows, v_retention_days);
+END;
+$$;
+
+COMMENT ON FUNCTION clean_profile_comparison_log() IS
+'Удаляет записи из profile_comparison_log старше profile_comparison_retention_days (из markov_config).';
+
+-- =============================================================================
+-- 5. (Опционально) Пример использования и настройка cron
+-- =============================================================================
+/*
+-- Ежедневная очистка (например, в 03:00)
+-- 0 3 * * * psql -d expecto_db -U expecto_user -c "SELECT clean_profile_comparison_log();"
+
+-- Ручной вызов
+SELECT clean_profile_comparison_log();
+
+-- Просмотр последних сравнений
+SELECT id, created_at, status, js_divergence
+FROM profile_comparison_log
+ORDER BY created_at DESC
+LIMIT 10;
+*/
+
+
+-- Функция: получить безынцидентное окно длины p_window_minutes,
+-- заканчивающееся не позже p_ts, с максимальным концом.
+CREATE OR REPLACE FUNCTION get_incident_free_window_before(
+    p_ts                TIMESTAMPTZ,
+    p_window_minutes    INT DEFAULT 60,
+    p_exclude_before_min INT DEFAULT 30,
+    p_exclude_after_min  INT DEFAULT 60
+)
+RETURNS TABLE (start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ)
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_interval INTERVAL := (p_window_minutes || ' minutes')::INTERVAL;
+    v_before   INTERVAL := (p_exclude_before_min || ' minutes')::INTERVAL;
+    v_after    INTERVAL := (p_exclude_after_min || ' minutes')::INTERVAL;
+BEGIN
+    RETURN QUERY
+    WITH
+    incidents AS (
+        SELECT
+            start_timepoint - v_before AS inc_start,
+            COALESCE(finish_timepoint, 'infinity'::timestamptz) + v_after AS inc_end
+        FROM performance_incident
+        WHERE start_timepoint <= p_ts
+    ),
+    merged AS (
+        SELECT MIN(inc_start) AS m_start, MAX(inc_end) AS m_end
+        FROM (
+            SELECT inc_start, inc_end,
+                   SUM(CASE WHEN prev_end >= inc_start THEN 0 ELSE 1 END)
+                       OVER (ORDER BY inc_start, inc_end) AS grp
+            FROM (
+                SELECT inc_start, inc_end,
+                       LAG(inc_end) OVER (ORDER BY inc_start, inc_end) AS prev_end
+                FROM incidents
+            ) t
+        ) t
+        GROUP BY grp
+    ),
+    free_windows AS (
+        -- от -infinity до первого расширенного инцидента
+        SELECT '-infinity'::timestamptz AS f_start,
+               (SELECT MIN(m_start) FROM merged) AS f_end
+        WHERE EXISTS (SELECT 1 FROM merged)
+        UNION ALL
+        -- между расширенными инцидентами
+        SELECT prev_end AS f_start, m_start AS f_end
+        FROM (
+            SELECT m_start, m_end,
+                   LAG(m_end) OVER (ORDER BY m_start) AS prev_end
+            FROM merged
+        ) t
+        WHERE prev_end < m_start
+        UNION ALL
+        -- после последнего расширенного инцидента до p_ts
+        SELECT MAX(m_end) AS f_start, p_ts AS f_end
+        FROM merged
+        HAVING MAX(m_end) < p_ts
+    ),
+    valid_free AS (
+        SELECT f_start, f_end,
+               (f_end - f_start) AS duration
+        FROM free_windows
+        WHERE f_start < f_end
+          AND (f_end - f_start) >= v_interval
+    ),
+    best AS (
+        SELECT f_start, f_end
+        FROM valid_free
+        ORDER BY f_end DESC
+        LIMIT 1
+    )
+    SELECT
+        (f_end - v_interval) AS start_ts,
+        f_end
+    FROM best
+    WHERE best.f_end IS NOT NULL;
+END;
+$$;
+
+COMMENT ON FUNCTION get_incident_free_window_before(TIMESTAMPTZ, INT, INT, INT) IS
+'Возвращает самое позднее безынцидентное окно длины p_window_minutes, заканчивающееся не позже p_ts,
+с учётом буферов исключения до (p_exclude_before_min) и после (p_exclude_after_min) инцидентов.';
+
+
+-- Процедура исторического заполнения
+CREATE OR REPLACE PROCEDURE historical_fill_profile_comparison_log(
+    p_start                TIMESTAMPTZ,
+    p_end                  TIMESTAMPTZ,
+    p_window_minutes       INT DEFAULT 60,
+    p_step_minutes         INT DEFAULT 1,
+    p_overwrite            BOOLEAN DEFAULT TRUE,
+    p_exclude_before_min   INT DEFAULT 30,
+    p_exclude_after_min    INT DEFAULT 60
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_ts               TIMESTAMPTZ;
+    v_baseline_start   TIMESTAMPTZ;
+    v_baseline_end     TIMESTAMPTZ;
+    v_current_start    TIMESTAMPTZ;
+    v_current_end      TIMESTAMPTZ;
+    v_baseline_metrics RECORD;
+    v_current_metrics  RECORD;
+    v_js               REAL;
+    v_status           TEXT;
+    v_report           TEXT[] := '{}';
+    v_details          JSONB;
+    v_counter          BIGINT := 0;
+    v_total_minutes    BIGINT;
+    v_last_notice      TIMESTAMPTZ := NULL;
+BEGIN
+    IF p_start > p_end THEN
+        RAISE EXCEPTION 'p_start (%s) > p_end (%s)', p_start, p_end;
+    END IF;
+
+    -- Удаление старых записей за указанный диапазон (если требуется перезапись)
+    IF p_overwrite THEN
+        DELETE FROM profile_comparison_log
+        WHERE current_window_end BETWEEN p_start AND p_end;
+        RAISE NOTICE 'Удалено % записей за период [%, %]',
+                     (SELECT COUNT(*) FROM profile_comparison_log
+                      WHERE current_window_end BETWEEN p_start AND p_end),
+                     p_start, p_end;
+    END IF;
+
+    v_total_minutes := EXTRACT(EPOCH FROM (p_end - p_start)) / 60 + 1;
+    RAISE NOTICE 'Начало исторического заполнения: % → %, окно % мин, шаг % мин, всего % минут',
+                 p_start, p_end, p_window_minutes, p_step_minutes, v_total_minutes;
+
+    v_ts := p_start;
+    WHILE v_ts <= p_end LOOP
+        v_counter := v_counter + 1;
+
+        -- 1. Найти безынцидентное окно перед v_ts с учётом буферов
+        SELECT start_ts, end_ts INTO v_baseline_start, v_baseline_end
+        FROM get_incident_free_window_before(v_ts, p_window_minutes, p_exclude_before_min, p_exclude_after_min);
+
+        IF v_baseline_start IS NULL THEN
+            v_ts := v_ts + (p_step_minutes || ' minutes')::INTERVAL;
+            CONTINUE;
+        END IF;
+
+        -- 2. Текущий профиль: окно [v_ts - p_window_minutes, v_ts]
+        v_current_start := v_ts - (p_window_minutes || ' minutes')::INTERVAL;
+        v_current_end   := v_ts;
+
+        -- 3. Вычислить метрики
+        SELECT * INTO v_baseline_metrics
+        FROM calculate_profile_metrics(v_baseline_start, v_baseline_end);
+
+        SELECT * INTO v_current_metrics
+        FROM calculate_profile_metrics(v_current_start, v_current_end);
+
+        -- 4. JS-дивергенция
+        v_js := histogram_divergence(
+            v_baseline_metrics.state_histogram,
+            v_current_metrics.state_histogram
+        );
+
+        -- 5. Статус (пороги остаются без изменений)
+        v_status := 'NORMAL';
+        IF v_js >= 0.05 THEN
+            v_status := 'WARNING';
+        END IF;
+        IF v_js >= 0.2 OR ABS(COALESCE(v_current_metrics.avg_correlation, 0) - COALESCE(v_baseline_metrics.avg_correlation, 0)) > 0.2 THEN
+            v_status := 'CRITICAL';
+        END IF;
+
+        -- 6. Детали
+        v_details := jsonb_build_object(
+            'baseline_avg_correlation', v_baseline_metrics.avg_correlation,
+            'baseline_critical_ratio', v_baseline_metrics.critical_ratio,
+            'baseline_entropy', v_baseline_metrics.entropy,
+            'baseline_self_loop_ratio', v_baseline_metrics.self_loop_ratio,
+            'current_avg_correlation', v_current_metrics.avg_correlation,
+            'current_critical_ratio', v_current_metrics.critical_ratio,
+            'current_entropy', v_current_metrics.entropy,
+            'current_self_loop_ratio', v_current_metrics.self_loop_ratio,
+            'js_divergence', v_js
+        );
+
+        -- 7. Отчёт (краткий)
+        v_report := ARRAY[
+            'Сравнение на ' || v_ts,
+            'Эталон: ' || v_baseline_start || ' – ' || v_baseline_end,
+            'Текущий: ' || v_current_start || ' – ' || v_current_end,
+            'JS-дивергенция: ' || COALESCE(ROUND(v_js::NUMERIC, 4)::TEXT, 'NULL'),
+            'Статус: ' || v_status
+        ];
+
+        -- 8. Вставка
+        INSERT INTO profile_comparison_log (
+            baseline_window_start,
+            baseline_window_end,
+            current_window_start,
+            current_window_end,
+            status,
+            js_divergence,
+            report,
+            details
+        ) VALUES (
+            v_baseline_start,
+            v_baseline_end,
+            v_current_start,
+            v_current_end,
+            v_status,
+            v_js,
+            to_jsonb(v_report),
+            v_details
+        );
+
+        -- Прогресс
+        IF v_counter % 100 = 0 OR (v_last_notice IS NULL OR v_ts - v_last_notice > INTERVAL '5 minutes') THEN
+            RAISE NOTICE 'Прогресс: % из % минут (%.1f%%), последний ts = %',
+                         v_counter, v_total_minutes,
+                         (v_counter::NUMERIC / v_total_minutes * 100),
+                         v_ts;
+            v_last_notice := v_ts;
+        END IF;
+
+        v_ts := v_ts + (p_step_minutes || ' minutes')::INTERVAL;
+    END LOOP;
+
+    RAISE NOTICE 'Заполнение завершено. Вставлено записей: %', v_counter;
+END;
+$$;
+
+COMMENT ON PROCEDURE historical_fill_profile_comparison_log IS
+'Заполняет profile_comparison_log историческими сравнениями для каждой минуты в диапазоне.
+Учитывает буферы исключения вокруг инцидентов при выборе эталонного окна.';
+
+
+
+-- =============================================================================
+-- Функция: generate_profile_incident_analytics_report
+-- Назначение: формирует аналитический отчёт по сводному анализу сравнения
+--             профилей производительности и инцидентов на основе данных
+--             из profile_comparison_log и performance_incident.
+-- Параметры:
+--   p_start TIMESTAMPTZ – начало периода (по умолчанию 30 дней назад)
+--   p_end   TIMESTAMPTZ – конец периода (по умолчанию now())
+-- Возвращает: TEXT[] – массив строк с отформатированным отчётом.
+-- =============================================================================
+CREATE OR REPLACE FUNCTION generate_profile_incident_analytics_report(
+    p_start TIMESTAMPTZ DEFAULT now() - INTERVAL '30 days',
+    p_end   TIMESTAMPTZ DEFAULT now()
+)
+RETURNS TEXT[]
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_report TEXT[] := '{}';
+    v_line_sep CONSTANT TEXT := E'\n';
+    v_header TEXT := '=== СВОДНЫЙ АНАЛИЗ СРАВНЕНИЯ ПРОФИЛЕЙ И ИНЦИДЕНТОВ ===';
+    v_ts TIMESTAMPTZ := now();
+
+    -- Переменные для статистики
+    v_total_comparisons BIGINT;
+    v_normal_count BIGINT;
+    v_warning_count BIGINT;
+    v_critical_count BIGINT;
+    v_avg_js_normal REAL;
+    v_avg_js_warning REAL;
+    v_avg_js_critical REAL;
+    v_max_js REAL;
+
+    -- Переменные для связи с инцидентами
+    v_incidents_total BIGINT;
+    v_incidents_with_any BIGINT;
+    v_incidents_with_anomaly BIGINT;
+    v_incidents_with_warning BIGINT;
+    v_incidents_with_critical BIGINT;
+    v_avg_time_to_incident_min REAL;
+    v_incident_rate_anomaly REAL;
+    v_incident_rate_normal REAL;
+
+    -- Переменные для трендов
+    v_trend_js TEXT;
+    v_trend_status TEXT;
+
+    v_rec RECORD;
+    v_line TEXT;
+BEGIN
+    -- Проверка интервала
+    IF p_start > p_end THEN
+        RETURN ARRAY['Ошибка: начальная дата позже конечной.'];
+    END IF;
+
+    -- ========================================================================
+    -- 1. Общая статистика по сравнениям (фильтр по current_window_end)
+    -- ========================================================================
+    SELECT
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE status = 'NORMAL') AS normal,
+        COUNT(*) FILTER (WHERE status = 'WARNING') AS warning,
+        COUNT(*) FILTER (WHERE status = 'CRITICAL') AS critical,
+        COALESCE(AVG(js_divergence) FILTER (WHERE status = 'NORMAL'), 0) AS avg_js_normal,
+        COALESCE(AVG(js_divergence) FILTER (WHERE status = 'WARNING'), 0) AS avg_js_warning,
+        COALESCE(AVG(js_divergence) FILTER (WHERE status = 'CRITICAL'), 0) AS avg_js_critical,
+        COALESCE(MAX(js_divergence), 0) AS max_js
+    INTO
+        v_total_comparisons,
+        v_normal_count,
+        v_warning_count,
+        v_critical_count,
+        v_avg_js_normal,
+        v_avg_js_warning,
+        v_avg_js_critical,
+        v_max_js
+    FROM profile_comparison_log
+    WHERE current_window_end BETWEEN p_start AND p_end;   -- <-- исправлено
+
+    -- ========================================================================
+    -- 2. Связь с инцидентами
+    -- ========================================================================
+    -- 2.1. Общее число инцидентов в периоде
+    SELECT COUNT(*) INTO v_incidents_total
+    FROM performance_incident
+    WHERE start_timepoint BETWEEN p_start AND p_end;
+
+    -- 2.2. Инциденты, которым предшествовало сравнение (окно 30 минут до инцидента)
+    WITH incident_comparisons AS (
+        SELECT
+            pi.start_timepoint AS incident_ts,
+            pcl.current_window_end AS comp_ts,
+            pcl.status,
+            pcl.js_divergence
+        FROM performance_incident pi
+        JOIN profile_comparison_log pcl
+            ON pcl.current_window_end BETWEEN pi.start_timepoint - INTERVAL '30 minutes' AND pi.start_timepoint
+        WHERE pi.start_timepoint BETWEEN p_start AND p_end
+    )
+    SELECT
+        COUNT(DISTINCT incident_ts) AS inc_with_any,
+        COUNT(DISTINCT incident_ts) FILTER (WHERE status IN ('WARNING', 'CRITICAL')) AS inc_with_anomaly,
+        COUNT(DISTINCT incident_ts) FILTER (WHERE status = 'WARNING') AS inc_with_warning,
+        COUNT(DISTINCT incident_ts) FILTER (WHERE status = 'CRITICAL') AS inc_with_critical,
+        AVG(EXTRACT(EPOCH FROM (incident_ts - comp_ts)) / 60) AS avg_time_to_incident
+    INTO
+        v_incidents_with_any,
+        v_incidents_with_anomaly,
+        v_incidents_with_warning,
+        v_incidents_with_critical,
+        v_avg_time_to_incident_min
+    FROM incident_comparisons;
+
+    -- 2.3. Доли
+    v_incident_rate_anomaly := CASE
+        WHEN v_incidents_total > 0 THEN v_incidents_with_anomaly::REAL / v_incidents_total
+        ELSE 0
+    END;
+    v_incident_rate_normal := CASE
+        WHEN v_incidents_total > 0 THEN (v_incidents_total - v_incidents_with_anomaly)::REAL / v_incidents_total
+        ELSE 0
+    END;
+
+    -- ========================================================================
+    -- 3. Тренды (по дням, используем current_window_end)
+    -- ========================================================================
+    WITH daily_stats AS (
+        SELECT
+            DATE(current_window_end) AS day,
+            AVG(js_divergence) AS avg_js,
+            MAX(CASE status
+                WHEN 'CRITICAL' THEN 3
+                WHEN 'WARNING' THEN 2
+                WHEN 'NORMAL' THEN 1
+                ELSE 0
+            END) AS max_status_score
+        FROM profile_comparison_log
+        WHERE current_window_end BETWEEN p_start AND p_end
+        GROUP BY DATE(current_window_end)
+        ORDER BY day
+    ),
+    trend AS (
+        SELECT
+            CORR(EXTRACT(EPOCH FROM day)::REAL, avg_js) AS corr_js_time,
+            CORR(EXTRACT(EPOCH FROM day)::REAL, max_status_score) AS corr_status_time
+        FROM daily_stats
+    )
+    SELECT
+        CASE
+            WHEN corr_js_time > 0.5 THEN 'РАСТЕТ (ухудшение)'
+            WHEN corr_js_time < -0.5 THEN 'УБЫВАЕТ (улучшение)'
+            ELSE 'СТАБИЛЬНО'
+        END AS trend_js,
+        CASE
+            WHEN corr_status_time > 0.5 THEN 'РАСТЕТ (ухудшение)'
+            WHEN corr_status_time < -0.5 THEN 'УБЫВАЕТ (улучшение)'
+            ELSE 'СТАБИЛЬНО'
+        END AS trend_status
+    INTO v_trend_js, v_trend_status
+    FROM trend;
+
+    -- ========================================================================
+    -- 4. Формирование отчёта
+    -- ========================================================================
+    v_report := array_append(v_report, v_header);
+    v_report := array_append(v_report, 'Отчёт сформирован: ' || to_char(v_ts, 'YYYY-MM-DD HH24:MI'));
+    v_report := array_append(v_report, 'Период анализа: ' || to_char(p_start, 'YYYY-MM-DD HH24:MI') || ' – ' || to_char(p_end, 'YYYY-MM-DD HH24:MI'));
+    v_report := array_append(v_report, '');
+
+    v_report := array_append(v_report, '--- СТАТИСТИКА СРАВНЕНИЙ ПРОФИЛЕЙ ---');
+    v_report := array_append(v_report, '  Всего сравнений: ' || v_total_comparisons::TEXT);
+    IF v_total_comparisons > 0 THEN
+        v_report := array_append(v_report, '  NORMAL: ' || v_normal_count::TEXT || ' (' || ROUND((v_normal_count::NUMERIC / v_total_comparisons) * 100, 1)::TEXT || '%)');
+        v_report := array_append(v_report, '  WARNING: ' || v_warning_count::TEXT || ' (' || ROUND((v_warning_count::NUMERIC / v_total_comparisons) * 100, 1)::TEXT || '%)');
+        v_report := array_append(v_report, '  CRITICAL: ' || v_critical_count::TEXT || ' (' || ROUND((v_critical_count::NUMERIC / v_total_comparisons) * 100, 1)::TEXT || '%)');
+    ELSE
+        v_report := array_append(v_report, '  Нет данных для расчёта процентного соотношения.');
+    END IF;
+    v_report := array_append(v_report, '  Средняя JS-дивергенция (NORMAL): ' || ROUND(v_avg_js_normal::NUMERIC, 4)::TEXT);
+    v_report := array_append(v_report, '  Средняя JS-дивергенция (WARNING): ' || ROUND(v_avg_js_warning::NUMERIC, 4)::TEXT);
+    v_report := array_append(v_report, '  Средняя JS-дивергенция (CRITICAL): ' || ROUND(v_avg_js_critical::NUMERIC, 4)::TEXT);
+    v_report := array_append(v_report, '  Максимальная JS-дивергенция: ' || ROUND(v_max_js::NUMERIC, 4)::TEXT);
+    v_report := array_append(v_report, '');
+
+    v_report := array_append(v_report, '--- СВЯЗЬ С ИНЦИДЕНТАМИ ---');
+    v_report := array_append(v_report, '  Всего инцидентов за период: ' || COALESCE(v_incidents_total::TEXT, '0'));
+    v_report := array_append(v_report, '  Инцидентов, которым предшествовало хотя бы одно сравнение (в течение 60 мин): ' || COALESCE(v_incidents_with_any::TEXT, '0'));
+    v_report := array_append(v_report, '  Из них с аномалией (WARNING/CRITICAL): ' || COALESCE(v_incidents_with_anomaly::TEXT, '0'));
+    v_report := array_append(v_report, '    - WARNING: ' || COALESCE(v_incidents_with_warning::TEXT, '0'));
+    v_report := array_append(v_report, '    - CRITICAL: ' || COALESCE(v_incidents_with_critical::TEXT, '0'));
+    IF v_incidents_total > 0 THEN
+        v_report := array_append(v_report, '  Доля инцидентов с предшествующей аномалией: ' || ROUND((v_incident_rate_anomaly * 100)::numeric, 1)::TEXT || '%');
+        v_report := array_append(v_report, '  Доля инцидентов без аномалии: ' || ROUND((v_incident_rate_normal * 100)::numeric, 1)::TEXT || '%');
+    END IF;
+    IF v_avg_time_to_incident_min IS NOT NULL THEN
+        v_report := array_append(v_report, '  Среднее время от сравнения до инцидента (мин): ' || ROUND(v_avg_time_to_incident_min::NUMERIC, 1)::TEXT);
+    ELSE
+        v_report := array_append(v_report, '  Нет данных о времени до инцидента.');
+    END IF;
+    v_report := array_append(v_report, '');
+
+    v_report := array_append(v_report, '--- ТРЕНДЫ ---');
+    v_report := array_append(v_report, '  Тренд JS-дивергенции (по дням): ' || COALESCE(v_trend_js, 'недоступно'));
+    v_report := array_append(v_report, '  Тренд статусов (по дням): ' || COALESCE(v_trend_status, 'недоступно'));
+    v_report := array_append(v_report, '');
+
+    v_report := array_append(v_report, '--- РАСПРЕДЕЛЕНИЕ ПО ДНЯМ НЕДЕЛИ (средняя JS) ---');
+    FOR v_rec IN
+        SELECT
+            EXTRACT(DOW FROM current_window_end) AS dow,
+            COUNT(*) AS cnt,
+            AVG(js_divergence) AS avg_js,
+            MAX(CASE status WHEN 'CRITICAL' THEN 1 ELSE 0 END) AS has_critical
+        FROM profile_comparison_log
+        WHERE current_window_end BETWEEN p_start AND p_end
+        GROUP BY EXTRACT(DOW FROM current_window_end)
+        ORDER BY dow
+    LOOP
+        v_line := format('  День %s: сравнений %s, средняя JS %s%s',
+            v_rec.dow,
+            v_rec.cnt,
+            ROUND(v_rec.avg_js::NUMERIC, 4),
+            CASE WHEN v_rec.has_critical = 1 THEN ' (есть CRITICAL)' ELSE '' END
+        );
+        v_report := array_append(v_report, v_line);
+    END LOOP;
+    IF NOT FOUND THEN
+        v_report := array_append(v_report, '  Нет данных для анализа по дням недели.');
+    END IF;
+    v_report := array_append(v_report, '');
+
+    v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
+
+    RETURN v_report;
+END;
+$$;
+
+COMMENT ON FUNCTION generate_profile_incident_analytics_report(TIMESTAMPTZ, TIMESTAMPTZ) IS
+'Формирует аналитический отчёт по сводному анализу сравнения профилей производительности и инцидентов за указанный период. Возвращает массив строк.';
+
+-- =============================================================================
+-- Функция: generate_comprehensive_analytical_report
+-- Назначение: формирует сводный аналитический отчёт по производительности,
+--             прогнозированию и профилям нагрузки за указанный период.
+-- Выполняет многомерный анализ, выявляет связи между метриками,
+-- инцидентами, аномалиями профилей и качеством прогнозов.
+-- Возвращает: TEXT[] – массив строк с отформатированным отчётом.
+-- Параметры:
+--   p_start TIMESTAMPTZ – начало периода (по умолчанию 30 дней назад)
+--   p_end   TIMESTAMPTZ – конец периода (по умолчанию now())
+-- =============================================================================
+CREATE OR REPLACE FUNCTION generate_comprehensive_analytical_report(
+    p_start TIMESTAMPTZ DEFAULT NULL,
+    p_end   TIMESTAMPTZ DEFAULT NULL
+)
+RETURNS TEXT[]
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_start TIMESTAMPTZ;
+    v_end   TIMESTAMPTZ;
+    v_report TEXT[] := '{}';
+    v_line_sep CONSTANT TEXT := E'\n';
+    v_header TEXT := '=== СВОДНЫЙ АНАЛИТИЧЕСКИЙ ОТЧЁТ ===';
+    v_ts TIMESTAMPTZ := now();
+
+    -- Общая статистика
+    v_total_transitions BIGINT;
+    v_total_predictions BIGINT;
+    v_total_incidents BIGINT;
+    v_total_comparisons BIGINT;
+
+    -- Статистика производительности
+    v_avg_correlation REAL;
+    v_avg_os_angle REAL;
+    v_avg_wait_angle REAL;
+    v_std_correlation REAL;
+    v_std_os_angle REAL;
+    v_std_wait_angle REAL;
+
+    -- Статистика прогнозов
+    v_pred_known BIGINT;
+    v_pred_incidents BIGINT;
+    v_accuracy REAL;
+    v_precision REAL;
+    v_recall REAL;
+    v_brier REAL;
+    v_roc_auc REAL;
+    v_reliability INT;
+
+    -- Статистика сравнения профилей
+    v_js_avg REAL;
+    v_js_max REAL;
+    v_anomaly_rate REAL;           -- доля сравнений со статусом CRITICAL или WARNING
+    v_critical_ratio REAL;
+
+    -- Связи (корреляции)
+    v_corr_js_inc REAL;            -- корреляция между JS-дивергенцией и количеством инцидентов (по дням)
+    v_corr_acc_stab REAL;          -- корреляция между точностью прогнозов и стабильностью корреляции (CV)
+
+    -- Тренды
+    v_trend_js TEXT;
+    v_trend_incidents TEXT;
+    v_trend_accuracy TEXT;
+
+    -- Вспомогательные
+    v_rec RECORD;
+    v_line TEXT;
+BEGIN
+    -- ========================================================================
+    -- 1. Определение периода
+    -- ========================================================================
+    v_start := COALESCE(p_start, now() - INTERVAL '30 days');
+    v_end   := COALESCE(p_end, now());
+    IF v_start > v_end THEN
+        RETURN ARRAY['Ошибка: начальная дата позже конечной.'];
+    END IF;
+
+    -- ========================================================================
+    -- 2. Сбор базовой статистики
+    -- ========================================================================
+    -- 2.1. Переходы
+    SELECT COUNT(*) INTO v_total_transitions
+    FROM transition_log
+    WHERE ts BETWEEN v_start AND v_end;
+
+    -- 2.2. Прогнозы
+    SELECT
+        COUNT(*) AS total,
+        COUNT(actual_outcome) AS known,
+        COUNT(*) FILTER (WHERE actual_outcome = 1) AS incidents
+    INTO v_total_predictions, v_pred_known, v_pred_incidents
+    FROM prediction_log
+    WHERE prediction_time BETWEEN v_start AND v_end;
+
+    -- 2.3. Инциденты производительности
+    SELECT COUNT(*) INTO v_total_incidents
+    FROM performance_incident
+    WHERE start_timepoint BETWEEN v_start AND v_end;
+
+    -- 2.4. Сравнения профилей
+    SELECT COUNT(*) INTO v_total_comparisons
+    FROM profile_comparison_log
+    WHERE created_at BETWEEN v_start AND v_end;
+
+    -- ========================================================================
+    -- 3. Метрики производительности (performance_history)
+    -- ========================================================================
+    SELECT
+        AVG(correlation) AS avg_corr,
+        AVG(os_angle) AS avg_os,
+        AVG(wait_angle) AS avg_wait,
+        STDDEV(correlation) AS std_corr,
+        STDDEV(os_angle) AS std_os,
+        STDDEV(wait_angle) AS std_wait
+    INTO
+        v_avg_correlation, v_avg_os_angle, v_avg_wait_angle,
+        v_std_correlation, v_std_os_angle, v_std_wait_angle
+    FROM performance_history
+    WHERE ts BETWEEN v_start AND v_end;
+
+    -- ========================================================================
+    -- 4. Качество прогнозов
+    -- ========================================================================
+    IF v_pred_known > 0 THEN
+        SELECT
+            COUNT(*) FILTER (WHERE (predicted_risk >= 0.5 AND actual_outcome = 1)
+                                 OR (predicted_risk < 0.5 AND actual_outcome = 0))::REAL / v_pred_known AS acc,
+            COUNT(*) FILTER (WHERE predicted_risk >= 0.5 AND actual_outcome = 1)::REAL /
+                NULLIF(COUNT(*) FILTER (WHERE predicted_risk >= 0.5), 0) AS prec,
+            COUNT(*) FILTER (WHERE predicted_risk >= 0.5 AND actual_outcome = 1)::REAL /
+                NULLIF(v_pred_incidents, 0) AS rec,
+            AVG((predicted_risk - actual_outcome)^2) AS brier
+        INTO v_accuracy, v_precision, v_recall, v_brier
+        FROM prediction_log
+        WHERE prediction_time BETWEEN v_start AND v_end
+          AND actual_outcome IS NOT NULL;
+
+        -- ROC-AUC (упрощённо через ранговый метод)
+        WITH ranked AS (
+            SELECT predicted_risk, actual_outcome,
+                   ROW_NUMBER() OVER (ORDER BY predicted_risk ASC) AS rank
+            FROM prediction_log
+            WHERE prediction_time BETWEEN v_start AND v_end
+              AND actual_outcome IS NOT NULL
+        ),
+        auc_calc AS (
+            SELECT
+                (SUM(CASE WHEN actual_outcome = 1 THEN rank ELSE 0 END) -
+                 (COUNT(CASE WHEN actual_outcome = 1 THEN 1 END) *
+                  (COUNT(CASE WHEN actual_outcome = 1 THEN 1 END) + 1) / 2.0)
+                ) / (COUNT(CASE WHEN actual_outcome = 1 THEN 1 END) *
+                     COUNT(CASE WHEN actual_outcome = 0 THEN 1 END)) AS auc
+            FROM ranked
+            WHERE actual_outcome IN (0,1)
+        )
+        SELECT COALESCE(auc, 0) INTO v_roc_auc FROM auc_calc;
+    ELSE
+        v_accuracy := NULL;
+        v_precision := NULL;
+        v_recall := NULL;
+        v_brier := NULL;
+        v_roc_auc := NULL;
+    END IF;
+
+    -- Рейтинг достоверности
+    SELECT mchain_forecast_reliability() INTO v_reliability;
+
+    -- ========================================================================
+    -- 5. Статистика сравнения профилей
+    -- ========================================================================
+    SELECT
+        AVG(js_divergence) AS avg_js,
+        MAX(js_divergence) AS max_js,
+        COUNT(*) FILTER (WHERE status IN ('CRITICAL', 'WARNING'))::REAL / NULLIF(COUNT(*), 0) AS anomaly_rate,
+        COUNT(*) FILTER (WHERE status = 'CRITICAL')::REAL / NULLIF(COUNT(*), 0) AS critical_ratio
+    INTO v_js_avg, v_js_max, v_anomaly_rate, v_critical_ratio
+    FROM profile_comparison_log
+    WHERE created_at BETWEEN v_start AND v_end;
+
+    -- ========================================================================
+    -- 6. Вычисление корреляций (по дням)
+    -- ========================================================================
+    -- 6.1. Корреляция между ежедневной средней JS-дивергенцией и количеством инцидентов
+    WITH daily_js AS (
+        SELECT DATE(created_at) AS day, AVG(js_divergence) AS avg_js
+        FROM profile_comparison_log
+        WHERE created_at BETWEEN v_start AND v_end
+        GROUP BY DATE(created_at)
+    ),
+    daily_incidents AS (
+        SELECT DATE(start_timepoint) AS day, COUNT(*) AS inc_cnt
+        FROM performance_incident
+        WHERE start_timepoint BETWEEN v_start AND v_end
+        GROUP BY DATE(start_timepoint)
+    ),
+    daily_combined AS (
+        SELECT
+            COALESCE(j.day, i.day) AS day,
+            COALESCE(j.avg_js, 0) AS avg_js,
+            COALESCE(i.inc_cnt, 0) AS inc_cnt
+        FROM daily_js j
+        FULL JOIN daily_incidents i ON j.day = i.day
+    )
+    SELECT CORR(avg_js, inc_cnt) INTO v_corr_js_inc
+    FROM daily_combined
+    WHERE inc_cnt > 0;
+
+    -- 6.2. Корреляция между точностью прогнозов и стабильностью корреляции (CV)
+    -- Стабильность = STDDEV(correlation)/AVG(correlation) за день
+    WITH daily_perf AS (
+        SELECT DATE(ts) AS day,
+               AVG(correlation) AS avg_corr,
+               STDDEV(correlation) AS std_corr
+        FROM performance_history
+        WHERE ts BETWEEN v_start AND v_end
+        GROUP BY DATE(ts)
+    ),
+    daily_acc AS (
+        SELECT DATE(prediction_time) AS day,
+               COUNT(*) FILTER (WHERE (predicted_risk >= 0.5 AND actual_outcome = 1)
+                                    OR (predicted_risk < 0.5 AND actual_outcome = 0))::REAL /
+               NULLIF(COUNT(*), 0) AS accuracy
+        FROM prediction_log
+        WHERE prediction_time BETWEEN v_start AND v_end
+          AND actual_outcome IS NOT NULL
+        GROUP BY DATE(prediction_time)
+    ),
+    combined_acc_stab AS (
+        SELECT
+            COALESCE(p.day, a.day) AS day,
+            COALESCE(p.std_corr / NULLIF(p.avg_corr, 0), 0) AS cv_corr,
+            COALESCE(a.accuracy, 0) AS accuracy
+        FROM daily_perf p
+        FULL JOIN daily_acc a ON p.day = a.day
+        WHERE p.avg_corr IS NOT NULL AND a.accuracy IS NOT NULL
+    )
+    SELECT CORR(cv_corr, accuracy) INTO v_corr_acc_stab
+    FROM combined_acc_stab;
+
+    -- ========================================================================
+    -- 7. Тренды (по дням)
+    -- ========================================================================
+    -- Тренд JS-дивергенции
+    WITH daily_js_trend AS (
+        SELECT DATE(created_at) AS day, AVG(js_divergence) AS avg_js
+        FROM profile_comparison_log
+        WHERE created_at BETWEEN v_start AND v_end
+        GROUP BY DATE(created_at)
+        ORDER BY day
+    )
+    SELECT
+        CASE
+            WHEN CORR(EXTRACT(EPOCH FROM day)::REAL, avg_js) > 0.3 THEN 'РАСТЕТ (ухудшение)'
+            WHEN CORR(EXTRACT(EPOCH FROM day)::REAL, avg_js) < -0.3 THEN 'УБЫВАЕТ (улучшение)'
+            ELSE 'СТАБИЛЬНО'
+        END INTO v_trend_js
+    FROM daily_js_trend;
+
+    -- Тренд количества инцидентов
+    WITH daily_inc_trend AS (
+        SELECT DATE(start_timepoint) AS day, COUNT(*) AS inc_cnt
+        FROM performance_incident
+        WHERE start_timepoint BETWEEN v_start AND v_end
+        GROUP BY DATE(start_timepoint)
+        ORDER BY day
+    )
+    SELECT
+        CASE
+            WHEN CORR(EXTRACT(EPOCH FROM day)::REAL, inc_cnt) > 0.3 THEN 'РАСТЕТ'
+            WHEN CORR(EXTRACT(EPOCH FROM day)::REAL, inc_cnt) < -0.3 THEN 'УБЫВАЕТ'
+            ELSE 'СТАБИЛЬНО'
+        END INTO v_trend_incidents
+    FROM daily_inc_trend;
+
+    -- Тренд точности прогнозов
+    WITH daily_acc_trend AS (
+        SELECT DATE(prediction_time) AS day,
+               COUNT(*) FILTER (WHERE (predicted_risk >= 0.5 AND actual_outcome = 1)
+                                    OR (predicted_risk < 0.5 AND actual_outcome = 0))::REAL /
+               NULLIF(COUNT(*), 0) AS accuracy
+        FROM prediction_log
+        WHERE prediction_time BETWEEN v_start AND v_end
+          AND actual_outcome IS NOT NULL
+        GROUP BY DATE(prediction_time)
+        ORDER BY day
+    )
+    SELECT
+        CASE
+            WHEN CORR(EXTRACT(EPOCH FROM day)::REAL, accuracy) > 0.3 THEN 'РАСТЕТ (улучшение)'
+            WHEN CORR(EXTRACT(EPOCH FROM day)::REAL, accuracy) < -0.3 THEN 'УБЫВАЕТ (ухудшение)'
+            ELSE 'СТАБИЛЬНО'
+        END INTO v_trend_accuracy
+    FROM daily_acc_trend;
+
+    -- ========================================================================
+    -- 8. Формирование отчёта
+    -- ========================================================================
+    v_report := array_append(v_report, v_header);
+    v_report := array_append(v_report, 'Отчёт сформирован: ' || to_char(v_ts, 'YYYY-MM-DD HH24:MI'));
+    v_report := array_append(v_report, 'Период анализа: ' || to_char(v_start, 'YYYY-MM-DD HH24:MI') || ' – ' || to_char(v_end, 'YYYY-MM-DD HH24:MI'));
+    v_report := array_append(v_report, '');
+
+    -- ------------------------------------------------------------------------
+    -- Раздел 1: Общая статистика
+    -- ------------------------------------------------------------------------
+    v_report := array_append(v_report, '--- 1. ОБЩАЯ СТАТИСТИКА ---');
+    v_report := array_append(v_report, '  Всего переходов (transition_log): ' || COALESCE(v_total_transitions::TEXT, '0'));
+    v_report := array_append(v_report, '  Всего прогнозов (prediction_log): ' || COALESCE(v_total_predictions::TEXT, '0'));
+    v_report := array_append(v_report, '    – с известным исходом: ' || COALESCE(v_pred_known::TEXT, '0'));
+    v_report := array_append(v_report, '    – инцидентов по прогнозам: ' || COALESCE(v_pred_incidents::TEXT, '0'));
+    v_report := array_append(v_report, '  Инцидентов производительности: ' || COALESCE(v_total_incidents::TEXT, '0'));
+    v_report := array_append(v_report, '  Сравнений профилей (profile_comparison_log): ' || COALESCE(v_total_comparisons::TEXT, '0'));
+    v_report := array_append(v_report, '');
+
+    -- ------------------------------------------------------------------------
+    -- Раздел 2: Метрики производительности
+    -- ------------------------------------------------------------------------
+    v_report := array_append(v_report, '--- 2. МЕТРИКИ ПРОИЗВОДИТЕЛЬНОСТИ (performance_history) ---');
+    IF v_avg_correlation IS NOT NULL THEN
+        v_report := array_append(v_report, '  Средняя корреляция: ' || round(v_avg_correlation::NUMERIC, 3)::TEXT);
+        v_report := array_append(v_report, '  Стандартное отклонение корреляции: ' || round(v_std_correlation::NUMERIC, 3)::TEXT);
+        v_report := array_append(v_report, '  Коэффициент вариации (CV) корреляции: ' || round((v_std_correlation / NULLIF(v_avg_correlation, 0))::NUMERIC, 3)::TEXT);
+        v_report := array_append(v_report, '  Средний угол OS: ' || round(v_avg_os_angle::NUMERIC, 1)::TEXT || '°');
+        v_report := array_append(v_report, '  Средний угол WAIT: ' || round(v_avg_wait_angle::NUMERIC, 1)::TEXT || '°');
+    ELSE
+        v_report := array_append(v_report, '  Нет данных в performance_history за период.');
+    END IF;
+    v_report := array_append(v_report, '');
+
+    -- ------------------------------------------------------------------------
+    -- Раздел 3: Качество прогнозов
+    -- ------------------------------------------------------------------------
+    v_report := array_append(v_report, '--- 3. КАЧЕСТВО ПРОГНОЗОВ ---');
+    IF v_pred_known > 0 THEN
+        v_report := array_append(v_report, '  Точность (accuracy, порог 0.5): ' || COALESCE(round(v_accuracy::NUMERIC, 4)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '  Точность (precision, порог 0.5): ' || COALESCE(round(v_precision::NUMERIC, 4)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '  Полнота (recall, порог 0.5): ' || COALESCE(round(v_recall::NUMERIC, 4)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '  Brier score: ' || COALESCE(round(v_brier::NUMERIC, 6)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '  ROC-AUC: ' || COALESCE(round(v_roc_auc::NUMERIC, 4)::TEXT, 'NULL'));
+        v_report := array_append(v_report, '  Рейтинг достоверности (0–5): ' || v_reliability::TEXT);
+    ELSE
+        v_report := array_append(v_report, '  Нет прогнозов с известным исходом.');
+    END IF;
+    v_report := array_append(v_report, '');
+
+    -- ------------------------------------------------------------------------
+    -- Раздел 4: Сравнение профилей
+    -- ------------------------------------------------------------------------
+    v_report := array_append(v_report, '--- 4. СРАВНЕНИЕ ПРОФИЛЕЙ (profile_comparison_log) ---');
+    IF v_total_comparisons > 0 THEN
+        v_report := array_append(v_report, '  Средняя JS-дивергенция: ' || round(v_js_avg::NUMERIC, 4)::TEXT);
+        v_report := array_append(v_report, '  Максимальная JS-дивергенция: ' || round(v_js_max::NUMERIC, 4)::TEXT);
+        v_report := array_append(v_report, '  Доля сравнений с аномалией (WARNING/CRITICAL): ' || round((v_anomaly_rate * 100)::NUMERIC, 1)::TEXT || '%');
+        v_report := array_append(v_report, '  Доля CRITICAL: ' || round((v_critical_ratio * 100)::NUMERIC, 1)::TEXT || '%');
+    ELSE
+        v_report := array_append(v_report, '  Нет записей в profile_comparison_log за период.');
+    END IF;
+    v_report := array_append(v_report, '');
+
+    -- ------------------------------------------------------------------------
+    -- Раздел 5: Корреляции и связи
+    -- ------------------------------------------------------------------------
+    v_report := array_append(v_report, '--- 5. КОРРЕЛЯЦИИ И СВЯЗИ ---');
+    IF v_corr_js_inc IS NOT NULL THEN
+        v_report := array_append(v_report, '  Корреляция (ежедневная JS-дивергенция vs. количество инцидентов): ' || round(v_corr_js_inc::NUMERIC, 3)::TEXT);
+        IF v_corr_js_inc > 0.5 THEN
+            v_report := array_append(v_report, '    → Сильная положительная связь: рост аномалий профиля сопровождается ростом инцидентов.');
+        ELSIF v_corr_js_inc > 0.3 THEN
+            v_report := array_append(v_report, '    → Умеренная положительная связь.');
+        ELSIF v_corr_js_inc < -0.3 THEN
+            v_report := array_append(v_report, '    → Отрицательная связь (неожиданно).');
+        ELSE
+            v_report := array_append(v_report, '    → Связь слабая или отсутствует.');
+        END IF;
+    ELSE
+        v_report := array_append(v_report, '  Недостаточно данных для расчёта корреляции JS vs. инциденты.');
+    END IF;
+
+    IF v_corr_acc_stab IS NOT NULL THEN
+        v_report := array_append(v_report, '  Корреляция (ежедневная точность прогнозов vs. стабильность корреляции (CV)): ' || round(v_corr_acc_stab::NUMERIC, 3)::TEXT);
+        IF v_corr_acc_stab < -0.5 THEN
+            v_report := array_append(v_report, '    → Сильная отрицательная связь: менее стабильная корреляция → хуже точность прогнозов.');
+        ELSIF v_corr_acc_stab < -0.3 THEN
+            v_report := array_append(v_report, '    → Умеренная отрицательная связь.');
+        ELSE
+            v_report := array_append(v_report, '    → Связь слабая или отсутствует.');
+        END IF;
+    ELSE
+        v_report := array_append(v_report, '  Недостаточно данных для расчёта корреляции точность vs. стабильность.');
+    END IF;
+    v_report := array_append(v_report, '');
+
+    -- ------------------------------------------------------------------------
+    -- Раздел 6: Тренды
+    -- ------------------------------------------------------------------------
+    v_report := array_append(v_report, '--- 6. ТРЕНДЫ (по дням) ---');
+    v_report := array_append(v_report, '  Тренд JS-дивергенции: ' || COALESCE(v_trend_js, 'недоступно'));
+    v_report := array_append(v_report, '  Тренд количества инцидентов: ' || COALESCE(v_trend_incidents, 'недоступно'));
+    v_report := array_append(v_report, '  Тренд точности прогнозов: ' || COALESCE(v_trend_accuracy, 'недоступно'));
+    v_report := array_append(v_report, '');
+
+    -- ------------------------------------------------------------------------
+    -- Раздел 7: Итоговые выводы и рекомендации
+    -- ------------------------------------------------------------------------
+    v_report := array_append(v_report, '--- 7. ИТОГОВЫЕ ВЫВОДЫ И РЕКОМЕНДАЦИИ ---');
+    -- Формируем содержательный итог
+    DECLARE
+        v_conclusion TEXT := '';
+    BEGIN
+        -- Оценка стабильности производительности
+        IF v_std_correlation IS NOT NULL AND v_avg_correlation IS NOT NULL THEN
+            IF v_std_correlation / NULLIF(v_avg_correlation, 0) < 0.1 THEN
+                v_conclusion := v_conclusion || '✔ Производительность стабильна (CV корреляции < 0.1).' || E'\n';
+            ELSE
+                v_conclusion := v_conclusion || '⚠ Производительность нестабильна (CV корреляции >= 0.1). Рекомендуется анализ причин.' || E'\n';
+            END IF;
+        END IF;
+
+        -- Оценка качества прогнозов
+        IF v_accuracy IS NOT NULL THEN
+            IF v_accuracy > 0.7 THEN
+                v_conclusion := v_conclusion || '✔ Точность прогнозов высокая (> 0.7).' || E'\n';
+            ELSIF v_accuracy > 0.5 THEN
+                v_conclusion := v_conclusion || '⚠ Точность прогнозов умеренная (0.5–0.7). Возможно, требуется настройка модели.' || E'\n';
+            ELSE
+                v_conclusion := v_conclusion || '🔴 Точность прогнозов низкая (< 0.5). Требуется пересмотр модели или данных.' || E'\n';
+            END IF;
+        END IF;
+
+        -- Оценка аномалий профилей
+        IF v_anomaly_rate IS NOT NULL THEN
+            IF v_anomaly_rate > 0.2 THEN
+                v_conclusion := v_conclusion || '🔴 Высокая доля аномалий профилей (> 20%). Система часто отклоняется от эталона.' || E'\n';
+            ELSIF v_anomaly_rate > 0.1 THEN
+                v_conclusion := v_conclusion || '⚠ Умеренная доля аномалий профилей (10–20%). Рекомендуется мониторинг.' || E'\n';
+            ELSE
+                v_conclusion := v_conclusion || '✔ Доля аномалий профилей низкая (< 10%). Профили стабильны.' || E'\n';
+            END IF;
+        END IF;
+
+        -- Связь аномалий и инцидентов
+        IF v_corr_js_inc IS NOT NULL THEN
+            IF v_corr_js_inc > 0.5 THEN
+                v_conclusion := v_conclusion || '🔴 Сильная корреляция между аномалиями профилей и инцидентами. Аномалии профилей являются ранним признаком инцидентов.' || E'\n';
+            ELSIF v_corr_js_inc > 0.3 THEN
+                v_conclusion := v_conclusion || '⚠ Умеренная корреляция. Аномалии профилей частично предсказывают инциденты.' || E'\n';
+            ELSE
+                v_conclusion := v_conclusion || '✔ Связь аномалий профилей и инцидентов слабая. Возможно, инциденты вызваны другими факторами.' || E'\n';
+            END IF;
+        END IF;
+
+        -- Рекомендации
+        v_report := array_append(v_report, v_conclusion);
+        v_report := array_append(v_report, '  Рекомендации:');
+        IF v_reliability < 3 THEN
+            v_report := array_append(v_report, '    - Низкая достоверность прогнозов. Накопите больше данных или пересмотрите параметры забывания.');
+        END IF;
+        IF v_anomaly_rate > 0.15 THEN
+            v_report := array_append(v_report, '    - Частые аномалии профилей. Проверьте, не изменился ли характер нагрузки, обновите эталонный профиль.');
+        END IF;
+        IF v_corr_js_inc > 0.4 AND v_anomaly_rate > 0.1 THEN
+            v_report := array_append(v_report, '    - Используйте аномалии профилей как ранний индикатор риска. Настройте пороги для оповещений.');
+        END IF;
+        IF v_trend_accuracy = 'УБЫВАЕТ (ухудшение)' THEN
+            v_report := array_append(v_report, '    - Качество прогнозов ухудшается. Проверьте актуальность модели и параметры забывания.');
+        END IF;
+        IF v_trend_incidents = 'РАСТЕТ' THEN
+            v_report := array_append(v_report, '    - Наблюдается рост инцидентов. Срочно проанализируйте причины.');
+        END IF;
+        IF array_length(v_report, 1) = 0 THEN
+            v_report := array_append(v_report, '    - Все показатели в норме. Продолжайте мониторинг.');
+        END IF;
+    END;
+
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
+
+    RETURN v_report;
+END;
+$$;
+
+COMMENT ON FUNCTION generate_comprehensive_analytical_report(TIMESTAMPTZ, TIMESTAMPTZ) IS
+'Формирует сводный аналитический отчёт, объединяющий данные о производительности,
+прогнозах и сравнении профилей. Включает статистику, корреляции, тренды и итоговые
+рекомендации. Возвращает массив строк для удобного отображения.';
