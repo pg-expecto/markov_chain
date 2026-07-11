@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_profile_tables.sql
--- version 14.1
+-- version 14.3
 --------------------------------------------------------------------------------
 -- Таблицы для расчета метрик профиля нагрузки на основе цепи Маркова 
 --------------------------------------------------------------------------------
@@ -28,7 +28,7 @@
 DROP TABLE IF EXISTS profile_aggregated;
 CREATE TABLE profile_aggregated (
     id                  BIGSERIAL PRIMARY KEY,
-    profile_type        TEXT NOT NULL CHECK (profile_type IN ('operational', 'daily', 'weekly')),
+    profile_type        TEXT NOT NULL ,
     ts                  TIMESTAMPTZ NOT NULL,          -- Время формирования профиля (верхняя граница окна)
     hour                SMALLINT NOT NULL,             -- Час дня (0–23) для привязки к сезонности
     dow                 SMALLINT NOT NULL,             -- День недели (0–6, 0 = воскресенье)
@@ -62,6 +62,7 @@ COMMENT ON COLUMN profile_aggregated.top_transition IS 'Самый частый 
 CREATE INDEX idx_profile_aggregated_ts ON profile_aggregated (ts);
 CREATE INDEX idx_profile_aggregated_type_ts ON profile_aggregated (profile_type, ts);
 CREATE INDEX idx_profile_aggregated_hour_dow ON profile_aggregated (hour, dow);
+ALTER TABLE profile_aggregated ADD CONSTRAINT profile_aggregated_profile_type_check CHECK (profile_type IN ('operational', 'daily', 'weekly', 'baseline', 'current'));
 
 -- ----------------------------------------------------------------------------
 -- 13.2. Эталонные профили (база для сравнения)
@@ -161,3 +162,41 @@ COMMENT ON COLUMN excluded_windows.reason IS 'Причина исключени�
 
 CREATE INDEX idx_excluded_windows_ts ON excluded_windows (start_ts, end_ts);
 
+-- =============================================================================
+-- Таблица для хранения текущего безынцидентного окна
+-- =============================================================================
+DROP TABLE IF EXISTS incident_free_window_current;
+CREATE TABLE incident_free_window_current (
+    id            SERIAL PRIMARY KEY,
+    window_start  TIMESTAMPTZ NOT NULL,
+    window_end    TIMESTAMPTZ NOT NULL,
+    updated_at    TIMESTAMPTZ DEFAULT now()
+);
+
+COMMENT ON TABLE incident_free_window_current IS 'Хранит последнее найденное безынцидентное окно (одна строка).';
+
+
+-- =============================================================================
+-- 2. Создание таблицы для хранения результатов сравнения профилей
+-- =============================================================================
+DROP TABLE IF EXISTS profile_comparison_log;
+CREATE TABLE profile_comparison_log (
+    id                      BIGSERIAL PRIMARY KEY,
+    created_at              TIMESTAMPTZ DEFAULT now(),
+    baseline_window_start   TIMESTAMPTZ,
+    baseline_window_end     TIMESTAMPTZ,
+    current_window_start    TIMESTAMPTZ,
+    current_window_end      TIMESTAMPTZ,
+    status                  TEXT,                     -- итоговый статус (CRITICAL, WARNING, NORMAL)
+    js_divergence           REAL,
+    report                  JSONB,                    -- полный отчёт в виде массива строк
+    details                 JSONB                     -- дополнительные метрики (опционально)
+);
+
+COMMENT ON TABLE profile_comparison_log IS 'Журнал сравнений эталонного и текущего профилей';
+COMMENT ON COLUMN profile_comparison_log.status IS 'Итоговый статус из compare_profile_windows (например, "КРИТИЧЕСКОЕ")';
+COMMENT ON COLUMN profile_comparison_log.js_divergence IS 'JS-дивергенция гистограмм состояний';
+COMMENT ON COLUMN profile_comparison_log.report IS 'Полный отчёт в формате JSON-массива строк';
+COMMENT ON COLUMN profile_comparison_log.details IS 'Дополнительные метрики (средняя корреляция, critical_ratio и т.д.)';
+
+CREATE INDEX idx_profile_comparison_log_created_at ON profile_comparison_log (created_at);
