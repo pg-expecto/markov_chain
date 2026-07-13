@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_profile_functions.sql
--- version 14.4
+-- version 14.5
 --------------------------------------------------------------------------------
 -- Функции для расчета метрик профиля нагрузки на основе цепи Маркова 
 --------------------------------------------------------------------------------
@@ -93,7 +93,7 @@
 -- Назначение: Получить безынцидентное окно длины p_window_minutes,
 -- заканчивающееся не позже p_ts, с максимальным концом.
 -- 
--- Функция: historical_fill_profile_comparison_log
+-- Процедура: historical_fill_profile_comparison_log
 -- Назначение: Процедура исторического заполнения
 --
 -- Функция: generate_profile_incident_analytics_report
@@ -2192,8 +2192,8 @@ $$;
 -- =============================================================================
 CREATE OR REPLACE FUNCTION find_incident_free_window(
     p_window_minutes      INT DEFAULT 60,
-    p_exclude_before_min  INT DEFAULT 30,
-    p_exclude_after_min   INT DEFAULT 60
+    p_exclude_before_min  INT DEFAULT 30,   -- не используется
+    p_exclude_after_min   INT DEFAULT 60    -- не используется
 )
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -2202,177 +2202,46 @@ AS $$
 DECLARE
     v_now          TIMESTAMPTZ := now();
     v_interval     INTERVAL := (p_window_minutes || ' minutes')::INTERVAL;
-    v_before       INTERVAL := (p_exclude_before_min || ' minutes')::INTERVAL;
-    v_after        INTERVAL := (p_exclude_after_min || ' minutes')::INTERVAL;
     v_last_finish  TIMESTAMPTZ;
-    v_best_start   TIMESTAMPTZ;
-    v_best_end     TIMESTAMPTZ;
-    v_has_incidents BOOLEAN;
+    v_start_ts     TIMESTAMPTZ;
+    v_end_ts       TIMESTAMPTZ;
 BEGIN
     IF p_window_minutes <= 0 THEN
         RAISE EXCEPTION 'Длина окна должна быть положительной, получено %', p_window_minutes;
     END IF;
 
-    -- 1. Определяем последний завершённый инцидент
-    SELECT MAX(finish_timepoint) INTO v_last_finish
+    -- 1. Находим самый поздний завершённый инцидент
+    SELECT MAX(finish_timepoint)
+    INTO v_last_finish
     FROM performance_incident
     WHERE finish_timepoint IS NOT NULL;
 
-    -- 2. Если нет ни одного завершённого инцидента, используем текущее время как точку отсчёта
-    IF v_last_finish IS NULL THEN
-        v_last_finish := v_now;
-    END IF;
-
-    -- 3. Проверяем, есть ли инциденты вообще (если нет, то всё время свободно)
-    SELECT EXISTS (SELECT 1 FROM performance_incident) INTO v_has_incidents;
-    IF NOT v_has_incidents THEN
-        -- Весь временной промежуток свободен, выбираем окно от текущего момента
-        v_best_start := v_now;
-        v_best_end   := v_now + v_interval;
-    ELSE
-        WITH
-        -- 3.1 Интервалы инцидентов с расширением (буферы до и после)
-        incident_intervals AS (
-            SELECT
-                start_timepoint - v_before AS start_ts,
-                COALESCE(finish_timepoint, 'infinity'::timestamptz) + v_after AS end_ts
-            FROM performance_incident
-            WHERE start_timepoint IS NOT NULL
-              AND (finish_timepoint IS NULL OR finish_timepoint >= start_timepoint)
-        ),
-        -- 3.2 Объединение перекрывающихся/соприкасающихся интервалов
-        merged_intervals AS (
-            SELECT
-                MIN(start_ts) AS start_ts,
-                MAX(end_ts) AS end_ts
-            FROM (
-                SELECT
-                    start_ts,
-                    end_ts,
-                    SUM(CASE WHEN prev_end >= start_ts THEN 0 ELSE 1 END)
-                        OVER (ORDER BY start_ts, end_ts) AS grp
-                FROM (
-                    SELECT
-                        start_ts,
-                        end_ts,
-                        LAG(end_ts) OVER (ORDER BY start_ts, end_ts) AS prev_end
-                    FROM incident_intervals
-                ) t
-            ) t
-            GROUP BY grp
-        ),
-        -- 3.3 Вычисляем предыдущий конец для каждого интервала (для поиска разрывов)
-        intervals_with_prev AS (
-            SELECT
-                start_ts,
-                end_ts,
-                LAG(end_ts) OVER (ORDER BY start_ts) AS prev_end
-            FROM merged_intervals
-        ),
-        -- 3.4 Строим свободные промежутки (между расширенными зонами)
-        free_windows AS (
-            -- от -infinity до первого расширенного интервала
-            SELECT
-                '-infinity'::timestamptz AS start_ts,
-                (SELECT MIN(start_ts) FROM merged_intervals) AS end_ts
-            WHERE EXISTS (SELECT 1 FROM merged_intervals)
-            UNION ALL
-            -- между расширенными интервалами
-            SELECT
-                prev_end AS start_ts,
-                start_ts AS end_ts
-            FROM intervals_with_prev
-            WHERE prev_end < start_ts
-            UNION ALL
-            -- после последнего расширенного интервала
-            SELECT
-                MAX(end_ts) AS start_ts,
-                'infinity'::timestamptz AS end_ts
-            FROM merged_intervals
-        ),
-        -- 3.5 Только промежутки достаточной длины
-        valid_free AS (
-            SELECT
-                start_ts,
-                end_ts,
-                (end_ts - start_ts) AS duration
-            FROM free_windows
-            WHERE start_ts < end_ts
-              AND (end_ts - start_ts) >= v_interval
-        ),
-        -- 3.6 Оцениваем расстояние до точки отсчёта (последний завершённый инцидент)
-        scored AS (
-            SELECT
-                start_ts,
-                end_ts,
-                CASE
-                    WHEN start_ts >= v_last_finish THEN start_ts - v_last_finish
-                    WHEN end_ts <= v_last_finish THEN INTERVAL '1000 years'
-                    ELSE INTERVAL '0'
-                END AS distance
-            FROM valid_free
-        ),
-        -- 3.7 Выбираем промежуток с минимальным расстоянием
-        best_candidate AS (
-            SELECT
-                start_ts,
-                end_ts
-            FROM scored
-            ORDER BY distance ASC, start_ts ASC
-            LIMIT 1
-        )
-        -- 3.8 Выделяем подынтервал длины v_interval внутри выбранного промежутка
-        SELECT
-            CASE
-                WHEN v_last_finish BETWEEN bc.start_ts AND bc.end_ts THEN
-                    CASE
-                        WHEN v_last_finish + v_interval <= bc.end_ts THEN v_last_finish
-                        WHEN v_last_finish - v_interval >= bc.start_ts THEN v_last_finish - v_interval
-                        ELSE GREATEST(bc.start_ts, v_last_finish - v_interval / 2)
-                    END
-                WHEN bc.start_ts >= v_last_finish THEN
-                    bc.start_ts
-                ELSE
-                    bc.end_ts - v_interval
-            END AS start_ts,
-            CASE
-                WHEN v_last_finish BETWEEN bc.start_ts AND bc.end_ts THEN
-                    CASE
-                        WHEN v_last_finish + v_interval <= bc.end_ts THEN v_last_finish + v_interval
-                        WHEN v_last_finish - v_interval >= bc.start_ts THEN v_last_finish
-                        ELSE LEAST(bc.end_ts, v_last_finish + v_interval / 2)
-                    END
-                WHEN bc.start_ts >= v_last_finish THEN
-                    bc.start_ts + v_interval
-                ELSE
-                    bc.end_ts
-            END AS end_ts
-        INTO v_best_start, v_best_end
-        FROM best_candidate bc;
-    END IF;
-
-    -- 4. Обработка результата
-    IF v_best_start IS NULL THEN
+    -- 2. Проверяем условия доступности
+    IF v_last_finish IS NULL
+       OR v_last_finish + INTERVAL '1 hour' > v_now
+       OR v_last_finish + v_interval > v_now
+    THEN
         DELETE FROM incident_free_window_current;
-        RETURN 'Окно не найдено: нет свободного промежутка длиной ' || p_window_minutes || ' минут с учётом буферов ' || p_exclude_before_min || ' мин до и ' || p_exclude_after_min || ' мин после инцидентов.';
+        RETURN 'Окно не найдено: последний завершённый инцидент не удовлетворяет условиям доступности (не прошло 1 часа или окно не помещается в прошлое).';
     END IF;
 
-    -- 5. Обновляем таблицу
+    -- 3. Окно доступно
+    v_start_ts := v_last_finish;
+    v_end_ts   := v_last_finish + v_interval;
+
     DELETE FROM incident_free_window_current;
     INSERT INTO incident_free_window_current (window_start, window_end, updated_at)
-    VALUES (v_best_start, v_best_end, v_now);
+    VALUES (v_start_ts, v_end_ts, v_now);
 
-    RETURN format('Окно обновлено: %s – %s (длина %s минут, буферы: %s до, %s после, относительно последнего завершённого инцидента %s)',
-                  v_best_start, v_best_end, p_window_minutes,
-                  p_exclude_before_min, p_exclude_after_min,
-                  v_last_finish);
+    RETURN format('Окно обновлено: %s – %s (длина %s минут, привязано к последнему завершённому инциденту %s)',
+                  v_start_ts, v_end_ts, p_window_minutes, v_last_finish);
 END;
 $$;
 
-COMMENT ON FUNCTION find_incident_free_window IS
-'Вычисляет безынцидентное окно заданной длины, максимально близкое к последнему завершённому инциденту,
-и сохраняет его в таблицу incident_free_window_current. Если такого окна нет, ищется ближайшее к текущему моменту.
-При повторных вызовах (пока не появится новый завершённый инцидент) окно остаётся неизменным.';
+COMMENT ON FUNCTION find_incident_free_window(INT, INT, INT) IS
+'Эталонное окно = [finish ; finish + window_minutes] для самого позднего завершённого инцидента,
+доступно только если прошло не менее 1 часа после его окончания и окно целиком в прошлом.
+Если условий нет – таблица incident_free_window_current очищается.';
 
 -- =============================================================================
 -- Дополнительные функции для профилирования производительности:
@@ -2795,8 +2664,8 @@ LIMIT 10;
 CREATE OR REPLACE FUNCTION get_incident_free_window_before(
     p_ts                TIMESTAMPTZ,
     p_window_minutes    INT DEFAULT 60,
-    p_exclude_before_min INT DEFAULT 30,
-    p_exclude_after_min  INT DEFAULT 60
+    p_exclude_before_min INT DEFAULT 30,   -- не используется
+    p_exclude_after_min  INT DEFAULT 60    -- не используется
 )
 RETURNS TABLE (start_ts TIMESTAMPTZ, end_ts TIMESTAMPTZ)
 LANGUAGE plpgsql
@@ -2804,225 +2673,33 @@ STABLE
 AS $$
 DECLARE
     v_interval INTERVAL := (p_window_minutes || ' minutes')::INTERVAL;
-    v_before   INTERVAL := (p_exclude_before_min || ' minutes')::INTERVAL;
-    v_after    INTERVAL := (p_exclude_after_min || ' minutes')::INTERVAL;
+    v_last_finish TIMESTAMPTZ;
 BEGIN
-    RETURN QUERY
-    WITH
-    incidents AS (
-        SELECT
-            start_timepoint - v_before AS inc_start,
-            COALESCE(finish_timepoint, 'infinity'::timestamptz) + v_after AS inc_end
-        FROM performance_incident
-        WHERE start_timepoint <= p_ts
-    ),
-    merged AS (
-        SELECT MIN(inc_start) AS m_start, MAX(inc_end) AS m_end
-        FROM (
-            SELECT inc_start, inc_end,
-                   SUM(CASE WHEN prev_end >= inc_start THEN 0 ELSE 1 END)
-                       OVER (ORDER BY inc_start, inc_end) AS grp
-            FROM (
-                SELECT inc_start, inc_end,
-                       LAG(inc_end) OVER (ORDER BY inc_start, inc_end) AS prev_end
-                FROM incidents
-            ) t
-        ) t
-        GROUP BY grp
-    ),
-    free_windows AS (
-        -- от -infinity до первого расширенного инцидента
-        SELECT '-infinity'::timestamptz AS f_start,
-               (SELECT MIN(m_start) FROM merged) AS f_end
-        WHERE EXISTS (SELECT 1 FROM merged)
-        UNION ALL
-        -- между расширенными инцидентами
-        SELECT prev_end AS f_start, m_start AS f_end
-        FROM (
-            SELECT m_start, m_end,
-                   LAG(m_end) OVER (ORDER BY m_start) AS prev_end
-            FROM merged
-        ) t
-        WHERE prev_end < m_start
-        UNION ALL
-        -- после последнего расширенного инцидента до p_ts
-        SELECT MAX(m_end) AS f_start, p_ts AS f_end
-        FROM merged
-        HAVING MAX(m_end) < p_ts
-    ),
-    valid_free AS (
-        SELECT f_start, f_end,
-               (f_end - f_start) AS duration
-        FROM free_windows
-        WHERE f_start < f_end
-          AND (f_end - f_start) >= v_interval
-    ),
-    best AS (
-        SELECT f_start, f_end
-        FROM valid_free
-        ORDER BY f_end DESC
-        LIMIT 1
-    )
-    SELECT
-        (f_end - v_interval) AS start_ts,
-        f_end
-    FROM best
-    WHERE best.f_end IS NOT NULL;
+    -- Находим самый поздний завершённый инцидент, закончившийся не позже p_ts
+    SELECT MAX(finish_timepoint)
+    INTO v_last_finish
+    FROM performance_incident
+    WHERE finish_timepoint IS NOT NULL
+      AND finish_timepoint <= p_ts;   -- <-- добавлено условие
+
+    -- Проверяем доступность окна (прошло не менее 1 часа и окно помещается до p_ts)
+    IF v_last_finish IS NULL
+       OR v_last_finish + INTERVAL '1 hour' > p_ts
+       OR v_last_finish + v_interval > p_ts
+    THEN
+        RETURN;
+    END IF;
+
+    -- Окно доступно: [finish, finish + window_minutes]
+    RETURN QUERY SELECT v_last_finish AS start_ts, v_last_finish + v_interval AS end_ts;
 END;
 $$;
 
 COMMENT ON FUNCTION get_incident_free_window_before(TIMESTAMPTZ, INT, INT, INT) IS
-'Возвращает самое позднее безынцидентное окно длины p_window_minutes, заканчивающееся не позже p_ts,
-с учётом буферов исключения до (p_exclude_before_min) и после (p_exclude_after_min) инцидентов.';
+'Возвращает эталонное окно [finish ; finish + window_minutes] для самого позднего завершённого инцидента,
+при условии, что прошло не менее 1 часа после его окончания и окно целиком помещается до p_ts.
+Если условие не выполнено – возвращает пустой набор.';
 
-
--- Процедура исторического заполнения
-CREATE OR REPLACE PROCEDURE historical_fill_profile_comparison_log(
-    p_start                TIMESTAMPTZ,
-    p_end                  TIMESTAMPTZ,
-    p_window_minutes       INT DEFAULT 60,
-    p_step_minutes         INT DEFAULT 1,
-    p_overwrite            BOOLEAN DEFAULT TRUE,
-    p_exclude_before_min   INT DEFAULT 30,
-    p_exclude_after_min    INT DEFAULT 60
-)
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_ts               TIMESTAMPTZ;
-    v_baseline_start   TIMESTAMPTZ;
-    v_baseline_end     TIMESTAMPTZ;
-    v_current_start    TIMESTAMPTZ;
-    v_current_end      TIMESTAMPTZ;
-    v_baseline_metrics RECORD;
-    v_current_metrics  RECORD;
-    v_js               REAL;
-    v_status           TEXT;
-    v_report           TEXT[] := '{}';
-    v_details          JSONB;
-    v_counter          BIGINT := 0;
-    v_total_minutes    BIGINT;
-    v_last_notice      TIMESTAMPTZ := NULL;
-BEGIN
-    IF p_start > p_end THEN
-        RAISE EXCEPTION 'p_start (%s) > p_end (%s)', p_start, p_end;
-    END IF;
-
-    -- Удаление старых записей за указанный диапазон (если требуется перезапись)
-    IF p_overwrite THEN
-        DELETE FROM profile_comparison_log
-        WHERE current_window_end BETWEEN p_start AND p_end;
-        RAISE NOTICE 'Удалено % записей за период [%, %]',
-                     (SELECT COUNT(*) FROM profile_comparison_log
-                      WHERE current_window_end BETWEEN p_start AND p_end),
-                     p_start, p_end;
-    END IF;
-
-    v_total_minutes := EXTRACT(EPOCH FROM (p_end - p_start)) / 60 + 1;
-    RAISE NOTICE 'Начало исторического заполнения: % → %, окно % мин, шаг % мин, всего % минут',
-                 p_start, p_end, p_window_minutes, p_step_minutes, v_total_minutes;
-
-    v_ts := p_start;
-    WHILE v_ts <= p_end LOOP
-        v_counter := v_counter + 1;
-
-        -- 1. Найти безынцидентное окно перед v_ts с учётом буферов
-        SELECT start_ts, end_ts INTO v_baseline_start, v_baseline_end
-        FROM get_incident_free_window_before(v_ts, p_window_minutes, p_exclude_before_min, p_exclude_after_min);
-
-        IF v_baseline_start IS NULL THEN
-            v_ts := v_ts + (p_step_minutes || ' minutes')::INTERVAL;
-            CONTINUE;
-        END IF;
-
-        -- 2. Текущий профиль: окно [v_ts - p_window_minutes, v_ts]
-        v_current_start := v_ts - (p_window_minutes || ' minutes')::INTERVAL;
-        v_current_end   := v_ts;
-
-        -- 3. Вычислить метрики
-        SELECT * INTO v_baseline_metrics
-        FROM calculate_profile_metrics(v_baseline_start, v_baseline_end);
-
-        SELECT * INTO v_current_metrics
-        FROM calculate_profile_metrics(v_current_start, v_current_end);
-
-        -- 4. JS-дивергенция
-        v_js := histogram_divergence(
-            v_baseline_metrics.state_histogram,
-            v_current_metrics.state_histogram
-        );
-
-        -- 5. Статус (пороги остаются без изменений)
-        v_status := 'NORMAL';
-        IF v_js >= 0.05 THEN
-            v_status := 'WARNING';
-        END IF;
-        IF v_js >= 0.2 OR ABS(COALESCE(v_current_metrics.avg_correlation, 0) - COALESCE(v_baseline_metrics.avg_correlation, 0)) > 0.2 THEN
-            v_status := 'CRITICAL';
-        END IF;
-
-        -- 6. Детали
-        v_details := jsonb_build_object(
-            'baseline_avg_correlation', v_baseline_metrics.avg_correlation,
-            'baseline_critical_ratio', v_baseline_metrics.critical_ratio,
-            'baseline_entropy', v_baseline_metrics.entropy,
-            'baseline_self_loop_ratio', v_baseline_metrics.self_loop_ratio,
-            'current_avg_correlation', v_current_metrics.avg_correlation,
-            'current_critical_ratio', v_current_metrics.critical_ratio,
-            'current_entropy', v_current_metrics.entropy,
-            'current_self_loop_ratio', v_current_metrics.self_loop_ratio,
-            'js_divergence', v_js
-        );
-
-        -- 7. Отчёт (краткий)
-        v_report := ARRAY[
-            'Сравнение на ' || v_ts,
-            'Эталон: ' || v_baseline_start || ' – ' || v_baseline_end,
-            'Текущий: ' || v_current_start || ' – ' || v_current_end,
-            'JS-дивергенция: ' || COALESCE(ROUND(v_js::NUMERIC, 4)::TEXT, 'NULL'),
-            'Статус: ' || v_status
-        ];
-
-        -- 8. Вставка
-        INSERT INTO profile_comparison_log (
-            baseline_window_start,
-            baseline_window_end,
-            current_window_start,
-            current_window_end,
-            status,
-            js_divergence,
-            report,
-            details
-        ) VALUES (
-            v_baseline_start,
-            v_baseline_end,
-            v_current_start,
-            v_current_end,
-            v_status,
-            v_js,
-            to_jsonb(v_report),
-            v_details
-        );
-
-        -- Прогресс
-        IF v_counter % 100 = 0 OR (v_last_notice IS NULL OR v_ts - v_last_notice > INTERVAL '5 minutes') THEN
-            RAISE NOTICE 'Прогресс: % из % минут (%.1f%%), последний ts = %',
-                         v_counter, v_total_minutes,
-                         (v_counter::NUMERIC / v_total_minutes * 100),
-                         v_ts;
-            v_last_notice := v_ts;
-        END IF;
-
-        v_ts := v_ts + (p_step_minutes || ' minutes')::INTERVAL;
-    END LOOP;
-
-    RAISE NOTICE 'Заполнение завершено. Вставлено записей: %', v_counter;
-END;
-$$;
-
-COMMENT ON PROCEDURE historical_fill_profile_comparison_log IS
-'Заполняет profile_comparison_log историческими сравнениями для каждой минуты в диапазоне.
-Учитывает буферы исключения вокруг инцидентов при выборе эталонного окна.';
 
 
 
@@ -3754,3 +3431,191 @@ COMMENT ON FUNCTION generate_comprehensive_analytical_report(TIMESTAMPTZ, TIMEST
 'Формирует сводный аналитический отчёт, объединяющий данные о производительности,
 прогнозах и сравнении профилей. Включает статистику, корреляции, тренды и итоговые
 рекомендации. Возвращает массив строк для удобного отображения.';
+
+-- Процедура исторического заполнения
+CREATE OR REPLACE PROCEDURE historical_fill_profile_comparison_log(
+    p_start                TIMESTAMPTZ,
+    p_end                  TIMESTAMPTZ,
+    p_window_minutes       INT DEFAULT 60,
+    p_step_minutes         INT DEFAULT 1,
+    p_overwrite            BOOLEAN DEFAULT TRUE,
+    p_exclude_before_min   INT DEFAULT 30,   -- не используется
+    p_exclude_after_min    INT DEFAULT 60    -- не используется
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_ts               TIMESTAMPTZ;
+    v_baseline_start   TIMESTAMPTZ;
+    v_baseline_end     TIMESTAMPTZ;
+    v_current_start    TIMESTAMPTZ;
+    v_current_end      TIMESTAMPTZ;
+    v_baseline_metrics RECORD;
+    v_current_metrics  RECORD;
+    v_js               REAL;
+    v_status           TEXT;
+    v_report           TEXT[] := '{}';
+    v_details          JSONB;
+    v_counter          BIGINT := 0;
+    v_total_minutes    BIGINT;
+    v_last_notice      TIMESTAMPTZ := NULL;
+    v_inside_incident  BOOLEAN;
+BEGIN
+    IF p_start > p_end THEN
+        RAISE EXCEPTION 'p_start (%s) > p_end (%s)', p_start, p_end;
+    END IF;
+
+    IF p_overwrite THEN
+        DELETE FROM profile_comparison_log
+        WHERE current_window_end BETWEEN p_start AND p_end;
+        RAISE NOTICE 'Удалено % записей за период [%, %]',
+                     (SELECT COUNT(*) FROM profile_comparison_log
+                      WHERE current_window_end BETWEEN p_start AND p_end),
+                     p_start, p_end;
+    END IF;
+
+    v_total_minutes := EXTRACT(EPOCH FROM (p_end - p_start)) / 60 + 1;
+    RAISE NOTICE 'Начало исторического заполнения: % → %, окно % мин, шаг % мин, всего % минут',
+                 p_start, p_end, p_window_minutes, p_step_minutes, v_total_minutes;
+
+    v_ts := p_start;
+    WHILE v_ts <= p_end LOOP
+        v_counter := v_counter + 1;
+
+        -- Проверка: находится ли v_ts внутри активного инцидента
+        SELECT EXISTS (
+            SELECT 1
+            FROM performance_incident
+            WHERE start_timepoint <= v_ts
+              AND (finish_timepoint IS NULL OR finish_timepoint >= v_ts)
+        ) INTO v_inside_incident;
+
+        IF v_inside_incident THEN
+            -- Случай 1: внутри инцидента – запись INCIDENT
+            INSERT INTO profile_comparison_log (
+                current_window_start,
+                current_window_end,
+                status,
+                js_divergence,
+                report,
+                details
+            ) VALUES (
+                v_ts - (p_window_minutes || ' minutes')::INTERVAL,
+                v_ts,
+                'INCIDENT',
+                NULL,
+                NULL,
+                NULL
+            );
+            v_ts := v_ts + (p_step_minutes || ' minutes')::INTERVAL;
+            CONTINUE;
+        END IF;
+
+        -- Попытка получить эталонное окно (по новой стратегии)
+        SELECT start_ts, end_ts INTO v_baseline_start, v_baseline_end
+        FROM get_incident_free_window_before(v_ts, p_window_minutes, p_exclude_before_min, p_exclude_after_min);
+
+        IF v_baseline_start IS NULL THEN
+            -- Случай 2: после инцидента, но ещё не прошло 1 часа
+            -- (эталонное окно недоступно) – запись INCIDENT
+            INSERT INTO profile_comparison_log (
+                current_window_start,
+                current_window_end,
+                status,
+                js_divergence,
+                report,
+                details
+            ) VALUES (
+                v_ts - (p_window_minutes || ' minutes')::INTERVAL,
+                v_ts,
+                'INCIDENT',
+                NULL,
+                NULL,
+                NULL
+            );
+            v_ts := v_ts + (p_step_minutes || ' minutes')::INTERVAL;
+            CONTINUE;
+        END IF;
+
+        -- Эталонное окно доступно – выполняем нормальный расчёт
+        v_current_start := v_ts - (p_window_minutes || ' minutes')::INTERVAL;
+        v_current_end   := v_ts;
+
+        SELECT * INTO v_baseline_metrics
+        FROM calculate_profile_metrics(v_baseline_start, v_baseline_end);
+
+        SELECT * INTO v_current_metrics
+        FROM calculate_profile_metrics(v_current_start, v_current_end);
+
+        v_js := histogram_divergence(
+            v_baseline_metrics.state_histogram,
+            v_current_metrics.state_histogram
+        );
+
+        v_status := 'NORMAL';
+        IF v_js >= 0.05 THEN
+            v_status := 'WARNING';
+        END IF;
+        IF v_js >= 0.2 OR ABS(COALESCE(v_current_metrics.avg_correlation, 0) - COALESCE(v_baseline_metrics.avg_correlation, 0)) > 0.2 THEN
+            v_status := 'CRITICAL';
+        END IF;
+
+        v_details := jsonb_build_object(
+            'baseline_avg_correlation', v_baseline_metrics.avg_correlation,
+            'baseline_critical_ratio', v_baseline_metrics.critical_ratio,
+            'baseline_entropy', v_baseline_metrics.entropy,
+            'baseline_self_loop_ratio', v_baseline_metrics.self_loop_ratio,
+            'current_avg_correlation', v_current_metrics.avg_correlation,
+            'current_critical_ratio', v_current_metrics.critical_ratio,
+            'current_entropy', v_current_metrics.entropy,
+            'current_self_loop_ratio', v_current_metrics.self_loop_ratio,
+            'js_divergence', v_js
+        );
+
+        v_report := ARRAY[
+            'Сравнение на ' || v_ts,
+            'Эталон: ' || v_baseline_start || ' – ' || v_baseline_end,
+            'Текущий: ' || v_current_start || ' – ' || v_current_end,
+            'JS-дивергенция: ' || COALESCE(ROUND(v_js::NUMERIC, 4)::TEXT, 'NULL'),
+            'Статус: ' || v_status
+        ];
+
+        INSERT INTO profile_comparison_log (
+            baseline_window_start,
+            baseline_window_end,
+            current_window_start,
+            current_window_end,
+            status,
+            js_divergence,
+            report,
+            details
+        ) VALUES (
+            v_baseline_start,
+            v_baseline_end,
+            v_current_start,
+            v_current_end,
+            v_status,
+            v_js,
+            to_jsonb(v_report),
+            v_details
+        );
+
+        IF v_counter % 100 = 0 OR (v_last_notice IS NULL OR v_ts - v_last_notice > INTERVAL '5 minutes') THEN
+            RAISE NOTICE 'Прогресс: % из % минут (%.1f%%), последний ts = %',
+                         v_counter, v_total_minutes,
+                         (v_counter::NUMERIC / v_total_minutes * 100),
+                         v_ts;
+            v_last_notice := v_ts;
+        END IF;
+
+        v_ts := v_ts + (p_step_minutes || ' minutes')::INTERVAL;
+    END LOOP;
+
+    RAISE NOTICE 'Заполнение завершено. Вставлено записей: %', v_counter;
+END;
+$$;
+
+COMMENT ON PROCEDURE historical_fill_profile_comparison_log IS
+'Заполняет profile_comparison_log для каждой минуты диапазона.
+Использует новую стратегию выбора эталонного окна (доступно только после finish + 1 час).
+Если v_ts внутри инцидента или эталон недоступен – вставляется запись со статусом INCIDENT и NULL-полями.';
