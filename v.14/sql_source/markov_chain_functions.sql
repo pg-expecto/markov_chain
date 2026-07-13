@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_functions.sql
--- version 14.3
+-- version 14.6
 /*
  Функция: adaptive_configure_markov_chain
  Назначение: Адаптивная настройка параметров цепи Маркова с периодом анализа, определяемым из markov_config.transition_log_retention_days
