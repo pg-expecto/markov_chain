@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_profile_functions.sql
--- version 14.6
+-- version 14.7
 --------------------------------------------------------------------------------
 -- Функции для расчета метрик профиля нагрузки на основе цепи Маркова 
 --------------------------------------------------------------------------------
@@ -104,7 +104,13 @@
 -- Функция: generate_comprehensive_analytical_report
 -- Назначение: формирует сводный аналитический отчёт по производительности,
 --             прогнозированию и профилям нагрузки за указанный период.
-
+--
+-- Функция: generate_analytical_report
+-- Назначение: формирует аналитический отчёт по заданному временному интервалу,
+--             объединяя данные из prediction_log, profile_comparison_log
+--             и performance_incident. Возвращает массив строк с интерпретацией
+--             и сводными показателями, а не сырыми данными.
+--
 -- =============================================================================
 
 
@@ -136,9 +142,7 @@ WHERE id = 123;
 -- =============================================================================
 -- 2. Хранимые функции для профилирования производительности
 -- =============================================================================
--- ВНИМАНИЕ: Таблицы profile_aggregated, profile_baseline, anomaly_log,
--- excluded_windows должны быть созданы заранее (файл markov_chain_profile_tables.sql).
--- Данный скрипт содержит только определения функций.
+-- ВНИМАНИЕ: Таблицы profile_aggregated, profile_baseline, anomaly_log
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
@@ -3691,3 +3695,428 @@ COMMENT ON PROCEDURE historical_fill_profile_comparison_log IS
 'Заполняет profile_comparison_log для каждой минуты диапазона.
 Использует новую стратегию выбора эталонного окна (доступно только после finish + 1 час).
 Если v_ts внутри инцидента или эталон недоступен – вставляется запись со статусом INCIDENT и NULL-полями.';
+
+-- =============================================================================
+-- Функция: generate_analytical_report (модифицированная)
+-- Назначение: формирует аналитический отчёт по заданному периоду, исключая
+--             из расчётов статус 'INCIDENT' из profile_comparison_log.
+--             Показатели: качество прогнозов, доли статусов перед инцидентами,
+--             время от CRITICAL до инцидента, тренды, выводы.
+-- Параметры:
+--   p_start TEXT – начало периода в формате 'YYYY-MM-DD HH24:MI'
+--   p_end   TEXT – конец периода в формате 'YYYY-MM-DD HH24:MI'
+-- Возвращает: TEXT[] – массив строк отчёта.
+-- =============================================================================
+
+CREATE OR REPLACE FUNCTION generate_analytical_report(
+    p_start TEXT,
+    p_end   TEXT
+)
+RETURNS TEXT[]
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_start TIMESTAMPTZ;
+    v_end   TIMESTAMPTZ;
+    v_report TEXT[] := '{}';
+
+    -- Агрегаты из объединённого запроса (без INCIDENT)
+    v_total_records BIGINT;
+    v_avg_risk REAL;
+    v_status_counts JSONB;
+    v_avg_js_normal REAL;
+    v_avg_js_warning REAL;
+    v_avg_js_critical REAL;
+    v_incidents_total BIGINT;
+    v_accuracy REAL;
+    v_precision REAL;
+    v_recall REAL;
+    v_known_outcomes BIGINT;
+
+    -- Статистика по дням для тренда
+    v_trend_js TEXT;
+    v_trend_risk TEXT;
+    v_days_diff INT;
+
+    -- Время от CRITICAL до инцидента
+    v_min_diff REAL;
+    v_max_diff REAL;
+    v_avg_diff REAL;
+    v_median_diff REAL;
+
+    -- Статусы перед инцидентами (исключая INCIDENT)
+    v_inc_with_critical BIGINT;
+    v_inc_with_warning BIGINT;
+    v_inc_with_normal BIGINT;
+    v_inc_without_status BIGINT;
+
+BEGIN
+    -- Преобразование входных параметров
+    BEGIN
+        v_start := to_timestamp(p_start, 'YYYY-MM-DD HH24:MI');
+        v_end   := to_timestamp(p_end,   'YYYY-MM-DD HH24:MI');
+    EXCEPTION WHEN OTHERS THEN
+        RAISE EXCEPTION 'Неверный формат даты/времени. Ожидается "YYYY-MM-DD HH24:MI" (например, "2026-07-10 00:00").';
+    END;
+
+    IF v_start > v_end THEN
+        RAISE EXCEPTION 'Начальная дата должна быть раньше конечной.';
+    END IF;
+
+    -- ========================================================================
+    -- 1. Основные агрегаты (прогнозы + сравнения профилей) – исключаем INCIDENT
+    -- ========================================================================
+    WITH combined AS (
+        SELECT
+            date_trunc('minute', pl.prediction_time) AS pred_minute,
+            pl.predicted_risk,
+            pl.actual_outcome,
+            pcl.status,
+            pcl.js_divergence,
+            pcl.current_window_end
+        FROM prediction_log pl
+        JOIN profile_comparison_log pcl
+            ON date_trunc('minute', pl.prediction_time) = date_trunc('minute', pcl.current_window_end)
+        WHERE pl.prediction_time BETWEEN v_start AND v_end
+          AND pcl.current_window_end BETWEEN v_start AND v_end
+          AND pcl.status != 'INCIDENT'           -- Исключаем INCIDENT
+    ),
+    aggregated AS (
+        SELECT
+            COUNT(*) AS total_records,
+            AVG(predicted_risk) AS avg_risk,
+            COUNT(actual_outcome) AS known_outcomes,
+            AVG(CASE WHEN actual_outcome IS NOT NULL THEN (CASE WHEN predicted_risk >= 0.5 AND actual_outcome = 1 THEN 1.0
+                                                                WHEN predicted_risk < 0.5 AND actual_outcome = 0 THEN 1.0
+                                                                ELSE 0.0 END) END) AS accuracy,
+            AVG(CASE WHEN predicted_risk >= 0.5 AND actual_outcome = 1 THEN 1.0
+                     WHEN predicted_risk >= 0.5 AND actual_outcome = 0 THEN 0.0
+                     ELSE NULL END) AS precision,
+            AVG(CASE WHEN actual_outcome = 1 AND predicted_risk >= 0.5 THEN 1.0
+                     WHEN actual_outcome = 1 AND predicted_risk < 0.5 THEN 0.0
+                     ELSE NULL END) AS recall,
+            jsonb_build_object(
+                'NORMAL', COUNT(*) FILTER (WHERE status = 'NORMAL'),
+                'WARNING', COUNT(*) FILTER (WHERE status = 'WARNING'),
+                'CRITICAL', COUNT(*) FILTER (WHERE status = 'CRITICAL')
+            ) AS status_counts,
+            AVG(js_divergence) FILTER (WHERE status = 'NORMAL') AS avg_js_normal,
+            AVG(js_divergence) FILTER (WHERE status = 'WARNING') AS avg_js_warning,
+            AVG(js_divergence) FILTER (WHERE status = 'CRITICAL') AS avg_js_critical
+        FROM combined
+    )
+    SELECT
+        total_records,
+        avg_risk,
+        known_outcomes,
+        accuracy,
+        precision,
+        recall,
+        status_counts,
+        avg_js_normal,
+        avg_js_warning,
+        avg_js_critical
+    INTO
+        v_total_records,
+        v_avg_risk,
+        v_known_outcomes,
+        v_accuracy,
+        v_precision,
+        v_recall,
+        v_status_counts,
+        v_avg_js_normal,
+        v_avg_js_warning,
+        v_avg_js_critical
+    FROM aggregated;
+
+    -- Если данных нет
+    IF v_total_records IS NULL OR v_total_records = 0 THEN
+        v_report := array_append(v_report, '=== АНАЛИТИЧЕСКИЙ ОТЧЁТ ===');
+        v_report := array_append(v_report, 'Период: ' || to_char(v_start, 'YYYY-MM-DD HH24:MI') || ' – ' || to_char(v_end, 'YYYY-MM-DD HH24:MI'));
+        v_report := array_append(v_report, 'Нет данных для анализа за указанный период (после исключения INCIDENT).');
+        RETURN v_report;
+    END IF;
+
+    -- ========================================================================
+    -- 2. Общее количество инцидентов за период
+    -- ========================================================================
+    SELECT COUNT(*) INTO v_incidents_total
+    FROM performance_incident
+    WHERE start_timepoint BETWEEN v_start AND v_end;
+
+    -- ========================================================================
+    -- 3. Время от статуса CRITICAL до ближайшего инцидента
+    --    (используем только CRITICAL, INCIDENT не влияет)
+    -- ========================================================================
+    WITH critical_times AS (
+        SELECT current_window_end
+        FROM profile_comparison_log
+        WHERE status = 'CRITICAL'
+          AND current_window_end BETWEEN v_start AND v_end
+    ),
+    incident_times AS (
+        SELECT start_timepoint
+        FROM performance_incident
+        WHERE start_timepoint BETWEEN v_start AND v_end
+    ),
+    time_diffs AS (
+        SELECT
+            EXTRACT(EPOCH FROM (i.start_timepoint - c.current_window_end)) / 60 AS diff_min
+        FROM critical_times c
+        CROSS JOIN LATERAL (
+            SELECT start_timepoint
+            FROM incident_times
+            WHERE start_timepoint > c.current_window_end
+            ORDER BY start_timepoint
+            LIMIT 1
+        ) i
+    )
+    SELECT
+        MIN(diff_min) AS min_diff,
+        MAX(diff_min) AS max_diff,
+        AVG(diff_min) AS avg_diff,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY diff_min) AS median_diff
+    INTO v_min_diff, v_max_diff, v_avg_diff, v_median_diff
+    FROM time_diffs;
+
+    -- ========================================================================
+    -- 4. Статусы перед инцидентами (последний статус перед каждым инцидентом,
+    --    исключая INCIDENT)
+    -- ========================================================================
+    WITH incident_prior_status AS (
+        SELECT
+            pi.start_timepoint,
+            (
+                SELECT pcl.status
+                FROM profile_comparison_log pcl
+                WHERE pcl.current_window_end < pi.start_timepoint
+                  AND pcl.current_window_end BETWEEN v_start AND v_end
+                  AND pcl.status != 'INCIDENT'      -- Исключаем INCIDENT
+                ORDER BY pcl.current_window_end DESC
+                LIMIT 1
+            ) AS prior_status
+        FROM performance_incident pi
+        WHERE pi.start_timepoint BETWEEN v_start AND v_end
+    )
+    SELECT
+        COUNT(*) FILTER (WHERE prior_status = 'CRITICAL') AS critical_cnt,
+        COUNT(*) FILTER (WHERE prior_status = 'WARNING') AS warning_cnt,
+        COUNT(*) FILTER (WHERE prior_status = 'NORMAL') AS normal_cnt,
+        COUNT(*) FILTER (WHERE prior_status IS NULL) AS without_cnt
+    INTO
+        v_inc_with_critical,
+        v_inc_with_warning,
+        v_inc_with_normal,
+        v_inc_without_status
+    FROM incident_prior_status;
+
+    -- ========================================================================
+    -- 5. Тренды (если период > 1 дня) – также исключаем INCIDENT
+    -- ========================================================================
+    v_days_diff := EXTRACT(DAY FROM (v_end - v_start))::INT;
+    IF v_days_diff >= 1 THEN
+        WITH daily_stats AS (
+            SELECT
+                DATE(pcl.current_window_end) AS day,
+                AVG(pcl.js_divergence) AS avg_js,
+                AVG(pl.predicted_risk) AS avg_risk
+            FROM profile_comparison_log pcl
+            JOIN prediction_log pl
+                ON date_trunc('minute', pl.prediction_time) = date_trunc('minute', pcl.current_window_end)
+            WHERE pcl.current_window_end BETWEEN v_start AND v_end
+              AND pl.prediction_time BETWEEN v_start AND v_end
+              AND pcl.status != 'INCIDENT'
+            GROUP BY DATE(pcl.current_window_end)
+            ORDER BY day
+        )
+        SELECT
+            CASE
+                WHEN CORR(EXTRACT(EPOCH FROM day)::REAL, avg_js) > 0.3 THEN 'РАСТЕТ (ухудшение)'
+                WHEN CORR(EXTRACT(EPOCH FROM day)::REAL, avg_js) < -0.3 THEN 'УБЫВАЕТ (улучшение)'
+                ELSE 'СТАБИЛЬНО'
+            END AS trend_js,
+            CASE
+                WHEN CORR(EXTRACT(EPOCH FROM day)::REAL, avg_risk) > 0.3 THEN 'РАСТЕТ'
+                WHEN CORR(EXTRACT(EPOCH FROM day)::REAL, avg_risk) < -0.3 THEN 'УБЫВАЕТ'
+                ELSE 'СТАБИЛЬНО'
+            END AS trend_risk
+        INTO v_trend_js, v_trend_risk
+        FROM daily_stats;
+    ELSE
+        v_trend_js := 'недостаточно данных (период ≤ 1 дня)';
+        v_trend_risk := 'недостаточно данных (период ≤ 1 дня)';
+    END IF;
+
+    -- ========================================================================
+    -- 6. Формирование отчёта
+    -- ========================================================================
+    v_report := array_append(v_report, '=== АНАЛИТИЧЕСКИЙ ОТЧЁТ ===');
+    v_report := array_append(v_report, 'Период: ' || to_char(v_start, 'YYYY-MM-DD HH24:MI') || ' – ' || to_char(v_end, 'YYYY-MM-DD HH24:MI'));
+    v_report := array_append(v_report, '');
+
+    -- Общая статистика
+    v_report := array_append(v_report, '--- ОБЩАЯ СТАТИСТИКА ---');
+    v_report := array_append(v_report, '  Количество записей (прогноз + сравнение профиля, без INCIDENT): ' || v_total_records::TEXT);
+    v_report := array_append(v_report, '  Средний предсказанный риск: ' || round(v_avg_risk::NUMERIC, 4)::TEXT);
+
+    -- Качество прогнозов с интерпретацией
+    IF v_known_outcomes > 0 THEN
+        v_report := array_append(v_report, '  Прогнозов с известным исходом: ' || v_known_outcomes::TEXT);
+        v_report := array_append(v_report, '  Точность (accuracy, порог 0.5): ' || round(COALESCE(v_accuracy, 0)::NUMERIC, 4)::TEXT);
+        v_report := array_append(v_report, '  Точность (precision, порог 0.5): ' || round(COALESCE(v_precision, 0)::NUMERIC, 4)::TEXT);
+        v_report := array_append(v_report, '  Полнота (recall, порог 0.5): ' || round(COALESCE(v_recall, 0)::NUMERIC, 4)::TEXT);
+
+        DECLARE
+            analysis TEXT := '';
+        BEGIN
+            IF COALESCE(v_accuracy, 0) >= 0.8 THEN
+                analysis := analysis || 'Accuracy высокая (>0.8), ';
+            ELSIF COALESCE(v_accuracy, 0) >= 0.6 THEN
+                analysis := analysis || 'Accuracy умеренная (0.6-0.8), ';
+            ELSE
+                analysis := analysis || 'Accuracy низкая (<0.6), ';
+            END IF;
+
+            IF COALESCE(v_precision, 0) >= 0.8 THEN
+                analysis := analysis || 'Precision высокая (>0.8), ';
+            ELSIF COALESCE(v_precision, 0) >= 0.6 THEN
+                analysis := analysis || 'Precision умеренная (0.6-0.8), ';
+            ELSE
+                analysis := analysis || 'Precision низкая (<0.6), ';
+            END IF;
+
+            IF COALESCE(v_recall, 0) >= 0.8 THEN
+                analysis := analysis || 'Recall высокий (>0.8).';
+            ELSIF COALESCE(v_recall, 0) >= 0.6 THEN
+                analysis := analysis || 'Recall умеренный (0.6-0.8).';
+            ELSE
+                analysis := analysis || 'Recall низкий (<0.6).';
+            END IF;
+
+            v_report := array_append(v_report, '  Интерпретация: ' || analysis);
+        END;
+    ELSE
+        v_report := array_append(v_report, '  Нет данных о фактических исходах (actual_outcome отсутствует).');
+    END IF;
+
+    v_report := array_append(v_report, '');
+
+    -- Сравнение профилей (только NORMAL, WARNING, CRITICAL, без INCIDENT)
+    v_report := array_append(v_report, '--- СРАВНЕНИЕ ПРОФИЛЕЙ ---');
+    v_report := array_append(v_report, '  Распределение статусов (без INCIDENT):');
+    v_report := array_append(v_report, '    NORMAL: ' || COALESCE((v_status_counts->>'NORMAL')::TEXT, '0') || ' (' || round((COALESCE((v_status_counts->>'NORMAL')::NUMERIC, 0) / v_total_records * 100)::NUMERIC, 1) || '%)');
+    v_report := array_append(v_report, '    WARNING: ' || COALESCE((v_status_counts->>'WARNING')::TEXT, '0') || ' (' || round((COALESCE((v_status_counts->>'WARNING')::NUMERIC, 0) / v_total_records * 100)::NUMERIC, 1) || '%)');
+    v_report := array_append(v_report, '    CRITICAL: ' || COALESCE((v_status_counts->>'CRITICAL')::TEXT, '0') || ' (' || round((COALESCE((v_status_counts->>'CRITICAL')::NUMERIC, 0) / v_total_records * 100)::NUMERIC, 1) || '%)');
+    IF v_avg_js_normal IS NOT NULL THEN
+        v_report := array_append(v_report, '  Средняя JS-дивергенция (NORMAL): ' || round(v_avg_js_normal::NUMERIC, 4)::TEXT);
+    END IF;
+    IF v_avg_js_warning IS NOT NULL THEN
+        v_report := array_append(v_report, '  Средняя JS-дивергенция (WARNING): ' || round(v_avg_js_warning::NUMERIC, 4)::TEXT);
+    END IF;
+    IF v_avg_js_critical IS NOT NULL THEN
+        v_report := array_append(v_report, '  Средняя JS-дивергенция (CRITICAL): ' || round(v_avg_js_critical::NUMERIC, 4)::TEXT);
+    END IF;
+
+    -- Связь с инцидентами
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, '--- СВЯЗЬ С ИНЦИДЕНТАМИ ---');
+    v_report := array_append(v_report, '  Всего инцидентов за период: ' || v_incidents_total::TEXT);
+
+    -- Вывод долей статусов перед инцидентами (исключая INCIDENT в предшествующих статусах)
+    DECLARE
+        total_with_status BIGINT;
+        pct_critical TEXT;
+        pct_warning TEXT;
+        pct_normal TEXT;
+        pct_without TEXT;
+    BEGIN
+        total_with_status := v_inc_with_critical + v_inc_with_warning + v_inc_with_normal;
+        IF v_incidents_total > 0 THEN
+            pct_critical := round((v_inc_with_critical::NUMERIC / v_incidents_total * 100)::NUMERIC, 1) || '%';
+            pct_warning  := round((v_inc_with_warning::NUMERIC  / v_incidents_total * 100)::NUMERIC, 1) || '%';
+            pct_normal   := round((v_inc_with_normal::NUMERIC   / v_incidents_total * 100)::NUMERIC, 1) || '%';
+            pct_without  := round((v_inc_without_status::NUMERIC / v_incidents_total * 100)::NUMERIC, 1) || '%';
+        ELSE
+            pct_critical := '0%';
+            pct_warning  := '0%';
+            pct_normal   := '0%';
+            pct_without  := '100%';
+        END IF;
+
+        v_report := array_append(v_report, '  Доля состояний CRITICAL до инцидента: ' || v_inc_with_critical::TEXT || ' (' || pct_critical || ')');
+        v_report := array_append(v_report, '  Доля состояний WARNING до инцидента: ' || v_inc_with_warning::TEXT || ' (' || pct_warning || ')');
+        v_report := array_append(v_report, '  Доля инцидентов сразу после состояния NORMAL: ' || v_inc_with_normal::TEXT || ' (' || pct_normal || ')');
+        IF v_inc_without_status > 0 THEN
+            v_report := array_append(v_report, '  Инцидентов без предшествующего статуса (или только INCIDENT): ' || v_inc_without_status::TEXT || ' (' || pct_without || ')');
+        END IF;
+    END;
+
+    -- Время от CRITICAL до инцидента
+    IF v_min_diff IS NOT NULL THEN
+        v_report := array_append(v_report, '  Время от статуса CRITICAL до следующего инцидента (минут):');
+        v_report := array_append(v_report, '    минимальное: ' || round(v_min_diff::NUMERIC, 1)::TEXT);
+        v_report := array_append(v_report, '    максимальное: ' || round(v_max_diff::NUMERIC, 1)::TEXT);
+        v_report := array_append(v_report, '    среднее: ' || round(v_avg_diff::NUMERIC, 1)::TEXT);
+        v_report := array_append(v_report, '    медиана: ' || round(v_median_diff::NUMERIC, 1)::TEXT);
+    ELSE
+        v_report := array_append(v_report, '  Нет данных о времени от CRITICAL до инцидента (возможно, нет CRITICAL или инцидентов).');
+    END IF;
+
+    -- Тренды
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, '--- ТРЕНДЫ (по дням) ---');
+    v_report := array_append(v_report, '  Тренд JS-дивергенции: ' || v_trend_js);
+    v_report := array_append(v_report, '  Тренд среднего риска: ' || v_trend_risk);
+
+    -- Итоговые выводы (без рекомендаций)
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, '--- ВЫВОДЫ ---');
+    DECLARE
+        v_conclusion TEXT := '';
+    BEGIN
+        IF v_incidents_total > 0 THEN
+            v_conclusion := v_conclusion || '  - Зафиксировано ' || v_incidents_total || ' инцидентов. ';
+        END IF;
+        IF v_total_records > 0 THEN
+            DECLARE
+                anomaly_rate NUMERIC;
+            BEGIN
+                anomaly_rate := (COALESCE((v_status_counts->>'WARNING')::NUMERIC, 0) + COALESCE((v_status_counts->>'CRITICAL')::NUMERIC, 0)) / v_total_records;
+                IF anomaly_rate > 0.2 THEN
+                    v_conclusion := v_conclusion || 'Высокая доля аномалий (>20%) – система часто отклоняется от эталона. ';
+                ELSIF anomaly_rate > 0.1 THEN
+                    v_conclusion := v_conclusion || 'Умеренная доля аномалий (10-20%) – рекомендуется мониторинг. ';
+                ELSE
+                    v_conclusion := v_conclusion || 'Низкая доля аномалий (<10%) – профили стабильны. ';
+                END IF;
+            END;
+        END IF;
+        IF v_known_outcomes > 0 AND v_accuracy IS NOT NULL THEN
+            IF v_accuracy > 0.7 THEN
+                v_conclusion := v_conclusion || 'Точность прогнозов высокая (>0.7). ';
+            ELSIF v_accuracy > 0.5 THEN
+                v_conclusion := v_conclusion || 'Точность прогнозов умеренная (0.5-0.7). ';
+            ELSE
+                v_conclusion := v_conclusion || 'Точность прогнозов низкая (<0.5) – требуется пересмотр модели. ';
+            END IF;
+        END IF;
+        IF v_median_diff IS NOT NULL THEN
+            v_conclusion := v_conclusion || 'Медианное время от CRITICAL до инцидента: ' || round(v_median_diff::NUMERIC, 1) || ' мин. ';
+        END IF;
+        IF v_conclusion = '' THEN
+            v_conclusion := '  Все показатели в норме. Продолжайте мониторинг.';
+        END IF;
+        v_report := array_append(v_report, v_conclusion);
+    END;
+
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
+
+    RETURN v_report;
+END;
+$$;
+
+COMMENT ON FUNCTION generate_analytical_report(TEXT, TEXT) IS
+'Формирует аналитический отчёт по заданному периоду, исключая статус INCIDENT.
+Включает качество прогнозов, доли статусов перед инцидентами, время от CRITICAL до инцидента, тренды и выводы.';
