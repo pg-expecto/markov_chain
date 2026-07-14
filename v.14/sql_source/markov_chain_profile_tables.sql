@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_profile_tables.sql
--- version 14.6
+-- version 14.7
 --------------------------------------------------------------------------------
 -- Таблицы для расчета метрик профиля нагрузки на основе цепи Маркова 
 --------------------------------------------------------------------------------
@@ -143,24 +143,6 @@ COMMENT ON COLUMN anomaly_log.threshold_used IS 'Порог Z-оценки, ис
 CREATE INDEX idx_anomaly_log_ts ON anomaly_log (ts);
 CREATE INDEX idx_anomaly_log_profile_type ON anomaly_log (profile_type);
 CREATE INDEX idx_anomaly_log_acknowledged ON anomaly_log (acknowledged);
-
--- ----------------------------------------------------------------------------
--- 13.4. Вспомогательная таблица для исключаемых окон (при построении эталона)
--- ----------------------------------------------------------------------------
-DROP TABLE IF EXISTS excluded_windows;
-CREATE TABLE excluded_windows (
-    id          BIGSERIAL PRIMARY KEY,
-    start_ts    TIMESTAMPTZ NOT NULL,
-    end_ts      TIMESTAMPTZ NOT NULL,
-    reason      TEXT,                     -- 'incident', 'pre_incident', 'post_incident', 'manual'
-    incident_id BIGINT REFERENCES performance_incident(id) ON DELETE CASCADE,
-    created_at  TIMESTAMPTZ DEFAULT now()
-);
-
-COMMENT ON TABLE excluded_windows IS 'Интервалы времени, исключаемые при построении эталонного профиля (инциденты и буферы)';
-COMMENT ON COLUMN excluded_windows.reason IS 'Причина исключения: incident, pre_incident, post_incident, manual';
-
-CREATE INDEX idx_excluded_windows_ts ON excluded_windows (start_ts, end_ts);
 
 -- =============================================================================
 -- Таблица для хранения текущего безынцидентного окна
