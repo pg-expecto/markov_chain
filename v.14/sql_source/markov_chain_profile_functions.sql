@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_profile_functions.sql
--- version 14.8
+-- version 14.8.1
 --------------------------------------------------------------------------------
 -- Функции для расчета метрик профиля нагрузки на основе цепи Маркова 
 --------------------------------------------------------------------------------
@@ -2500,6 +2500,7 @@ DECLARE
     v_inside_incident BOOLEAN;
     v_max_pred_risk REAL;
     v_pre_alert     INTEGER;   -- 0 или 100
+    v_js_threshold  REAL;      -- ИЗМЕНЕНИЕ: переменная для порога из конфига
 BEGIN
     -- 1. Проверяем, находится ли текущий момент внутри активного инцидента
     SELECT EXISTS (
@@ -2605,8 +2606,13 @@ BEGIN
     END IF;
 
     -- 8. Вычисляем флаг предаварийного состояния
-    -- TRUE (100), если js_divergence >= 0.4 И max_predicted_risk = 1
-    IF v_js IS NOT NULL AND v_js >= 0.4 AND v_max_pred_risk IS NOT NULL AND v_max_pred_risk = 1 THEN
+    -- ИЗМЕНЕНИЕ: читаем порог из markov_config, по умолчанию 0.2
+    SELECT COALESCE(
+        (SELECT value::REAL FROM markov_config WHERE key = 'js_divergence_threshold'),
+        0.2
+    ) INTO v_js_threshold;
+
+    IF v_js IS NOT NULL AND v_js >= v_js_threshold AND v_max_pred_risk IS NOT NULL AND v_max_pred_risk = 1 THEN
         v_pre_alert := 100;
     ELSE
         v_pre_alert := 0;
@@ -2644,7 +2650,10 @@ BEGIN
         v_report := array_append(v_report, '  Максимальный предсказанный риск в текущем окне: нет данных');
     END IF;
 
-    v_report := array_append(v_report, format('  Предаварийный флаг: %s', CASE WHEN v_pre_alert = 100 THEN 'АКТИВИРОВАН (100)' ELSE 'НЕТ (0)' END));
+    -- ИЗМЕНЕНИЕ: в отчёте указываем актуальный порог
+    v_report := array_append(v_report, format('  Предаварийный флаг (порог JS=%.2f): %s',
+        v_js_threshold,
+        CASE WHEN v_pre_alert = 100 THEN 'АКТИВИРОВАН (100)' ELSE 'НЕТ (0)' END));
 
     v_report := array_append(v_report, '');
     v_report := array_append(v_report, '--- АНАЛИЗ ГИСТОГРАММЫ СОСТОЯНИЙ ---');
@@ -2683,7 +2692,8 @@ BEGIN
         'current_critical_ratio', v_current_metrics.critical_ratio,
         'current_entropy', v_current_metrics.entropy,
         'current_self_loop_ratio', v_current_metrics.self_loop_ratio,
-        'js_divergence', v_js
+        'js_divergence', v_js,
+        'js_threshold_used', v_js_threshold   -- ИЗМЕНЕНИЕ: добавлено поле в details
     );
 
     INSERT INTO profile_comparison_log (
