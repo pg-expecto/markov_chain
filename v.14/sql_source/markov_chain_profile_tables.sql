@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_profile_tables.sql
--- version 14.7
+-- version 14.8
 --------------------------------------------------------------------------------
 -- Таблицы для расчета метрик профиля нагрузки на основе цепи Маркова 
 --------------------------------------------------------------------------------
@@ -169,6 +169,8 @@ CREATE TABLE profile_comparison_log (
     baseline_window_end     TIMESTAMPTZ,
     current_window_start    TIMESTAMPTZ,
     current_window_end      TIMESTAMPTZ,
+	max_predicted_risk      REAL,
+	pre_alert_flag 			INTEGER DEFAULT 0, 
     status                  TEXT,                     -- итоговый статус (CRITICAL, WARNING, NORMAL)
     js_divergence           REAL,
     report                  JSONB,                    -- полный отчёт в виде массива строк
@@ -180,5 +182,11 @@ COMMENT ON COLUMN profile_comparison_log.status IS 'Итоговый стату�
 COMMENT ON COLUMN profile_comparison_log.js_divergence IS 'JS-дивергенция гистограмм состояний';
 COMMENT ON COLUMN profile_comparison_log.report IS 'Полный отчёт в формате JSON-массива строк';
 COMMENT ON COLUMN profile_comparison_log.details IS 'Дополнительные метрики (средняя корреляция, critical_ratio и т.д.)';
+COMMENT ON COLUMN profile_comparison_log.max_predicted_risk IS 'Максимальное значение predicted_risk из prediction_log за текущее окно (current_window_start, current_window_end)';
+COMMENT ON COLUMN profile_comparison_log.pre_alert_flag IS '100, если js_divergence >= 0.4 и max_predicted_risk = 1; иначе 0';
 
 CREATE INDEX idx_profile_comparison_log_created_at ON profile_comparison_log (created_at);
+
+
+
+
