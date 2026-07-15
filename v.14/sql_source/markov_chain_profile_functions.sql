@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_profile_functions.sql
--- version 14.7
+-- version 14.8
 --------------------------------------------------------------------------------
 -- Функции для расчета метрик профиля нагрузки на основе цепи Маркова 
 --------------------------------------------------------------------------------
@@ -2207,13 +2207,14 @@ DECLARE
     v_now          TIMESTAMPTZ := now();
     v_interval     INTERVAL := (p_window_minutes || ' minutes')::INTERVAL;
     v_last_finish  TIMESTAMPTZ;
+	v_test_start_point TIMESTAMPTZ;
     v_start_ts     TIMESTAMPTZ;
     v_end_ts       TIMESTAMPTZ;
 BEGIN
     IF p_window_minutes <= 0 THEN
         RAISE EXCEPTION 'Длина окна должна быть положительной, получено %', p_window_minutes;
     END IF;
-
+	
     -- 1. Находим самый поздний завершённый инцидент
     SELECT MAX(finish_timepoint)
     INTO v_last_finish
@@ -2229,16 +2230,20 @@ BEGIN
         RETURN 'Окно не найдено: последний завершённый инцидент не удовлетворяет условиям доступности (не прошло 1 часа или окно не помещается в прошлое).';
     END IF;
 
-    -- 3. Окно доступно
-    v_start_ts := v_last_finish;
-    v_end_ts   := v_last_finish + v_interval;
+	-- 3. Выбираем точку времени = v_now 
+	SELECT now() - interval '2 hour' 
+	INTO  v_test_start_point ;
 
-    DELETE FROM incident_free_window_current;
+    -- 4. Окно доступно
+    v_start_ts := v_test_start_point;
+    v_end_ts   := v_test_start_point + v_interval;
+	
+	DELETE FROM incident_free_window_current;
     INSERT INTO incident_free_window_current (window_start, window_end, updated_at)
     VALUES (v_start_ts, v_end_ts, v_now);
-
-    RETURN format('Окно обновлено: %s – %s (длина %s минут, привязано к последнему завершённому инциденту %s)',
-                  v_start_ts, v_end_ts, p_window_minutes, v_last_finish);
+    
+    RETURN format('Окно обновлено: %s – %s (длина %s минут)',
+                  v_start_ts, v_end_ts, p_window_minutes);
 END;
 $$;
 
@@ -2288,7 +2293,9 @@ BEGIN
     IF v_win_start IS NULL OR v_win_end IS NULL THEN
         RETURN 'Ошибка: таблица incident_free_window_current пуста. Сначала выполните find_incident_free_window().';
     END IF;
-
+/*
+--14.8
+--Эталонное окно - скользящее
     -- 2. Проверяем, совпадает ли текущее окно с последним сохранённым эталонным профилем
     SELECT window_start, window_end INTO v_last_baseline
     FROM profile_aggregated
@@ -2300,7 +2307,9 @@ BEGIN
         RETURN format('Эталонный профиль уже сохранён для окна %s – %s, пропуск.',
                       v_win_start, v_win_end);
     END IF;
-
+--Эталонное окно - скользящее	
+--14.8	
+*/
     -- 3. Удаляем старый эталонный профиль (если есть)
     DELETE FROM profile_aggregated WHERE profile_type = 'baseline';
 
@@ -2478,7 +2487,6 @@ AS $$
 DECLARE
     v_now           TIMESTAMPTZ := now();
     v_interval      INTERVAL := (p_window_minutes || ' minutes')::INTERVAL;
-    v_baseline_ts   TIMESTAMPTZ;
     v_baseline_start TIMESTAMPTZ;
     v_baseline_end  TIMESTAMPTZ;
     v_current_start TIMESTAMPTZ := v_now - v_interval;
@@ -2489,8 +2497,9 @@ DECLARE
     v_status        TEXT;
     v_report        TEXT[] := '{}';
     v_details       JSONB;
-    v_line          TEXT;
     v_inside_incident BOOLEAN;
+    v_max_pred_risk REAL;
+    v_pre_alert     INTEGER;   -- 0 или 100
 BEGIN
     -- 1. Проверяем, находится ли текущий момент внутри активного инцидента
     SELECT EXISTS (
@@ -2500,7 +2509,12 @@ BEGIN
           AND (finish_timepoint IS NULL OR finish_timepoint >= v_now)
     ) INTO v_inside_incident;
 
-    -- 2. Если внутри инцидента – записываем INCIDENT и возвращаем отчёт
+    -- 2. Вычисляем максимальный предсказанный риск за текущее окно
+    SELECT MAX(predicted_risk) INTO v_max_pred_risk
+    FROM prediction_log
+    WHERE prediction_time BETWEEN v_current_start AND v_current_end;
+
+    -- 3. Если внутри инцидента – записываем INCIDENT и возвращаем отчёт
     IF v_inside_incident THEN
         v_status := 'INCIDENT';
         v_report := array_append(v_report, '=== СРАВНЕНИЕ ПРОФИЛЕЙ ===');
@@ -2508,69 +2522,80 @@ BEGIN
         v_report := array_append(v_report, 'Статус: INCIDENT – система находится внутри инцидента, эталонное окно недоступно.');
         v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
 
-        -- Сохраняем в лог
+        -- При INCIDENT флаг всегда 0 (нет данных для сравнения)
+        v_pre_alert := 0;
+
         INSERT INTO profile_comparison_log (
             current_window_start,
             current_window_end,
             status,
             js_divergence,
             report,
-            details
+            details,
+            max_predicted_risk,
+            pre_alert_flag
         ) VALUES (
             v_current_start,
             v_current_end,
             v_status,
             NULL,
             to_jsonb(v_report),
-            jsonb_build_object('reason', 'inside_incident')
+            jsonb_build_object('reason', 'inside_incident'),
+            v_max_pred_risk,
+            v_pre_alert
         );
         RETURN v_report;
     END IF;
 
-    -- 3. Пытаемся получить эталонное окно (безынцидентное)
+    -- 4. Пытаемся получить эталонное окно (безынцидентное)
     SELECT start_ts, end_ts INTO v_baseline_start, v_baseline_end
     FROM get_incident_free_window_before(v_now, p_window_minutes, p_exclude_before_min, p_exclude_after_min);
 
     IF v_baseline_start IS NULL THEN
-        -- Эталонное окно недоступно (не прошло 1 часа после последнего инцидента или окно не помещается)
         v_status := 'INCIDENT';
         v_report := array_append(v_report, '=== СРАВНЕНИЕ ПРОФИЛЕЙ ===');
         v_report := array_append(v_report, format('Текущий момент: %s', v_now));
         v_report := array_append(v_report, 'Статус: INCIDENT – эталонное окно недоступно (возможно, ещё не прошло 1 часа после инцидента).');
         v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
 
+        v_pre_alert := 0;
+
         INSERT INTO profile_comparison_log (
             current_window_start,
             current_window_end,
             status,
             js_divergence,
             report,
-            details
+            details,
+            max_predicted_risk,
+            pre_alert_flag
         ) VALUES (
             v_current_start,
             v_current_end,
             v_status,
             NULL,
             to_jsonb(v_report),
-            jsonb_build_object('reason', 'no_incident_free_window')
+            jsonb_build_object('reason', 'no_incident_free_window'),
+            v_max_pred_risk,
+            v_pre_alert
         );
         RETURN v_report;
     END IF;
 
-    -- 4. Эталонное окно найдено – вычисляем метрики для обоих окон
+    -- 5. Эталонное окно найдено – вычисляем метрики для обоих окон
     SELECT * INTO v_baseline_metrics
     FROM calculate_profile_metrics(v_baseline_start, v_baseline_end);
 
     SELECT * INTO v_current_metrics
     FROM calculate_profile_metrics(v_current_start, v_current_end);
 
-    -- 5. Вычисляем JS-дивергенцию гистограмм
+    -- 6. Вычисляем JS-дивергенцию гистограмм
     v_js := histogram_divergence(
         v_baseline_metrics.state_histogram,
         v_current_metrics.state_histogram
     );
 
-    -- 6. Определяем статус по порогам (как в historical_fill)
+    -- 7. Определяем статус по порогам
     v_status := 'NORMAL';
     IF v_js >= 0.05 THEN
         v_status := 'WARNING';
@@ -2579,7 +2604,15 @@ BEGIN
         v_status := 'CRITICAL';
     END IF;
 
-    -- 7. Формируем отчёт
+    -- 8. Вычисляем флаг предаварийного состояния
+    -- TRUE (100), если js_divergence >= 0.4 И max_predicted_risk = 1
+    IF v_js IS NOT NULL AND v_js >= 0.4 AND v_max_pred_risk IS NOT NULL AND v_max_pred_risk = 1 THEN
+        v_pre_alert := 100;
+    ELSE
+        v_pre_alert := 0;
+    END IF;
+
+    -- 9. Формируем отчёт (включая информацию о флаге)
     v_report := array_append(v_report, '=== СРАВНЕНИЕ ЭТАЛОННОГО И ТЕКУЩЕГО ПРОФИЛЕЙ ===');
     v_report := array_append(v_report, format('Текущий момент: %s', v_now));
     v_report := array_append(v_report, format('Эталонное окно: %s – %s',
@@ -2603,6 +2636,15 @@ BEGIN
     v_report := array_append(v_report, format('  Доля петель (эталон/текущий): %s / %s',
         COALESCE(round(v_baseline_metrics.self_loop_ratio::NUMERIC, 3)::TEXT, 'NULL'),
         COALESCE(round(v_current_metrics.self_loop_ratio::NUMERIC, 3)::TEXT, 'NULL')));
+
+    IF v_max_pred_risk IS NOT NULL THEN
+        v_report := array_append(v_report, format('  Максимальный предсказанный риск в текущем окне: %s',
+            round(v_max_pred_risk::NUMERIC, 4)::TEXT));
+    ELSE
+        v_report := array_append(v_report, '  Максимальный предсказанный риск в текущем окне: нет данных');
+    END IF;
+
+    v_report := array_append(v_report, format('  Предаварийный флаг: %s', CASE WHEN v_pre_alert = 100 THEN 'АКТИВИРОВАН (100)' ELSE 'НЕТ (0)' END));
 
     v_report := array_append(v_report, '');
     v_report := array_append(v_report, '--- АНАЛИЗ ГИСТОГРАММЫ СОСТОЯНИЙ ---');
@@ -2631,7 +2673,7 @@ BEGIN
     END);
     v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
 
-    -- 8. Сохраняем результат в profile_comparison_log
+    -- 10. Сохраняем результат в profile_comparison_log (со всеми новыми полями)
     v_details := jsonb_build_object(
         'baseline_avg_correlation', v_baseline_metrics.avg_correlation,
         'baseline_critical_ratio', v_baseline_metrics.critical_ratio,
@@ -2652,7 +2694,9 @@ BEGIN
         status,
         js_divergence,
         report,
-        details
+        details,
+        max_predicted_risk,
+        pre_alert_flag
     ) VALUES (
         v_baseline_start,
         v_baseline_end,
@@ -2661,15 +2705,15 @@ BEGIN
         v_status,
         v_js,
         to_jsonb(v_report),
-        v_details
+        v_details,
+        v_max_pred_risk,
+        v_pre_alert
     );
 
     RETURN v_report;
 END;
 $$;
-
-COMMENT ON FUNCTION compare_profiles(INT, INT, INT) IS
-'Сравнивает текущий профиль нагрузки (за последние p_window_minutes минут) с эталонным безынцидентным окном, найденным по стратегии get_incident_free_window_before. Если текущий момент внутри инцидента или эталон недоступен – возвращает статус INCIDENT. Результат сохраняется в profile_comparison_log.';
+COMMENT ON FUNCTION compare_profiles(INT, INT, INT) IS 'Сравнивает текущий профиль нагрузки с эталонным, сохраняет результат в profile_comparison_log, включая максимальный предсказанный риск и флаг предаварийного состояния (100 – тревога, 0 – норма).';
 
 --------------------------------------------------------------------------------
 -- 6. Пример использования (для справки)
@@ -2750,24 +2794,38 @@ AS $$
 DECLARE
     v_interval INTERVAL := (p_window_minutes || ' minutes')::INTERVAL;
     v_last_finish TIMESTAMPTZ;
+	v_test_start_point TIMESTAMPTZ;	
 BEGIN
-    -- Находим самый поздний завершённый инцидент, закончившийся не позже p_ts
+    -- 1. Находим самый поздний завершённый инцидент
     SELECT MAX(finish_timepoint)
     INTO v_last_finish
     FROM performance_incident
-    WHERE finish_timepoint IS NOT NULL
-      AND finish_timepoint <= p_ts;   -- <-- добавлено условие
+    WHERE finish_timepoint IS NOT NULL;
 
-    -- Проверяем доступность окна (прошло не менее 1 часа и окно помещается до p_ts)
+    -- 2. Проверяем доступность окна (прошло не менее 1 часа и окно помещается до p_ts)
     IF v_last_finish IS NULL
        OR v_last_finish + INTERVAL '1 hour' > p_ts
        OR v_last_finish + v_interval > p_ts
     THEN
         RETURN;
     END IF;
+	
+	-- 3. ЕСЛИ после инцидента не прошло 2 часа
+	-- фиксируем окно
+	IF p_ts - v_last_finish <= interval '2 hour' 
+	THEN
+		-- Окно доступно: [finish, finish + window_minutes]
+		RETURN QUERY SELECT v_last_finish AS start_ts, v_last_finish + v_interval AS end_ts;
+	END IF;
+	
+	
+	-- 4. Выбираем точку времени 2 часа назад
+	SELECT p_ts - interval '2 hour' 
+	INTO  v_test_start_point ;
 
-    -- Окно доступно: [finish, finish + window_minutes]
-    RETURN QUERY SELECT v_last_finish AS start_ts, v_last_finish + v_interval AS end_ts;
+    RETURN QUERY SELECT v_test_start_point AS start_ts, v_test_start_point + v_interval AS end_ts;
+	
+	
 END;
 $$;
 
