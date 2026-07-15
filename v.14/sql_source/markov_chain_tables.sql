@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_tables.sql
--- version 14.6
+-- version 14.8.1
 --------------------------------------------------------------------------------
 -- Таблицы для расчета цепи Маркова 
 --------------------------------------------------------------------------------
@@ -95,7 +95,8 @@ CREATE UNLOGGED TABLE IF NOT EXISTS markov_config (
 	--Горизонт
 	forecast_horizon_minutes INT DEFAULT 10 ,
 	
-	min_freq_for_stability INT DEFAULT 300
+	min_freq_for_stability INT DEFAULT 300 , 
+	js_divergence_threshold REAL DEFAULT 0.2
 );
 
 COMMENT ON TABLE markov_config IS 'Конфигурация цепи Маркова (используется mchain_*)';
@@ -114,9 +115,8 @@ COMMENT ON COLUMN markov_config.min_transitions_for_forgetting IS 'Пока об
 COMMENT ON COLUMN markov_config.forecast_horizon_minutes IS 'Основной горизонт прогноза (минуты), используемый в collect и отчётах';
 COMMENT ON COLUMN markov_config.min_freq_for_stability IS 'Минимальное число переходов из состояния за анализируемый период для включения в расчёт стабильности вероятностей.';
 COMMENT ON COLUMN markov_config.profile_comparison_retention_days IS 'Срок хранения записей в profile_comparison_log (дни)';
+COMMENT ON COLUMN markov_config.js_divergence_threshold IS 'Граничное значение JS-Дивергенции для сравнения профилей производительности';
 
--- Начальная инициализация (если таблица пуста)
-INSERT INTO markov_config (last_forget_time) VALUES (now()) ON CONFLICT DO NOTHING;
 
 -- ============================================================================
 -- Таблица логирования ошибок (используется mchain_log_error)
