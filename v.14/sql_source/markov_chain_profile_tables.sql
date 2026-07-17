@@ -174,7 +174,11 @@ CREATE TABLE profile_comparison_log (
     status                  TEXT,                     -- итоговый статус (CRITICAL, WARNING, NORMAL)
     js_divergence           REAL,
     report                  JSONB,                    -- полный отчёт в виде массива строк
-    details                 JSONB                     -- дополнительные метрики (опционально)
+    details                 JSONB ,                     -- дополнительные метрики (опционально)
+	high_risk_percentile    REAL,
+	js_threshold_used       REAL,
+	stability_met           BOOLEAN,
+	pre_alert_flag_advanced INT DEFAULT 0
 );
 
 COMMENT ON TABLE profile_comparison_log IS 'Журнал сравнений эталонного и текущего профилей';
@@ -184,8 +188,14 @@ COMMENT ON COLUMN profile_comparison_log.report IS 'Полный отчёт в �
 COMMENT ON COLUMN profile_comparison_log.details IS 'Дополнительные метрики (средняя корреляция, critical_ratio и т.д.)';
 COMMENT ON COLUMN profile_comparison_log.max_predicted_risk IS 'Максимальное значение predicted_risk из prediction_log за текущее окно (current_window_start, current_window_end)';
 COMMENT ON COLUMN profile_comparison_log.pre_alert_flag IS '100, если js_divergence >= 0.4 и max_predicted_risk = 1; иначе 0';
+COMMENT ON COLUMN profile_comparison_log.high_risk_percentile IS '90-й перцентиль predicted_risk за текущее окно';
+COMMENT ON COLUMN profile_comparison_log.js_threshold_used IS 'Значение порога JS-дивергенции, взятое из markov_config.js_divergence_threshold';
+COMMENT ON COLUMN profile_comparison_log.stability_met IS 'Выполнено ли условие устойчивости (3 из 5 последних минут)';
+COMMENT ON COLUMN profile_comparison_log.pre_alert_flag_advanced IS 'Индикатор изменения профиля производительности (100 – активен, 0 – неактивен). Вычисляется по комплексному критерию: JS-дивергенция ≥ порога, 90-й перцентиль риска ≥ 0.95, устойчивость 3 из 5 мин.';
 
 CREATE INDEX idx_profile_comparison_log_created_at ON profile_comparison_log (created_at);
+
+
 
 
 
