@@ -2499,8 +2499,13 @@ DECLARE
     v_details       JSONB;
     v_inside_incident BOOLEAN;
     v_max_pred_risk REAL;
-    v_pre_alert     INTEGER;   -- 0 или 100
+    v_pre_alert     INTEGER;   -- старый флаг (0 или 100)
     v_js_threshold  REAL;      -- порог из конфига
+    
+    -- Новые переменные для комплексного подхода
+    v_high_risk_percentile REAL;    -- 90-й перцентиль
+    v_stability_met        BOOLEAN; -- устойчивость 3 из 5
+    v_pre_alert_advanced   INTEGER; -- новый флаг
 BEGIN
     -- 1. Проверяем, находится ли текущий момент внутри активного инцидента
     SELECT EXISTS (
@@ -2510,7 +2515,7 @@ BEGIN
           AND (finish_timepoint IS NULL OR finish_timepoint >= v_now)
     ) INTO v_inside_incident;
 
-    -- 2. Вычисляем максимальный предсказанный риск за текущее окно
+    -- 2. Получаем максимальный предсказанный риск за текущее окно (для старого флага и для устойчивости)
     SELECT MAX(predicted_risk) INTO v_max_pred_risk
     FROM prediction_log
     WHERE prediction_time BETWEEN v_current_start AND v_current_end;
@@ -2524,6 +2529,7 @@ BEGIN
         v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
 
         v_pre_alert := 0;
+        v_pre_alert_advanced := 0;
 
         INSERT INTO profile_comparison_log (
             current_window_start,
@@ -2533,7 +2539,11 @@ BEGIN
             report,
             details,
             max_predicted_risk,
-            pre_alert_flag
+            pre_alert_flag,
+            high_risk_percentile,
+            js_threshold_used,
+            stability_met,
+            pre_alert_flag_advanced
         ) VALUES (
             v_current_start,
             v_current_end,
@@ -2542,7 +2552,11 @@ BEGIN
             to_jsonb(v_report),
             jsonb_build_object('reason', 'inside_incident'),
             v_max_pred_risk,
-            v_pre_alert
+            v_pre_alert,
+            NULL,
+            NULL,
+            NULL,
+            v_pre_alert_advanced
         );
         RETURN v_report;
     END IF;
@@ -2559,6 +2573,7 @@ BEGIN
         v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
 
         v_pre_alert := 0;
+        v_pre_alert_advanced := 0;
 
         INSERT INTO profile_comparison_log (
             current_window_start,
@@ -2568,7 +2583,11 @@ BEGIN
             report,
             details,
             max_predicted_risk,
-            pre_alert_flag
+            pre_alert_flag,
+            high_risk_percentile,
+            js_threshold_used,
+            stability_met,
+            pre_alert_flag_advanced
         ) VALUES (
             v_current_start,
             v_current_end,
@@ -2577,7 +2596,11 @@ BEGIN
             to_jsonb(v_report),
             jsonb_build_object('reason', 'no_incident_free_window'),
             v_max_pred_risk,
-            v_pre_alert
+            v_pre_alert,
+            NULL,
+            NULL,
+            NULL,
+            v_pre_alert_advanced
         );
         RETURN v_report;
     END IF;
@@ -2595,7 +2618,7 @@ BEGIN
         v_current_metrics.state_histogram
     );
 
-    -- 7. Определяем статус по порогам
+    -- 7. Определяем статус по порогам (без изменений)
     v_status := 'NORMAL';
     IF v_js >= 0.05 THEN
         v_status := 'WARNING';
@@ -2604,16 +2627,43 @@ BEGIN
         v_status := 'CRITICAL';
     END IF;
 
-    -- 8. Вычисляем флаг предаварийного состояния
-    SELECT COALESCE( (SELECT js_divergence_threshold FROM markov_config ), 0.2 ) INTO v_js_threshold;
+    -- 8. Получаем порог JS из конфигурации (по умолчанию 0.2, но рекомендуется установить 0.3)
+    SELECT COALESCE( (SELECT js_divergence_threshold FROM markov_config), 0.2 ) INTO v_js_threshold;
 
+    -- 9. Вычисляем 90-й перцентиль риска за текущее окно (новый подход)
+    SELECT PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY predicted_risk) INTO v_high_risk_percentile
+    FROM prediction_log
+    WHERE prediction_time BETWEEN v_current_start AND v_current_end;
+
+    -- 10. Проверка устойчивости: не менее 3 записей за последние 5 минут,
+    --     где JS >= порог И max_predicted_risk >= 0.95
+    WITH stability_check AS (
+        SELECT COUNT(*) >= 3 AS stable
+        FROM profile_comparison_log
+        WHERE current_window_end >= v_current_start - INTERVAL '5 minutes'
+          AND js_divergence >= v_js_threshold
+          AND max_predicted_risk >= 0.95
+    )
+    SELECT COALESCE(stable, FALSE) INTO v_stability_met FROM stability_check;
+
+    -- 11. Вычисление старого флага (для обратной совместимости)
     IF v_js IS NOT NULL AND v_js >= v_js_threshold AND v_max_pred_risk IS NOT NULL AND v_max_pred_risk = 1 THEN
         v_pre_alert := 100;
     ELSE
         v_pre_alert := 0;
     END IF;
 
-    -- 9. Формируем отчёт (включая информацию о флаге)
+    -- 12. Вычисление нового флага (комплексный критерий)
+    IF v_js IS NOT NULL 
+       AND v_js >= v_js_threshold 
+       AND v_high_risk_percentile >= 0.95 
+       AND v_stability_met THEN
+        v_pre_alert_advanced := 100;
+    ELSE
+        v_pre_alert_advanced := 0;
+    END IF;
+
+    -- 13. Формируем отчёт (добавляем информацию о новом флаге)
     v_report := array_append(v_report, '=== СРАВНЕНИЕ ЭТАЛОННОГО И ТЕКУЩЕГО ПРОФИЛЕЙ ===');
     v_report := array_append(v_report, format('Текущий момент: %s', v_now));
     v_report := array_append(v_report, format('Эталонное окно: %s – %s',
@@ -2645,10 +2695,13 @@ BEGIN
         v_report := array_append(v_report, '  Максимальный предсказанный риск в текущем окне: нет данных');
     END IF;
 
-    -- ИСПРАВЛЕННАЯ СТРОКА (вместо %.2f используем %s и round)
-    v_report := array_append(v_report, format('  Предаварийный флаг (порог JS=%s): %s',
-        round(v_js_threshold::numeric, 2)::text,
-        CASE WHEN v_pre_alert = 100 THEN 'АКТИВИРОВАН (100)' ELSE 'НЕТ (0)' END));
+    -- Выводим новый флаг и промежуточные значения
+    v_report := array_append(v_report, format('  90-й перцентиль риска: %s',
+        COALESCE(round(v_high_risk_percentile::NUMERIC, 3)::TEXT, 'NULL')));
+    v_report := array_append(v_report, format('  Порог JS (из конфига): %s', round(v_js_threshold::NUMERIC, 2)::TEXT));
+    v_report := array_append(v_report, format('  Устойчивость (3 из 5 мин): %s', CASE WHEN v_stability_met THEN 'ДА' ELSE 'НЕТ' END));
+    v_report := array_append(v_report, format('  Предаварийный флаг (старый): %s', CASE WHEN v_pre_alert = 100 THEN 'АКТИВИРОВАН (100)' ELSE 'НЕТ (0)' END));
+    v_report := array_append(v_report, format('  Индикатор изменения профиля: %s', CASE WHEN v_pre_alert_advanced = 100 THEN 'АКТИВИРОВАН (100)' ELSE 'НЕТ (0)' END));
 
     v_report := array_append(v_report, '');
     v_report := array_append(v_report, '--- АНАЛИЗ ГИСТОГРАММЫ СОСТОЯНИЙ ---');
@@ -2677,7 +2730,7 @@ BEGIN
     END);
     v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
 
-    -- 10. Сохраняем результат в profile_comparison_log
+    -- 14. Сохраняем результат в profile_comparison_log (с новыми колонками)
     v_details := jsonb_build_object(
         'baseline_avg_correlation', v_baseline_metrics.avg_correlation,
         'baseline_critical_ratio', v_baseline_metrics.critical_ratio,
@@ -2688,7 +2741,9 @@ BEGIN
         'current_entropy', v_current_metrics.entropy,
         'current_self_loop_ratio', v_current_metrics.self_loop_ratio,
         'js_divergence', v_js,
-        'js_threshold_used', v_js_threshold
+        'js_threshold_used', v_js_threshold,
+        'high_risk_percentile', v_high_risk_percentile,
+        'stability_met', v_stability_met
     );
 
     INSERT INTO profile_comparison_log (
@@ -2701,7 +2756,11 @@ BEGIN
         report,
         details,
         max_predicted_risk,
-        pre_alert_flag
+        pre_alert_flag,
+        high_risk_percentile,
+        js_threshold_used,
+        stability_met,
+        pre_alert_flag_advanced
     ) VALUES (
         v_baseline_start,
         v_baseline_end,
@@ -2712,14 +2771,19 @@ BEGIN
         to_jsonb(v_report),
         v_details,
         v_max_pred_risk,
-        v_pre_alert
+        v_pre_alert,
+        v_high_risk_percentile,
+        v_js_threshold,
+        v_stability_met,
+        v_pre_alert_advanced
     );
 
     RETURN v_report;
 END;
 $$;
 
-COMMENT ON FUNCTION compare_profiles(INT, INT, INT) IS 'Сравнивает текущий профиль нагрузки с эталонным, сохраняет результат в profile_comparison_log, включая максимальный предсказанный риск и флаг предаварийного состояния (100 – тревога, 0 – норма).';
+COMMENT ON FUNCTION compare_profiles(INT, INT, INT) IS 'Сравнивает текущий профиль нагрузки с эталонным, сохраняет результат в profile_comparison_log, включая максимальный предсказанный риск и два флага предаварийного состояния: старый (pre_alert_flag) и новый (pre_alert_flag_advanced) по комплексному критерию (порог JS, 90-й перцентиль риска, устойчивость 3 из 5 мин).';
+
 
 --------------------------------------------------------------------------------
 -- 6. Пример использования (для справки)
