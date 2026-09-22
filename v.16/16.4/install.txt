@@ -1,0 +1,51 @@
+﻿cd /postgres/pg_expecto/sh
+
+vi markov_chain_tables.sql
+vi markov_chain_profile_tables.sql
+vi markov_chain_functions.sql
+vi markov_chain_profile_functions.sql
+vi performance_metrics_for_markov_chain.sql
+
+psql -d expecto_db -U expecto_user  -v ON_ERROR_STOP=on --echo-errors -f markov_chain_tables.sql > markov_chain_tables.log 2>&1
+psql -d expecto_db -U expecto_user  -v ON_ERROR_STOP=on --echo-errors -f markov_chain_profile_tables.sql > markov_chain_profile_tables.log 2>&1
+psql -d expecto_db -U expecto_user  -v ON_ERROR_STOP=on --echo-errors -f markov_chain_functions.sql > markov_chain_functions.log 2>&1
+psql -d expecto_db -U expecto_user  -v ON_ERROR_STOP=on --echo-errors -f markov_chain_profile_functions.sql > markov_chain_profile_functions.log 2>&1
+psql -d expecto_db -U expecto_user  -v ON_ERROR_STOP=on --echo-errors -f performance_metrics_for_markov_chain.sql > performance_metrics_for_markov_chain.log 2>&1
+
+-- Изменить режим сигнала на WEIGHTED
+psql -d expecto_db -U expecto_user  -c "UPDATE incident_forecast_config SET signal_mode = 'WEIGHTED', weight_js = 0.9, weight_risk = 0.1 , extended_report = TRUE" 
+
+rm pg_expecto.sh
+vi pg_expecto.sh
+chmod 750 pg_expecto.sh
+
+crontab -e
+markov_chain_cron.txt
+
+cd /postgres/pg_expecto/sh
+tail -f pg_expecto.log
+tail -f markov_chain.log
+
+-- Обучение цепим Маркова на исторических данных
+vi train_markov_chain2.sh
+chmod 750 train_markov_chain2.sh
+./train_markov_chain2.sh >/tmp/train_markov_chain2_progress.txt 2>train_markov_chain2.log
+
+cd /postgres/pg_expecto/sh
+tail -f /tmp/train_markov_chain2_progress.txt
+
+-- Формирование профилей 
+psql -d expecto_db -U expecto_user  -c "SELECT fill_profile_comparison_historically()" > /tmp/fill_profile_comparison_historically.txt 2>&1
+cat /tmp/fill_profile_comparison_historically.txt
+
+--Отчет про прогнозированию и инцидентам за 30 дней
+psql -d expecto_db -U expecto_user  -c "SELECT unnest(generate_incident_forecast_report(now() - INTERVAL '30 days' , now()))" > /tmp/generate_incident_forecast_report.txt 
+
+chmod 777 /tmp/train_markov_chain2_progress.txt
+chmod 777 /tmp/fill_profile_comparison_historically.txt
+chmod 777 /tmp/generate_incident_forecast_report.txt
+
+
+
+
+
