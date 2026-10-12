@@ -2343,6 +2343,7 @@ BEGIN
       AND horizon_minutes = v_horizon;
 
     -- 4. Если рейтинг < 3 или прогнозов меньше 100 – пропускаем расчёт
+/*	
     IF v_reliability < 3 OR v_predictions_count < 100 THEN
         INSERT INTO mchain_quality_metrics_history (
             date_from, date_to, total_predictions, incident_rate,
@@ -2374,6 +2375,39 @@ BEGIN
         RETURN format('Diagnostic: metrics not calculated (horizon=%s, reliability=%s, predictions=%s)', 
                       v_horizon, v_reliability, v_predictions_count);
     END IF;
+*/
+    -- 4. ВРЕМЕННО: проверка reliability отключена, пока не накоплена полная история
+    -- TODO: вернуть проверку `v_reliability < 3` через 1–2 недели
+    IF v_predictions_count < 100 THEN
+        INSERT INTO mchain_quality_metrics_history (
+            date_from, date_to, total_predictions, incident_rate,
+            brier_score, log_loss, roc_auc, precision_at_05, recall_at_05, mae,
+            calibration_summary, ece, mce, notes
+        )
+        VALUES (
+            p_date, p_date + 1, v_predictions_count, NULL,
+            NULL, NULL, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL,
+            format('Skipped (horizon=%s, reliability=%s, predictions=%s)', 
+                   v_horizon, v_reliability, v_predictions_count)
+        )
+        ON CONFLICT (date_from, date_to) DO UPDATE SET
+            total_predictions = EXCLUDED.total_predictions,
+            incident_rate = EXCLUDED.incident_rate,
+            brier_score = EXCLUDED.brier_score,
+            log_loss = EXCLUDED.log_loss,
+            roc_auc = EXCLUDED.roc_auc,
+            precision_at_05 = EXCLUDED.precision_at_05,
+            recall_at_05 = EXCLUDED.recall_at_05,
+            mae = EXCLUDED.mae,
+            calibration_summary = EXCLUDED.calibration_summary,
+            ece = EXCLUDED.ece,
+            mce = EXCLUDED.mce,
+            notes = EXCLUDED.notes,
+            calculated_at = now();
+        RETURN format('Diagnostic: metrics not calculated (horizon=%s, reliability=%s, predictions=%s)', 
+                      v_horizon, v_reliability, v_predictions_count);
+    END IF;	
 
     -- 5. Достаточно данных – рассчитываем метрики
     WITH predictions AS (
@@ -2396,6 +2430,7 @@ BEGIN
             AVG(ABS(predicted_risk - actual_outcome)) AS mae
         FROM predictions
     ),
+/*	
     metrics AS (
         SELECT *, 
                NULL::REAL AS roc_auc, 
@@ -2403,6 +2438,41 @@ BEGIN
                NULL::REAL AS recall_at_05
         FROM stats
     ),
+*/
+	metrics AS (
+    SELECT 
+        s.total, s.incident_rate, s.brier, s.log_loss, s.mae,
+        (SELECT 
+            CASE
+                WHEN COUNT(CASE WHEN actual_outcome = 1 THEN 1 END) = 0
+                     OR COUNT(CASE WHEN actual_outcome = 0 THEN 1 END) = 0
+                THEN NULL
+                ELSE (
+                    SUM(CASE WHEN actual_outcome = 1 THEN rnk ELSE 0 END) -
+                    (COUNT(CASE WHEN actual_outcome = 1 THEN 1 END) *
+                     (COUNT(CASE WHEN actual_outcome = 1 THEN 1 END) + 1) / 2.0)
+                ) / (COUNT(CASE WHEN actual_outcome = 1 THEN 1 END) *
+                     COUNT(CASE WHEN actual_outcome = 0 THEN 1 END))
+            END
+            FROM (
+                SELECT predicted_risk, actual_outcome,
+                       ROW_NUMBER() OVER (ORDER BY predicted_risk ASC) AS rnk
+                FROM predictions
+            ) ranked
+            WHERE actual_outcome IN (0, 1)
+        ) AS roc_auc,
+        (SELECT 
+            COUNT(*) FILTER (WHERE predicted_risk >= 0.5 AND actual_outcome = 1)::REAL
+                / NULLIF(COUNT(*) FILTER (WHERE predicted_risk >= 0.5), 0)
+            FROM predictions
+        ) AS precision_at_05,
+        (SELECT 
+            COUNT(*) FILTER (WHERE predicted_risk >= 0.5 AND actual_outcome = 1)::REAL
+                / NULLIF(COUNT(*) FILTER (WHERE actual_outcome = 1), 0)
+            FROM predictions
+        ) AS recall_at_05
+    FROM stats s
+	),
     calibration AS (
         WITH bin_data AS (
             SELECT
@@ -2500,9 +2570,9 @@ LIMIT 10;
 CREATE OR REPLACE FUNCTION refresh_critical_states(
     p_start           TIMESTAMPTZ DEFAULT now() - interval '14 days',
     p_end             TIMESTAMPTZ DEFAULT now(),
-    p_min_transitions INT         DEFAULT 50,
+    p_min_transitions INT         DEFAULT 20,    -- было 50
     p_interval_min    INT         DEFAULT 15,
-    p_risk_threshold  REAL        DEFAULT 0.10,
+    p_risk_threshold  REAL        DEFAULT 0.05,  -- было 0.10
     p_dry_run         BOOLEAN     DEFAULT FALSE,
     p_audit           BOOLEAN     DEFAULT TRUE
 )
@@ -5445,10 +5515,10 @@ COMMENT ON FUNCTION find_optimal_horizon(REAL, INT, INT, INT) IS 'Подбира
 CREATE OR REPLACE PROCEDURE mchain_initial_train_from_history(
     IN p_end                TIMESTAMPTZ,
     IN p_refresh_critical   BOOLEAN DEFAULT TRUE,
-    IN p_risk_threshold     REAL    DEFAULT 0.10,
-    IN p_min_transitions    INT     DEFAULT 50,
+    IN p_risk_threshold     REAL    DEFAULT 0.05,   -- было 0.10
+    IN p_min_transitions    INT     DEFAULT 20,     -- было 50
     IN p_interval_min       INT     DEFAULT 15,
-    IN p_start              TIMESTAMPTZ DEFAULT NULL,   -- <-- НОВЫЙ ПАРАМЕТР
+    IN p_start              TIMESTAMPTZ DEFAULT NULL,
     INOUT result            TEXT    DEFAULT NULL
 )
 LANGUAGE plpgsql
