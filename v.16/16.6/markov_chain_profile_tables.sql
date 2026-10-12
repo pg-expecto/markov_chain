@@ -1,4 +1,4 @@
-﻿-- Copyright 2026 Ринат (markov_chain)
+-- Copyright 2026 Ринат (markov_chain)
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_profile_tables.sql
--- version 16.3
+--  version 16.6.1
 --------------------------------------------------------------------------------
 -- Таблицы для расчета метрик профиля нагрузки на основе цепи Маркова 
 --------------------------------------------------------------------------------
@@ -270,7 +270,7 @@ DROP TABLE IF EXISTS incident_forecast_config;
 CREATE TABLE incident_forecast_config (
     id                              SERIAL PRIMARY KEY,
     window_minutes                  INT     NOT NULL DEFAULT 60,
-    js_threshold                    REAL    NOT NULL DEFAULT 0.2,
+    js_threshold                    REAL    NOT NULL DEFAULT 0.15,   -- снижено с 0.2 (2026-10-12)
     risk_threshold                  REAL    NOT NULL DEFAULT 0.8,
     include_summary                 BOOLEAN NOT NULL DEFAULT TRUE,
     signal_mode                     TEXT    NOT NULL DEFAULT 'AND',
@@ -304,7 +304,7 @@ INSERT INTO incident_forecast_config (
     extended_report, optimize_thresholds, priority_filter, status_filter,
     csv_mode, include_pre_incident_matches
 ) VALUES (
-    60, 0.2, 0.8, TRUE,
+    60, 0.15, 0.8, TRUE,
     'OR', 3, FALSE,
     0.5, 0.5, FALSE, 7,
     60, 5, 10,
