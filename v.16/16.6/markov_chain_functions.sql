@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_functions.sql
--- version 16.5
+-- version 16.6.1
 /*
  Функция: adaptive_configure_markov_chain
  Назначение: Адаптивная настройка параметров цепи Маркова с периодом анализа, определяемым из markov_config.transition_log_retention_days
@@ -3257,7 +3257,7 @@ BEGIN
                     'bin_high', bin / 10.0,
                     'avg_pred', avg_pred,
                     'obs_freq', obs_freq,
-                    'count', cnt
+                    'cnt', cnt          -- ИСПРАВЛЕНО: было 'count'
                 )
             ) AS calib,
             COALESCE(SUM((cnt::REAL / total.total_cnt) * ABS(avg_pred - obs_freq)), 0) AS ece,
@@ -3388,7 +3388,6 @@ END;
 $$;
 
 COMMENT ON FUNCTION mchain_quality_report(DATE, DATE, INT) IS 'Формирует текстовый отчёт о качестве прогнозов. ROC‑AUC выведена в конец с комментарием о её ограничениях при константных прогнозах. Рекомендации исключают использование ROC‑AUC.';
-
 -- =============================================================================
 -- Функция: mchain_predict_risk_current_horizon
 -- Назначение: возвращает прогноз риска на горизонт, заданный в 
