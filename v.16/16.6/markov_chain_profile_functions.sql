@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_profile_functions.sql
--- version 16.6.1
+-- version 16.6.2
 --------------------------------------------------------------------------------
 -- Функции для расчета метрик профиля нагрузки на основе цепи Маркова 
 --------------------------------------------------------------------------------
@@ -1408,19 +1408,32 @@ $$;
 
 
 -- =============================================================================
--- Функция: find_incident_free_window (исправленная – оконные функции в WHERE)
--- Назначение: найти отрезок времени заданной длины, свободный от инцидентов,
---             максимально близкий к последнему завершённому инциденту.
---             Результат сохраняется в таблицу incident_free_window_current.
+-- Функция: find_incident_free_window (версия 3)
+-- Назначение: найти самое свежее окно длины p_window_minutes, свободное от
+--             инцидентов, заканчивающееся не позже (now() - p_exclude_after_min).
+--             Результат сохраняется в incident_free_window_current.
+--
+-- ИЗМЕНЕНИЯ (2026-10-14):
+--   - Раньше окно строилось как [finish, finish + window] для последнего
+--     завершённого инцидента, что давало «мёртвую зону» ~120 мин после каждого
+--     инцидента (см. диагностику NO_BASELINE от 2026-10-14).
+--   - Теперь используется get_incident_free_window_before с отступом
+--     p_exclude_after_min (по умолчанию 120 мин) от now(), что исключает
+--     перекрытие с текущим часовым окном.
+--   - Старое окно в incident_free_window_current переиспользуется, если оно
+--     всё ещё удовлетворяет условию свежести (window_end < now() - 120 мин).
+--
 -- Входные параметры:
---   p_window_minutes INT – требуемая длина окна в минутах (по умолчанию 60)
--- Возвращает:
---   TEXT – сообщение о результате
+--   p_window_minutes    INT – длина окна в минутах (по умолчанию 60)
+--   p_lookback_days     INT – глубина поиска (по умолчанию 30)
+--   p_exclude_after_min INT – отступ от now() (по умолчанию 120)
+--
+-- Возвращает: TEXT – сообщение о результате.
 -- =============================================================================
 CREATE OR REPLACE FUNCTION find_incident_free_window(
-    p_window_minutes      INT DEFAULT 60,
-    p_exclude_before_min  INT DEFAULT 30,
-    p_exclude_after_min   INT DEFAULT 60
+    p_window_minutes    INT DEFAULT 60,
+    p_lookback_days     INT DEFAULT 30,
+    p_exclude_after_min INT DEFAULT 120
 )
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -1428,50 +1441,44 @@ VOLATILE
 AS $$
 DECLARE
     v_now          TIMESTAMPTZ := now();
-    v_interval     INTERVAL := (p_window_minutes || ' minutes')::INTERVAL;
-    v_last_finish  TIMESTAMPTZ;
+    v_existing     RECORD;
     v_start_ts     TIMESTAMPTZ;
     v_end_ts       TIMESTAMPTZ;
-    v_existing     RECORD;
 BEGIN
     -- Проверяем, есть ли уже сохранённое окно
     SELECT window_start, window_end INTO v_existing
     FROM incident_free_window_current
     LIMIT 1;
 
-    -- Получаем время окончания последнего завершённого инцидента
-    SELECT MAX(finish_timepoint)
-    INTO v_last_finish
-    FROM performance_incident
-    WHERE finish_timepoint IS NOT NULL;
-
-    -- Если есть существующее окно и оно всё ещё актуально
-    IF FOUND AND v_existing.window_start IS NOT NULL THEN
-        -- Окно актуально, если:
-        -- 1) Его конец < now() (оно в прошлом)
-        -- 2) После его окончания не было новых завершённых инцидентов
-        -- 3) Оно не пересекается с инцидентами (это уже гарантировано)
-        IF v_existing.window_end < v_now AND
-           (v_last_finish IS NULL OR v_last_finish <= v_existing.window_start) THEN
-            RETURN format('Окно уже существует и актуально: %s – %s',
-                          v_existing.window_start, v_existing.window_end);
-        END IF;
-    END IF;
-
-    -- Если окна нет или оно устарело – ищем новое
-    IF v_last_finish IS NULL
-       OR v_last_finish + INTERVAL '1 hour' > v_now
-       OR v_last_finish + v_interval > v_now
+    -- Если окно существует и всё ещё удовлетворяет условию свежести,
+    -- оставляем его как есть
+    IF FOUND
+       AND v_existing.window_start IS NOT NULL
+       AND v_existing.window_end < v_now - (p_exclude_after_min || ' minutes')::INTERVAL
     THEN
-        DELETE FROM incident_free_window_current;
-        RETURN 'Окно не найдено: последний завершённый инцидент не удовлетворяет условиям доступности.';
+        RETURN format('Окно уже существует и актуально: %s – %s',
+                      v_existing.window_start, v_existing.window_end);
     END IF;
 
-    -- Строим окно сразу после последнего завершённого инцидента
-    v_start_ts := v_last_finish;
-    v_end_ts   := v_last_finish + v_interval;
+    -- Ищем самое свежее безынцидентное окно,
+    -- заканчивающееся не позже (now() - p_exclude_after_min)
+    SELECT start_ts, end_ts
+    INTO v_start_ts, v_end_ts
+    FROM get_incident_free_window_before(
+        p_ts                 => v_now,
+        p_window_minutes     => p_window_minutes,
+        p_lookback_days      => p_lookback_days,
+        p_exclude_before_min => 0,
+        p_exclude_after_min  => p_exclude_after_min
+    );
 
-    -- Проверяем, что окно не пересекается с другими инцидентами (доп. проверка)
+    IF v_start_ts IS NULL THEN
+        DELETE FROM incident_free_window_current;
+        RETURN format('Окно не найдено: нет безынцидентного интервала длиной %s мин за последние %s дней (отступ %s мин).',
+                      p_window_minutes, p_lookback_days, p_exclude_after_min);
+    END IF;
+
+    -- Финальная проверка: окно целиком в прошлом и не пересекается с текущим часом
     IF EXISTS (
         SELECT 1 FROM performance_incident
         WHERE start_timepoint < v_end_ts
@@ -1485,37 +1492,39 @@ BEGIN
     DELETE FROM incident_free_window_current;
     INSERT INTO incident_free_window_current (window_start, window_end, updated_at)
     VALUES (v_start_ts, v_end_ts, v_now);
-    
-    RETURN format('Окно обновлено: %s – %s (длина %s минут)',
-                  v_start_ts, v_end_ts, p_window_minutes);
+
+    RETURN format('Окно обновлено: %s – %s (длина %s минут, отступ %s мин)',
+                  v_start_ts, v_end_ts, p_window_minutes, p_exclude_after_min);
 END;
 $$;
 
 COMMENT ON FUNCTION find_incident_free_window(INT, INT, INT) IS
-'Эталонное окно = [finish ; finish + window_minutes] для самого позднего завершённого инцидента,
-доступно только если прошло не менее 1 часа после его окончания и окно целиком в прошлом.
-Если условий нет – таблица incident_free_window_current очищается.';
+'Ищет самое свежее окно длины p_window_minutes, свободное от инцидентов,
+заканчивающееся не позже (now() - p_exclude_after_min).
+Версия 3 (2026-10-14): отказ от построения окна "сразу после последнего
+завершённого инцидента" в пользу динамического поиска через
+get_incident_free_window_before. Устраняет "мёртвую зону" ~120 мин после
+каждого инцидента.';
 
 -- =============================================================================
 -- Дополнительные функции для профилирования производительности:
 -- 1) Сохранение эталонного профиля на основе incident_free_window_current
 -- 2) Сохранение текущего профиля от текущего времени
 -- 3) Сравнение эталонного и текущего профилей с анализом аномалий
-
 -- =============================================================================
--- Обновлённые функции для профилирования производительности
--- (без использования отдельной таблицы baseline_state)
+-- Функция: save_baseline_profile (версия 2)
+-- Назначение: сохраняет эталонный профиль на основе incident_free_window_current.
+--
+-- ИЗМЕНЕНИЯ (2026-10-14):
+--   - Раньше выполнялся полный DELETE FROM profile_aggregated
+--     WHERE profile_type = 'baseline'. Это лишало compare_profiles
+--     fallback-материала на период, пока новое окно не станет пригодным
+--     (см. диагностику NO_BASELINE от 2026-10-14).
+--   - Теперь сохраняются последние v_retention_count baseline-профилей
+--     (по умолчанию 5). Остальные чистятся.
+--
+-- Возвращает: TEXT – сообщение о результате.
 -- =============================================================================
--- Copyright 2026 Ринат (markov_chain)
--- Лицензия Apache 2.0
--- =============================================================================
-
---------------------------------------------------------------------------------
--- 2. Функция сохранения эталонного профиля (переработанная)
---    Использует incident_free_window_current как источник актуального окна,
---    а для проверки изменений сравнивает с последним сохранённым профилем
---    в profile_aggregated (profile_type='baseline').
---------------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION save_baseline_profile()
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -1528,6 +1537,7 @@ DECLARE
     v_metrics   RECORD;
     v_hour      SMALLINT;
     v_dow       SMALLINT;
+    v_retention_count CONSTANT INT := 5;
 BEGIN
     -- Получаем текущее безынцидентное окно
     SELECT window_start, window_end INTO v_win_start, v_win_end
@@ -1549,9 +1559,6 @@ BEGIN
         RETURN format('Эталонный профиль уже сохранён для окна %s – %s, пропуск.',
                       v_win_start, v_win_end);
     END IF;
-
-    -- Удаляем старый эталонный профиль (если есть)
-    DELETE FROM profile_aggregated WHERE profile_type = 'baseline';
 
     -- Вычисляем метрики для нового окна
     SELECT * INTO v_metrics
@@ -1576,16 +1583,28 @@ BEGIN
         v_metrics.top_transition
     );
 
-    RETURN format('Эталонный профиль сохранён: %s – %s (длина %s мин)',
+    -- Чистим старые baseline, оставляя последние v_retention_count
+    DELETE FROM profile_aggregated
+    WHERE profile_type = 'baseline'
+      AND id NOT IN (
+          SELECT id FROM profile_aggregated
+          WHERE profile_type = 'baseline'
+          ORDER BY ts DESC
+          LIMIT v_retention_count
+      );
+
+    RETURN format('Эталонный профиль сохранён: %s – %s (длина %s мин); retention=%s',
                   v_win_start, v_win_end,
-                  EXTRACT(EPOCH FROM (v_win_end - v_win_start)) / 60);
+                  EXTRACT(EPOCH FROM (v_win_end - v_win_start)) / 60,
+                  v_retention_count);
 END;
 $$;
 
 COMMENT ON FUNCTION save_baseline_profile() IS
 'Сохраняет эталонный профиль на основе текущего окна из incident_free_window_current.
 Если окно совпадает с последним сохранённым эталоном – пропускает.
-Старый эталон удаляется.';
+Версия 2 (2026-10-14): вместо полного DELETE старых baseline сохраняются
+последние 5 записей (retention), что даёт compare_profiles fallback-материал.';
 
 --------------------------------------------------------------------------------
 -- 3. Функция сохранения текущего профиля производительности (без изменений)
@@ -1703,7 +1722,7 @@ COMMENT ON FUNCTION histogram_divergence(JSONB, JSONB) IS
 'Вычисляет JS-дивергенцию между двумя гистограммами (поля pct в процентах).';
 
 -- =============================================================================
--- compare_profiles (версия 3, 2026-10-12)
+-- compare_profiles (версия 4, 2026-10-14)
 -- Назначение: выполняет сравнение текущего профиля нагрузки с эталонным окном.
 --             Дополнительно вычисляет:
 --               - 90-й перцентиль predicted_risk за текущее окно;
@@ -1714,13 +1733,15 @@ COMMENT ON FUNCTION histogram_divergence(JSONB, JSONB) IS
 --                     И stability_met = TRUE
 --                 иначе 0.
 --
--- ИЗМЕНЕНИЯ (2026-10-12):
---   - Удалён поиск совпадений с пред-инцидентными профилями
---     (find_matching_pre_incident_profile).
---   - Удалена переменная v_matched_id.
---   - Удалён вывод строк о совпадениях в отчёте.
---   - Удалена колонка matched_pre_incident_id из INSERT в profile_comparison_log.
---   - Причина: за период 2026-09-12 – 2026-10-12 совпадения дали 0%.
+-- ИЗМЕНЕНИЯ (2026-10-14):
+--   - Добавлена цепочка fallback для получения эталонного окна:
+--       1) incident_free_window_current;
+--       2) самый свежий baseline из profile_aggregated с window_end < current_start;
+--       3) динамический поиск через get_incident_free_window_before
+--          (p_ts => current_start, p_exclude_after_min => 1).
+--   - Причина: диагностика от 2026-10-14 показала серии NO_BASELINE
+--     длиной до 60+ минут, вызванные перекрытием окна incident_free_window_current
+--     с текущим часовым окном.
 --
 -- Параметры:
 --   p_window_minutes      INT – длина окна в минутах (по умолчанию 60)
@@ -1762,6 +1783,8 @@ DECLARE
     -- Для устойчивости
     v_last_statuses TEXT[];
     v_crit_or_warn_count INT;
+    -- Источник эталона (для логов)
+    v_baseline_source TEXT := 'unknown';
 BEGIN
     -- 1. Проверяем, находится ли текущий момент внутри активного инцидента
     SELECT EXISTS (
@@ -1813,25 +1836,62 @@ BEGIN
         RETURN v_report;
     END IF;
 
-    -- 4. Пытаемся получить эталонное окно из таблицы incident_free_window_current
+    -- ========================================================================
+    -- 4. Цепочка fallback для получения эталонного окна
+    -- ========================================================================
+
+    -- fallback 0: incident_free_window_current
     SELECT window_start, window_end INTO v_baseline_start, v_baseline_end
     FROM incident_free_window_current
     LIMIT 1;
 
-    -- Если в incident_free_window_current нет записи, пробуем взять baseline из profile_aggregated
-    IF v_baseline_start IS NULL THEN
+    IF v_baseline_start IS NOT NULL
+       AND v_baseline_end < v_current_start THEN
+        v_baseline_source := 'incident_free_window_current';
+    END IF;
+
+    -- fallback 1: самый свежий baseline из profile_aggregated,
+    --             не перекрывающийся с текущим окном
+    IF v_baseline_start IS NULL OR v_baseline_end >= v_current_start THEN
         SELECT window_start, window_end INTO v_baseline_start, v_baseline_end
         FROM profile_aggregated
         WHERE profile_type = 'baseline'
-        ORDER BY ts DESC
+          AND window_end < v_current_start
+        ORDER BY window_end DESC
         LIMIT 1;
+
+        IF v_baseline_start IS NOT NULL
+           AND v_baseline_end < v_current_start THEN
+            v_baseline_source := 'profile_aggregated.baseline';
+        END IF;
     END IF;
 
-    -- Проверяем, что эталонное окно существует и его конец меньше начала текущего окна
+    -- fallback 2: динамический поиск безынцидентного окна
+    --             через get_incident_free_window_before
+    --             (p_ts => current_start, отступ 1 минута, чтобы окно
+    --              гарантированно заканчивалось строго до current_start)
+    IF v_baseline_start IS NULL OR v_baseline_end >= v_current_start THEN
+        SELECT start_ts, end_ts INTO v_baseline_start, v_baseline_end
+        FROM get_incident_free_window_before(
+            p_ts                 => v_current_start,
+            p_window_minutes     => p_window_minutes,
+            p_lookback_days      => 30,
+            p_exclude_before_min => 0,
+            p_exclude_after_min  => 1
+        );
+
+        IF v_baseline_start IS NOT NULL
+           AND v_baseline_end < v_current_start THEN
+            v_baseline_source := 'get_incident_free_window_before';
+        END IF;
+    END IF;
+
+    -- Финальная проверка
     IF v_baseline_start IS NOT NULL AND v_baseline_end < v_current_start THEN
         v_baseline_found := TRUE;
     ELSE
         v_baseline_found := FALSE;
+        v_baseline_source := 'none';
     END IF;
 
     -- 5. Если эталон не найден – статус NO_BASELINE
@@ -1840,6 +1900,7 @@ BEGIN
         v_report := array_append(v_report, '=== СРАВНЕНИЕ ПРОФИЛЕЙ ===');
         v_report := array_append(v_report, format('Текущий момент: %s', v_now));
         v_report := array_append(v_report, 'Статус: NO_BASELINE – отсутствует актуальный эталонный профиль.');
+        v_report := array_append(v_report, 'Проверены все источники: incident_free_window_current, profile_aggregated.baseline, get_incident_free_window_before.');
         v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
 
         v_pre_alert := 0;
@@ -1860,7 +1921,11 @@ BEGIN
             v_status,
             NULL,
             to_jsonb(v_report),
-            jsonb_build_object('reason', 'no_baseline'),
+            jsonb_build_object('reason', 'no_baseline',
+                               'checked_sources',
+                               jsonb_build_array('incident_free_window_current',
+                                                 'profile_aggregated.baseline',
+                                                 'get_incident_free_window_before')),
             v_max_pred_risk,
             v_pre_alert,
             v_pre_alert_advanced
@@ -1935,6 +2000,7 @@ BEGIN
     -- 12. Формируем отчёт
     v_report := array_append(v_report, '=== СРАВНЕНИЕ ЭТАЛОННОГО И ТЕКУЩЕГО ПРОФИЛЕЙ ===');
     v_report := array_append(v_report, format('Текущий момент: %s', v_now));
+    v_report := array_append(v_report, format('Источник эталона: %s', v_baseline_source));
     v_report := array_append(v_report, format('Эталонное окно: %s – %s',
         to_char(v_baseline_start, 'YYYY-MM-DD HH24:MI'),
         to_char(v_baseline_end, 'YYYY-MM-DD HH24:MI')));
@@ -2023,7 +2089,7 @@ BEGIN
         'risk_p90', v_risk_p90,
         'stability_met', v_stability_met,
         'crit_or_warn_count', v_crit_or_warn_count,
-        'baseline_source', 'incident_free_window_current'
+        'baseline_source', v_baseline_source
     );
 
     INSERT INTO profile_comparison_log (
@@ -2064,11 +2130,14 @@ $$;
 
 COMMENT ON FUNCTION compare_profiles(INT, INT, INT) IS
 'Сравнивает текущий профиль нагрузки с эталонным, сохраняет результат в profile_comparison_log.
-Вычисляет pre_alert_flag (простой) и pre_alert_flag_advanced (расширенный: JS >= порога,
-90-й перцентиль риска >= 0.95, устойчивость 3 из 5 последних сравнений CRITICAL/WARNING).
-ИЗМЕНЕНИЯ (2026-10-12): удалён поиск совпадений с пред-инцидентными профилями
-(find_matching_pre_incident_profile) и запись в matched_pre_incident_id.
-Причина: за период 2026-09-12 – 2026-10-12 совпадения дали 0%.';
+Версия 4 (2026-10-14): добавлена цепочка fallback для получения эталона:
+  1) incident_free_window_current;
+  2) самый свежий baseline из profile_aggregated с window_end < current_start;
+  3) get_incident_free_window_before (p_ts => current_start, отступ 1 мин).
+Вычисляет pre_alert_flag (простой) и pre_alert_flag_advanced (расширенный:
+JS >= порога, 90-й перцентиль риска >= 0.95, устойчивость 3 из 5 последних
+сравнений CRITICAL/WARNING). Источник эталона сохраняется в details.baseline_source.';
+
 --------------------------------------------------------------------------------
 -- 6. Пример использования (для справки)
 --------------------------------------------------------------------------------
@@ -4108,7 +4177,7 @@ BEGIN
                 'bin_high', bin_high,
                 'avg_pred', avg_pred,
                 'obs_freq', obs_freq,
-                'count', cnt
+                'cnt', cnt          -- ИСПРАВЛЕНО: было 'count'
             )
         ) INTO v_calibration FROM calibration_bins;
 
