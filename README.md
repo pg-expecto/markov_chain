@@ -242,4 +242,60 @@
 - **Историческое заполнение** – добавлена функция `fill_profile_comparison_historically()` для заполнения журнала сравнений профилей за исторический период на основе параметров `training_start_time` и `training_end_time` из `markov_config`.
 - **Обновлённая установка** – версия 16.3 требует PostgreSQL 13 или выше. Подробная инструкция по установке вынесена в отдельный файл `install.md`.
 
+### Версия 16.9 (актуальная)
+
+**Ключевые особенности:**
+
+- **SICPP (Signal Indicating a Change in the Performance Profile)** – полноценная подсистема онлайн-сигнализации о предаварийных изменениях профиля производительности. Включает:
+  - таблицы `sicpp_history` (история изменений состояния) и `sicpp_current_state` (singleton-таблица текущего состояния);
+  - функцию `sicpp_calculate_at()` – расчёт состояния SICPP на заданный момент с логикой, полностью соответствующей `calculate_signal()` из отчёта `generate_incident_forecast_report()`;
+  - функцию `sicpp_update_state()` – ежеминутное обновление состояния (вызывается из `mchain_train_step()`);
+  - функцию `historical_fill_sicpp()` – историческое заполнение `sicpp_history` с верификацией покрытия инцидентов;
+  - функцию `sicpp_clean_history()` – очистка устаревших записей.
+
+- **Отчётность по SICPP и инцидентам**:
+  - `report_incidents_vs_sicpp()` – сводный отчёт, сравнивающий инциденты производительности и эпизоды SICPP. Покрытие считается по эпизодам (а не по отдельным записям), что устраняет регресс предыдущих версий. Включает:
+    - общую статистику по инцидентам и сигналам SICPP;
+    - покрытие инцидентов сигналом (с разбивкой по приоритетам);
+    - precision эпизодов SICPP;
+    - lead time (время опережения сигнала);
+    - детали по инцидентам и эпизодам;
+    - алерты для P3-инцидентов без сигнала.
+  - `diagnose_incident_coverage()` – диагностика покрытия конкретного инцидента (проверка фильтров, состояния SICPP, покрытия по старому и новому правилу).
+  - `check_p3_coverage_gaps()` – проверка P3-инцидентов без сигнала SICPP (возвращает список непокрытых, опционально записывает алерты).
+  - `get_active_p3_alerts()` – список неподтверждённых P3-алертов.
+  - `acknowledge_p3_alert()` – подтверждение алерта по `incident_id`.
+
+- **Обновления в `sicpp_calculate_at()` (v1.1.0)**:
+  - Изменена семантика `signal_active`: теперь `TRUE`, если в окне `[p_ts - window, p_ts - 1 мин]` был хотя бы один непрерывный пробег длительностью ≥ `min_signal_duration`. Это соответствует `calculate_signal()` и устраняет ложные пропуски сигнала.
+  - `signal_active` остаётся `TRUE` в течение ~`window_minutes` после завершения пробега (latch-эффект), что отражает «был ли сигнал в окне», а не «активен ли он сейчас».
+
+- **Обновления в `report_incidents_vs_sicpp()` (v2.0.1)**:
+  - Покрытие считается по **эпизодам** (`_tmp_sicpp_episodes`), а не по сырым записям `sicpp_history`. Инцидент покрыт, если существует эпизод, начавшийся до `start_timepoint` и ещё активный в окне `[start - window, start + 1 мин]`. Это устраняет регресс v2.0.0.
+  - Добавлен раздел «Критические алерты (P3 без сигнала SICPP)» с записью в `sicpp_coverage_alerts` (при `p_alert_p3 = TRUE`).
+
+- **Обновления в `diagnose_incident_coverage()` (v2.0.2)**:
+  - Удалён блок «Отсечение серийных» (проверка `v_last_status = 'INCIDENT'`), так как в `report_incidents_vs_sicpp` этот фильтр не применяется. Теперь диагностика точно соответствует логике отчёта.
+
+- **Установка и cron**:
+  - Добавлена еженедельная очистка `sicpp_history` (`sicpp_clean_history(90)`).
+  - Добавлена ежечасная проверка P3-покрытия (`check_p3_coverage_gaps`).
+  - Явно зафиксирован рекомендованный порог `refresh_critical_states(p_risk_threshold => 0.10)`.
+  - Опциональный вызов `mchain_train_step()` через cron (если приложение не делает это автоматически).
+
+- **Совместимость**: требует PostgreSQL 13+; порядок загрузки файлов остаётся прежним; `install.md` дополнен разделами о SICPP и проверке P3-покрытия.
+
+---
+
+### История версии 16 (краткая хронология)
+
+| Версия | Дата (примерная) | Ключевые изменения |
+|--------|------------------|-------------------|
+| **16.3** | окт. 2026 | Добавлены `profile_baseline`, `profile_comparison_log`, `fill_profile_comparison_historically()`, расширенные отчёты по профилям, `generate_analytical_report()`. Требуется PostgreSQL 13+. |
+| **16.4** | 12 окт. 2026 | Улучшена стабильность baseline: `find_incident_free_window()` получил параметр `p_overlap_threshold`, `save_baseline_profile()` – дедупликацию перекрывающихся эталонов, `compare_profiles()` – цепочку fallback для получения эталона. |
+| **16.6** | 14 окт. 2026 | Доработки `markov_chain_profile_functions.sql` (детали не раскрыты в коммитах, но, вероятно, связаны с профилированием и SICPP). |
+| **16.8** | 16 окт. 2026 | Введён SICPP (Signal Indicating a Change in the Performance Profile): таблицы `sicpp_history`, `sicpp_current_state`, функции `sicpp_calculate_at()`, `sicpp_update_state()`, `historical_fill_sicpp()`, `report_incidents_vs_sicpp()` (v2.0.1), `diagnose_incident_coverage()`, `check_p3_coverage_gaps()`, `get_active_p3_alerts()`, `acknowledge_p3_alert()`. |
+| **16.9** | 17 окт. 2026 | Финализация SICPP: `sicpp_calculate_at()` v1.1.0 (новая семантика `signal_active`), `report_incidents_vs_sicpp()` v2.0.1 (покрытие по эпизодам), `diagnose_incident_coverage()` v2.0.2 (удалён series-фильтр), обновлён `install.md`, добавлены cron-задачи для SICPP. |
+
+
 
