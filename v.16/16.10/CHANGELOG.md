@@ -2,9 +2,6 @@
 
 Все заметные изменения проекта `markov_chain`.
 
-Формат: [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/),
-версионирование: [Semantic Versioning](https://semver.org/lang/ru/).
-
 ---
 
 ## [v3.1.1] — 2026-10-18 — документационный патч
