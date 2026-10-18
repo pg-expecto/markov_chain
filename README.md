@@ -16,12 +16,17 @@
 
 Данная реализация цепи Маркова предназначена для прогнозирования риска возникновения инцидентов производительности в СУБД на основе временных рядов метрик (операционная скорость, ожидания, корреляция). Модель обучается в реальном времени на потоке данных, использует адаптивное забывание для учёта дрейфа распределений и предоставляет вероятностные прогнозы на заданный горизонт.
 
+Версия **16.10** (внутренняя версия `v3.1.1`) развивает функциональность предыдущих релизов, добавляя расширенную отчётность по покрытию инцидентов с учётом времени упреждения (lead time), диагностику качества сигналов и новые параметры конфигурации, позволяющие более точно настраивать пороги срабатывания.
+
 Ключевые особенности:
 - Дискретизация непрерывных метрик в 189 состояний (3×3×21).
 - Динамическое обновление матрицы переходов и вероятностей.
 - Адаптивное забывание с учётом частоты инцидентов.
 - Оценка достоверности прогнозов на основе статистической устойчивости.
 - Многошаговый прогноз с использованием поглощающей матрицы.
+- **Расширенная отчётность по покрытию инцидентов** с разделением на «предсказано заранее» (`lead ≥ порога`) и «сигнал активен, но не предсказал» (`lead < порога`).
+- **Диагностика качества сигналов** через функцию `diagnose_incident_coverage`, включая episode-based coverage и серийные фильтры.
+- **Гибкая настройка порогов** через новые параметры в `incident_forecast_config`.
 
 ---
 
@@ -29,10 +34,10 @@
 
 Система состоит из следующих логических слоёв:
 
-- **Слой данных** – таблицы для хранения переходов, частот, вероятностей, конфигурации, журналов.
+- **Слой данных** – таблицы для хранения переходов, частот, вероятностей, конфигурации, журналов, а также новые таблицы и поля, появившиеся в версии 16.10.
 - **Слой обучения** – функции `mchain_train_step`, `mchain_log_transition`, механизмы забывания и проверки достаточности данных.
 - **Слой прогнозирования** – функции `mchain_predict_risk_k_v2`, `mchain_predict_risk_current_horizon`, `collect_prediction`.
-- **Слой оценки** – функции `mchain_forecast_reliability`, `calculate_daily_quality_metrics`, отчёты качества.
+- **Слой оценки** – функции `mchain_forecast_reliability`, `calculate_daily_quality_metrics`, отчёты качества, а также новые функции `generate_incident_forecast_report_v2` и `diagnose_incident_coverage`.
 - **Слой профилирования нагрузки** (начиная с версии 14) – функции для сравнения эталонных и текущих профилей производительности.
 
 Все таблицы и функции снабжены подробными комментариями и документацией.
@@ -53,6 +58,8 @@
 - `critical_states` – динамический список состояний, считающихся аварийными (обновляется эмпирически).
 - `performance_history` – агрегированные метрики производительности для расчёта профилей (с версии 13).
 - `profile_aggregated`, `profile_baseline`, `anomaly_log`, `profile_comparison_log` – таблицы для профилирования нагрузки (с версии 14).
+- `incident_forecast_config` – параметры режима прогнозирования и весов сигналов. **В версии 16.10 добавлены новые поля:** `coverage_lead_threshold_min` (порог lead time для разделения покрытия), `series_filter_enabled` (флаг фильтрации серийных инцидентов), `sicpp_coverage_warn_threshold_pct` (порог предупреждения о покрытии SICPP).
+- `sicpp_coverage_alerts` – алерты о критических инцидентах (P3) без сигнала SICPP.
 
 ### 3.2. Основные функции
 
@@ -64,6 +71,14 @@
 - `mchain_forecast_reliability()` – оценка достоверности прогнозов (0–5).
 - `refresh_critical_states()` – автоматическое обновление списка критических состояний на основе эмпирических рисков.
 - `calculate_daily_quality_metrics(date)` – расчёт суточных метрик качества (Brier, ECE, MCE и др.).
+- **`generate_incident_forecast_report_v2()`** – **основная отчётная функция (v3.1.1)**. Формирует детализированный отчёт, включающий разделы:
+  - «ПОКРЫТИЕ С УЧЁТОМ LEAD TIME» (количество инцидентов с `lead >= coverage_lead_threshold_min` и `lead < порога`);
+  - «ПОКРЫТИЕ ПО ПРИОРИТЕТАМ»;
+  - «ТОЧНОСТЬ СИГНАЛА (PRECISION эпизодов)»;
+  - «РАСПРЕДЕЛЕНИЕ LEAD TIME»;
+  - «КРИТИЧЕСКИЕ АЛЕРТЫ (P3 без сигнала)».
+- **`diagnose_incident_coverage()`** – диагностическая функция, переработанная для поддержки `priority_filter`, `status_filter`, `series_filter`, episode-based coverage и взвешенной оценки (WEIGHTED score).
+- Устаревшие функции `generate_incident_forecast_report` (v1) и `report_incidents_vs_sicpp` помечены как deprecated и заменены заглушками с предупреждением.
 
 ---
 
@@ -118,6 +133,10 @@
 - `collect_prediction` сохраняет прогноз в таблицу `prediction_log` с временной меткой.
 - `update_prediction_outcomes` (вызывается по cron) обновляет фактические исходы для прогнозов, у которых истёк горизонт: ищет первый переход в критическое состояние в окне и проставляет `actual_outcome` (1/0).
 
+### 5.4. Расширенная отчётность (новое в 16.10)
+
+Функция `generate_incident_forecast_report_v2` предоставляет углублённый анализ покрытия инцидентов, разделяя их на категории в зависимости от времени упреждения (`lead time`). Это позволяет оценить, насколько заранее система предсказывает инциденты, и выявить случаи, когда сигнал был активен, но не привёл к своевременному предупреждению. Отчёт также включает анализ точности (precision) эпизодов сигнала и распределение lead time, что даёт полную картину качества прогнозирования.
+
 ---
 
 ## 6. Оценка качества и достоверности
@@ -159,6 +178,16 @@
 - `mchain_reliability_report` – детализированный отчёт о достоверности.
 - `mchain_incident_transitions_report` – анализ переходов в критические состояния.
 - `generate_full_analytical_report` – всесторонний отчёт в формате Markdown.
+- **`generate_incident_forecast_report_v2`** – расширенный отчёт по покрытию инцидентов с учётом lead time (см. раздел 5.4).
+
+### 6.4. Результаты тестирования (v3.1.1)
+
+Согласно данным тестирования на наборе test5, достигнуты следующие показатели:
+- Покрытие инцидентов (episode-based): **25/25 (100%)**.
+- Покрытие с `lead ≥ 60 мин`: **22/25 (88%)**.
+- При пороге 120 мин: **16/25 (64%)**.
+- Precision эпизодов: **37.5%** (18 TP / 30 FP из 48 эпизодов).
+- ROC‑AUC: **0.9568**, Brier: **0.0652** (при горизонте 120 мин).
 
 ---
 
@@ -170,7 +199,7 @@
 - Адаптация к изменению характера нагрузки благодаря забыванию.
 - Гибкая настройка горизонта прогноза и параметров забывания.
 - Встроенные механизмы оценки качества и достоверности.
-- Расширяемая архитектура (добавлены профили нагрузки в версии 14).
+- Расширяемая архитектура (добавлены профили нагрузки в версии 14, SICPP в версии 16, расширенная отчётность в версии 16.10).
 
 Система успешно применяется для мониторинга производительности СУБД и предупреждения о возможных сбоях.
 
@@ -188,102 +217,116 @@
 
 ### Версия 11
 - Введено **адаптивное забывание** с параметрами `base_alpha`, `min_alpha`, `incident_half_life_days`.
-- Добавлена таблица `critical_states` для динамического определения аварийных состояний (вместо жёсткого условия `correlation<0 AND os_trend=-1 AND wait_trend=1`).
-- Функция `refresh_critical_states` для эмпирического обновления списка критических состояний на основе инцидентов.
-- Новая версия прогноза `mchain_predict_risk_k_v2` (без поглощающей матрицы, с накоплением вероятностей и обнулением критических состояний).
-- Добавлены `collect_prediction` и `update_prediction_outcomes` для журналирования прогнозов.
+- Добавлена таблица `critical_states` для динамического определения аварийных состояний.
+- Функция `refresh_critical_states` для эмпирического обновления списка критических состояний.
+- Новая версия прогноза `mchain_predict_risk_k_v2`.
+- Добавлены `collect_prediction` и `update_prediction_outcomes`.
 - Отчёты: `mchain_quality_report`, `report_stability_trend`, `state_distribution`.
 
 ### Версия 12
-- Внедрён `stability_factor` в забывание: коэффициент корректировки α в зависимости от нестабильности вероятностей.
-- Добавлен порог `min_freq_for_stability` для отсева состояний с малым числом переходов при расчёте стабильности.
-- Функция `refresh_stability_threshold` для адаптивной настройки `min_freq_for_stability`.
-- Добавлена эмпирическая оптимизация параметров забывания: `evaluate_forgetting_params` и процедура `optimize_forgetting_params` с перебором по сетке.
-- В отчёты добавлены ECE и MCE (калибровочные ошибки).
+- Внедрён `stability_factor` в забывание.
+- Добавлен порог `min_freq_for_stability`.
+- Функция `refresh_stability_threshold`.
+- Эмпирическая оптимизация параметров забывания: `evaluate_forgetting_params` и `optimize_forgetting_params`.
+- В отчёты добавлены ECE и MCE.
 
 ### Версия 13
-- Добавлена поддержка **исторического обучения**:
-  - Функция `fill_performance_history` – заполняет таблицу `performance_history` за период.
-  - Процедура `mchain_initial_train_from_history` – обучает модель на исторических данных, имитируя пошаговое обучение.
-  - Функции `mchain_train_step_at`, `mchain_train_historical`, `mchain_train_historical_chunk` для пакетной обработки.
-- Функция `recalculate_prediction_risks` – пересчёт прогнозов после изменения модели.
-- Триггер на `markov_config` для автоматического пересчёта прогнозов при изменении параметров.
-- В таблицу `mchain_quality_metrics_history` добавлены столбцы `ece` и `mce`.
-- Функция `find_optimal_horizon` для подбора горизонта прогноза.
+- Поддержка **исторического обучения**:
+  - `fill_performance_history`, `mchain_initial_train_from_history`, `mchain_train_step_at`, `mchain_train_historical`, `mchain_train_historical_chunk`.
+- `recalculate_prediction_risks`.
+- Триггер на `markov_config`.
+- В `mchain_quality_metrics_history` добавлены столбцы `ece` и `mce`.
+- `find_optimal_horizon`.
 
 ### Версия 14
 - Внедрена система **профилирования нагрузки**:
   - Таблицы: `profile_aggregated`, `profile_baseline`, `anomaly_log`, `profile_comparison_log`, `incident_free_window_current`.
-  - Функции: `calculate_profile_metrics`, `save_operational_profile`, `save_daily_profile`, `save_weekly_profile`, `build_baseline_profile`, `detect_anomaly`, `get_deviation_report`, `check_and_log_anomalies`.
-  - Функция `compare_profiles` – сравнение текущего профиля с эталонным (с учётом безынцидентных окон).
-  - Процедура `historical_fill_profile_comparison_log` – историческое заполнение журнала сравнений.
-- Добавлены расширенные аналитические отчёты:
-  - `generate_profile_summary_report` – краткий отчёт по профилям.
-  - `generate_detailed_profile_report` – расширенный отчёт с контекстными метриками и интерпретацией.
-  - `generate_profile_incident_analytics_report` – сводный анализ связи профилей и инцидентов.
-  - `generate_comprehensive_analytical_report` – всесторонний отчёт, объединяющий все данные.
-  - `generate_analytical_report` – отчёт по заданному интервалу с исключением статуса INCIDENT.
-- Функции для работы с эталонным окном: `get_incident_free_window_before`, `save_baseline_profile`, `save_current_profile`.
+  - Функции: `calculate_profile_metrics`, `save_operational_profile`, `save_daily_profile`, `save_weekly_profile`, `build_baseline_profile`, `detect_anomaly`, `get_deviation_report`, `check_and_log_anomalies`, `compare_profiles`, `historical_fill_profile_comparison_log`.
+- Расширенные аналитические отчёты: `generate_profile_summary_report`, `generate_detailed_profile_report`, `generate_profile_incident_analytics_report`, `generate_comprehensive_analytical_report`, `generate_analytical_report`.
 - Добавлены поля `ece` и `mce` в таблицу `mchain_quality_metrics_history`.
-- В `markov_config` добавлен параметр `profile_comparison_retention_days` для очистки логов сравнения.
+- В `markov_config` добавлен параметр `profile_comparison_retention_days`.
 
 ### Версия 16
 
 **Ключевые особенности:**
-- **Генерация сигналов раннего предупреждения** – введён комплексный сигнал на основе JS-дивергенции и прогнозируемого риска. Поддерживаются три режима комбинации: `AND`, `OR`, `WEIGHTED`. Добавлен учёт минимальной длительности сигнала для снижения ложных срабатываний.
-- **Новая конфигурационная таблица `incident_forecast_config`** – хранит параметры генерации сигналов: пороги JS-дивергенции (`js_threshold`) и прогнозируемого риска (`risk_threshold`), режим комбинации (`signal_mode`), веса для взвешенного режима (`weight_js`, `weight_risk`), минимальную длительность сигнала (`min_signal_duration`) и флаг расширенного отчёта (`extended_report`).
-- **Новая таблица `profile_change_indicator`** – хранит индикатор изменения профиля, представляющий собой сигнал о предаварийном состоянии.
-- **Новая таблица `pre_incident_profiles`** – библиотека профилей, предшествовавших инцидентам, для последующего анализа и обучения.
-- **Новые функции:**
-  - `calculate_signal()` – вычисление комплексного сигнала на основе JS-дивергенции и прогнозируемого риска.
-  - `generate_incident_forecast_report()` – отчёт по прогнозированию инцидентов.
-- **Расширенная система профилирования** – добавлена поддержка трёх типов профилей: _operational_ (60 мин), _daily_ (24 ч), _weekly_ (7 дней). Введены таблицы `profile_baseline` (эталонные профили по часам и дням недели со средними и стандартными отклонениями) и `profile_comparison_log` (журнал сравнений текущего профиля с эталонным, включая JS-дивергенцию и статус).
-- **Управление профилями и сигналами** – добавлены функции для сохранения эталонного профиля на основе текущего безынцидентного окна (`save_baseline_profile`) и сохранения текущего профиля за заданный период (`save_current_profile`), а также функция сравнения профилей (`compare_profiles`).
-- **Историческое заполнение** – добавлена функция `fill_profile_comparison_historically()` для заполнения журнала сравнений профилей за исторический период на основе параметров `training_start_time` и `training_end_time` из `markov_config`.
-- **Обновлённая установка** – версия 16.3 требует PostgreSQL 13 или выше. Подробная инструкция по установке вынесена в отдельный файл `install.md`.
+- **Генерация сигналов раннего предупреждения** – комплексный сигнал на основе JS-дивергенции и прогнозируемого риска. Режимы комбинации: `AND`, `OR`, `WEIGHTED`. Учёт минимальной длительности сигнала.
+- **Новая конфигурационная таблица `incident_forecast_config`** – пороги JS-дивергенции (`js_threshold`) и прогнозируемого риска (`risk_threshold`), режим комбинации (`signal_mode`), веса (`weight_js`, `weight_risk`), минимальная длительность сигнала (`min_signal_duration`), флаг расширенного отчёта (`extended_report`).
+- **Новая таблица `profile_change_indicator`**.
+- **Новая таблица `pre_incident_profiles`**.
+- **Новые функции:** `calculate_signal()`, `generate_incident_forecast_report()`.
+- **Расширенная система профилирования** – оперативный (60 мин), суточный (24 ч) и недельный (7 дней) профили.
+- **Управление профилями и сигналами** – `save_baseline_profile`, `save_current_profile`, `compare_profiles`.
+- **Историческое заполнение** – `fill_profile_comparison_historically()`.
+- **Обновлённая установка** – требуется PostgreSQL 13 или выше.
 
-### Версия 16.9 (актуальная)
+### Версия 16.9 (актуальная на момент предыдущего релиза)
 
 **Ключевые особенности:**
 
 - **SICPP (Signal Indicating a Change in the Performance Profile)** – полноценная подсистема онлайн-сигнализации о предаварийных изменениях профиля производительности. Включает:
-  - таблицы `sicpp_history` (история изменений состояния) и `sicpp_current_state` (singleton-таблица текущего состояния);
-  - функцию `sicpp_calculate_at()` – расчёт состояния SICPP на заданный момент с логикой, полностью соответствующей `calculate_signal()` из отчёта `generate_incident_forecast_report()`;
-  - функцию `sicpp_update_state()` – ежеминутное обновление состояния (вызывается из `mchain_train_step()`);
-  - функцию `historical_fill_sicpp()` – историческое заполнение `sicpp_history` с верификацией покрытия инцидентов;
-  - функцию `sicpp_clean_history()` – очистка устаревших записей.
+  - таблицы `sicpp_history` и `sicpp_current_state`;
+  - функцию `sicpp_calculate_at()`;
+  - функцию `sicpp_update_state()`;
+  - функцию `historical_fill_sicpp()`;
+  - функцию `sicpp_clean_history()`.
 
 - **Отчётность по SICPP и инцидентам**:
-  - `report_incidents_vs_sicpp()` – сводный отчёт, сравнивающий инциденты производительности и эпизоды SICPP. Покрытие считается по эпизодам (а не по отдельным записям), что устраняет регресс предыдущих версий. Включает:
-    - общую статистику по инцидентам и сигналам SICPP;
-    - покрытие инцидентов сигналом (с разбивкой по приоритетам);
-    - precision эпизодов SICPP;
-    - lead time (время опережения сигнала);
-    - детали по инцидентам и эпизодам;
-    - алерты для P3-инцидентов без сигнала.
-  - `diagnose_incident_coverage()` – диагностика покрытия конкретного инцидента (проверка фильтров, состояния SICPP, покрытия по старому и новому правилу).
-  - `check_p3_coverage_gaps()` – проверка P3-инцидентов без сигнала SICPP (возвращает список непокрытых, опционально записывает алерты).
+  - `report_incidents_vs_sicpp()` – сводный отчёт, сравнивающий инциденты производительности и эпизоды SICPP.
+  - `diagnose_incident_coverage()` – диагностика покрытия конкретного инцидента.
+  - `check_p3_coverage_gaps()` – проверка P3-инцидентов без сигнала SICPP.
   - `get_active_p3_alerts()` – список неподтверждённых P3-алертов.
-  - `acknowledge_p3_alert()` – подтверждение алерта по `incident_id`.
+  - `acknowledge_p3_alert()` – подтверждение алерта.
 
 - **Обновления в `sicpp_calculate_at()` (v1.1.0)**:
-  - Изменена семантика `signal_active`: теперь `TRUE`, если в окне `[p_ts - window, p_ts - 1 мин]` был хотя бы один непрерывный пробег длительностью ≥ `min_signal_duration`. Это соответствует `calculate_signal()` и устраняет ложные пропуски сигнала.
-  - `signal_active` остаётся `TRUE` в течение ~`window_minutes` после завершения пробега (latch-эффект), что отражает «был ли сигнал в окне», а не «активен ли он сейчас».
+  - Изменена семантика `signal_active`.
 
 - **Обновления в `report_incidents_vs_sicpp()` (v2.0.1)**:
-  - Покрытие считается по **эпизодам** (`_tmp_sicpp_episodes`), а не по сырым записям `sicpp_history`. Инцидент покрыт, если существует эпизод, начавшийся до `start_timepoint` и ещё активный в окне `[start - window, start + 1 мин]`. Это устраняет регресс v2.0.0.
-  - Добавлен раздел «Критические алерты (P3 без сигнала SICPP)» с записью в `sicpp_coverage_alerts` (при `p_alert_p3 = TRUE`).
+  - Покрытие считается по эпизодам.
+  - Добавлен раздел «Критические алерты (P3 без сигнала SICPP)».
 
 - **Обновления в `diagnose_incident_coverage()` (v2.0.2)**:
-  - Удалён блок «Отсечение серийных» (проверка `v_last_status = 'INCIDENT'`), так как в `report_incidents_vs_sicpp` этот фильтр не применяется. Теперь диагностика точно соответствует логике отчёта.
+  - Удалён блок «Отсечение серийных».
 
 - **Установка и cron**:
-  - Добавлена еженедельная очистка `sicpp_history` (`sicpp_clean_history(90)`).
-  - Добавлена ежечасная проверка P3-покрытия (`check_p3_coverage_gaps`).
-  - Явно зафиксирован рекомендованный порог `refresh_critical_states(p_risk_threshold => 0.10)`.
-  - Опциональный вызов `mchain_train_step()` через cron (если приложение не делает это автоматически).
+  - Добавлена еженедельная очистка `sicpp_history`.
+  - Добавлена ежечасная проверка P3-покрытия.
+  - Рекомендованный порог `refresh_critical_states(p_risk_threshold => 0.10)`.
 
-- **Совместимость**: требует PostgreSQL 13+; порядок загрузки файлов остаётся прежним; `install.md` дополнен разделами о SICPP и проверке P3-покрытия.
+### Версия 16.10 (актуальная)
+
+**Ключевые особенности (внутренняя версия v3.1.1):**
+
+- **Расширенная отчётность по покрытию инцидентов**:
+  - Новая функция `generate_incident_forecast_report_v2()` – основной отчёт, включающий:
+    - раздел «ПОКРЫТИЕ С УЧЁТОМ LEAD TIME» с разделением на инциденты, предсказанные заранее (`lead >= coverage_lead_threshold_min`), и случаи, когда сигнал был активен, но не предсказал (`lead < порога`);
+    - раздел «ПОКРЫТИЕ ПО ПРИОРИТЕТАМ»;
+    - раздел «ТОЧНОСТЬ СИГНАЛА (PRECISION эпизодов)»;
+    - раздел «РАСПРЕДЕЛЕНИЕ LEAD TIME»;
+    - раздел «КРИТИЧЕСКИЕ АЛЕРТЫ (P3 без сигнала)».
+  - Функция `diagnose_incident_coverage()` обновлена для поддержки `priority_filter`, `status_filter`, `series_filter`, episode-based coverage и взвешенной оценки (WEIGHTED score).
+
+- **Новые параметры конфигурации** в `incident_forecast_config`:
+  - `coverage_lead_threshold_min` – порог lead time (в минутах) для разделения покрытия на «предсказано заранее» и «сигнал активен, но не предсказал».
+  - `series_filter_enabled` – флаг включения фильтрации серийных инцидентов.
+  - `sicpp_coverage_warn_threshold_pct` – порог предупреждения о покрытии SICPP (в процентах).
+
+- **Диагностика качества сигналов**:
+  - `diagnose_incident_coverage()` теперь точно соответствует логике отчёта `generate_incident_forecast_report_v2`, что позволяет использовать её для отладки и верификации покрытия.
+
+- **Уточнённые легенды и комментарии**:
+  - В отчётах уточнены легенды и добавлены комментарии к функциям с ожидаемыми значениями метрик (например, «покрытие с lead ≥ 60 мин» — 88% на тестовых данных).
+
+- **Результаты тестирования** (на данных test5):
+  - Покрытие инцидентов: **25/25 (100%)** (episode-based).
+  - Покрытие с `lead ≥ 60 мин`: **22/25 (88%)**.
+  - При пороге 120 мин: **16/25 (64%)**.
+  - Precision эпизодов: **37.5%** (18 TP / 30 FP из 48 эпизодов).
+  - ROC‑AUC: **0.9568**, Brier: **0.0652** (при горизонте 120 мин).
+
+- **Совместимость и установка**:
+  - Требуется PostgreSQL 13+.
+  - Порядок загрузки файлов остаётся прежним.
+  - Рекомендованные cron-задачи: еженедельная очистка `sicpp_history`, ежечасная проверка P3-покрытия, опциональный вызов `mchain_train_step()`.
 
 ---
 
@@ -293,9 +336,7 @@
 |--------|------------------|-------------------|
 | **16.3** | окт. 2026 | Добавлены `profile_baseline`, `profile_comparison_log`, `fill_profile_comparison_historically()`, расширенные отчёты по профилям, `generate_analytical_report()`. Требуется PostgreSQL 13+. |
 | **16.4** | 12 окт. 2026 | Улучшена стабильность baseline: `find_incident_free_window()` получил параметр `p_overlap_threshold`, `save_baseline_profile()` – дедупликацию перекрывающихся эталонов, `compare_profiles()` – цепочку fallback для получения эталона. |
-| **16.6** | 14 окт. 2026 | Доработки `markov_chain_profile_functions.sql` (детали не раскрыты в коммитах, но, вероятно, связаны с профилированием и SICPP). |
-| **16.8** | 16 окт. 2026 | Введён SICPP (Signal Indicating a Change in the Performance Profile): таблицы `sicpp_history`, `sicpp_current_state`, функции `sicpp_calculate_at()`, `sicpp_update_state()`, `historical_fill_sicpp()`, `report_incidents_vs_sicpp()` (v2.0.1), `diagnose_incident_coverage()`, `check_p3_coverage_gaps()`, `get_active_p3_alerts()`, `acknowledge_p3_alert()`. |
-| **16.9** | 17 окт. 2026 | Финализация SICPP: `sicpp_calculate_at()` v1.1.0 (новая семантика `signal_active`), `report_incidents_vs_sicpp()` v2.0.1 (покрытие по эпизодам), `diagnose_incident_coverage()` v2.0.2 (удалён series-фильтр), обновлён `install.md`, добавлены cron-задачи для SICPP. |
-
-
-
+| **16.6** | 14 окт. 2026 | Доработки `markov_chain_profile_functions.sql`. |
+| **16.8** | 16 окт. 2026 | Введён SICPP: таблицы `sicpp_history`, `sicpp_current_state`, функции `sicpp_calculate_at()`, `sicpp_update_state()`, `historical_fill_sicpp()`, `report_incidents_vs_sicpp()` (v2.0.1), `diagnose_incident_coverage()`, `check_p3_coverage_gaps()`, `get_active_p3_alerts()`, `acknowledge_p3_alert()`. |
+| **16.9** | 17 окт. 2026 | Финализация SICPP: `sicpp_calculate_at()` v1.1.0, `report_incidents_vs_sicpp()` v2.0.1 (покрытие по эпизодам), `diagnose_incident_coverage()` v2.0.2, обновлён `install.md`, добавлены cron-задачи. |
+| **16.10** | 18 окт. 2026 | **Расширенная отчётность**: `generate_incident_forecast_report_v2()`, обновлённая `diagnose_incident_coverage()`. Новые параметры в `incident_forecast_config`: `coverage_lead_threshold_min`, `series_filter_enabled`, `sicpp_coverage_warn_threshold_pct`. Уточнены легенды и комментарии. Подтверждены высокие метрики на тестовых данных. |
