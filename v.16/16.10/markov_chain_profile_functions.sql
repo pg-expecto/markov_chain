@@ -158,6 +158,11 @@
 -- Функция: diagnose_incident_coverage
 -- Назначение: диагностика причины отсутствия или непокрытия инцидента
 --
+-- Функция: get_current_preincident_status
+-- Назначение: возвращает текущий интегральный статус предынцедентного
+--             состояния СУБД на основе SICPP, сравнения профилей и
+--             марковского прогноза риска.
+-- get_current_preincident_status_detail - детализация
 -- =============================================================================
 
 
@@ -7370,3 +7375,321 @@ $$;
 
 COMMENT ON FUNCTION acknowledge_p3_alert(BIGINT, TEXT) IS
 'Подтверждает P3-алерт по incident_id (acknowledged = TRUE, фиксирует ack_at/by).';
+
+
+-- =============================================================================
+-- Функция: get_current_preincident_status
+-- Версия: 1.0.0 (2026-10-18)
+-- Назначение: возвращает текущий интегральный статус предынцедентного
+--             состояния СУБД на основе SICPP, сравнения профилей и
+--             марковского прогноза риска.
+--
+-- Возвращает INTEGER:
+--   0   — NORMAL:  предпосылок нет, СУБД в норме
+--   50  — WARNING: незначительные предпосылки, требуется мониторинг
+--   100 — ALARM:   сильные предпосылки, СУБД в предаварийном состоянии
+--
+-- Источники:
+--   - critical_states               (текущее state_id в критическом списке?)
+--   - sicpp_current_state           (кэш SICPP; обновляется ежеминутно
+--                                    из mchain_train_step -> sicpp_update_state)
+--   - profile_comparison_log        (последние p_recent_minutes мин)
+--   - mchain_predict_risk_current_horizon()  (марковский риск 0..1)
+--
+-- Особенности:
+--   - Если sicpp_current_state устарел (updated_at старше p_state_staleness_min),
+--     SICPP-триггеры игнорируются, чтобы избежать ложных ALARM при сбоях cron.
+--   - Если profile_comparison_log не обновлялся более p_recent_minutes,
+--     триггеры профилей игнорируются.
+--   - Ошибки в подчинённых функциях поглощаются (возврат NULL/0),
+--     функция никогда не бросает исключение для внешнего мониторинга.
+--   - При включённом DEBUG (SET client_min_messages = DEBUG1)
+--     выводится причина принятого решения через RAISE DEBUG.
+--
+-- Примеры использования:
+--   SELECT get_current_preincident_status();                 -- 0/50/100
+--   SELECT get_current_preincident_status(p_alarm_risk => 0.95);  -- строже
+--   SET client_min_messages = DEBUG1;
+--   SELECT get_current_preincident_status();                 -- с диагностикой
+-- =============================================================================
+CREATE OR REPLACE FUNCTION get_current_preincident_status(
+    p_alarm_signal_strength   REAL DEFAULT 1.1,   -- SICPP: порог силы для ALARM
+    p_alarm_risk              REAL DEFAULT 0.90,  -- риск для ALARM
+    p_warning_risk            REAL DEFAULT 0.60,  -- риск для WARNING
+    p_warning_js              REAL DEFAULT 0.10,  -- JS-дивергенция для WARNING
+    p_recent_minutes          INT  DEFAULT 5,     -- окно свежести comparison_log
+    p_state_staleness_min     INT  DEFAULT 5      -- порог устаревания sicpp_current_state
+)
+RETURNS INTEGER
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    -- Текущее состояние цепи Маркова
+    v_state_id            SMALLINT;
+    v_is_critical         BOOLEAN := FALSE;
+
+    -- SICPP (кэш текущего состояния)
+    v_sicpp_updated_at    TIMESTAMPTZ;
+    v_sicpp_active        BOOLEAN;
+    v_sicpp_strength      REAL;
+    v_sicpp_duration      INT;
+    v_sicpp_fresh         BOOLEAN := FALSE;
+
+    -- Последнее сравнение профилей
+    v_comp_window_end     TIMESTAMPTZ;
+    v_comp_status         TEXT;
+    v_comp_js             REAL;
+    v_comp_pre_alert      INTEGER;
+    v_comp_pre_alert_adv  INTEGER;
+    v_comp_matched_id     BIGINT;
+    v_comp_fresh          BOOLEAN := FALSE;
+
+    -- Прогноз риска на текущий горизонт
+    v_risk                REAL;
+
+    -- Интервалы
+    v_recent_interval     INTERVAL;
+    v_stale_interval      INTERVAL;
+BEGIN
+    v_recent_interval := (p_recent_minutes      || ' minutes')::INTERVAL;
+    v_stale_interval  := (p_state_staleness_min || ' minutes')::INTERVAL;
+
+    -- =========================================================================
+    -- 1. Состояние цепи Маркова + членство в critical_states
+    -- =========================================================================
+    BEGIN
+        v_state_id := mchain_get_current_state_id();
+    EXCEPTION WHEN OTHERS THEN
+        v_state_id := NULL;
+        RAISE DEBUG '[preincident] mchain_get_current_state_id failed: %', SQLERRM;
+    END;
+
+    IF v_state_id IS NOT NULL THEN
+        BEGIN
+            SELECT EXISTS (SELECT 1 FROM critical_states WHERE state_id = v_state_id)
+            INTO v_is_critical;
+        EXCEPTION WHEN OTHERS THEN
+            v_is_critical := FALSE;
+        END;
+    END IF;
+
+    -- =========================================================================
+    -- 2. SICPP (кэш)
+    -- =========================================================================
+    BEGIN
+        SELECT updated_at, signal_active, signal_strength, signal_duration
+        INTO v_sicpp_updated_at, v_sicpp_active, v_sicpp_strength, v_sicpp_duration
+        FROM sicpp_current_state
+        WHERE id = 1;
+    EXCEPTION WHEN OTHERS THEN
+        v_sicpp_updated_at := NULL;
+    END;
+
+    IF v_sicpp_updated_at IS NOT NULL
+       AND v_sicpp_updated_at >= now() - v_stale_interval
+       AND COALESCE(v_sicpp_active, FALSE) = TRUE THEN
+        v_sicpp_fresh := TRUE;
+    ELSE
+        v_sicpp_fresh  := FALSE;
+        v_sicpp_active := FALSE;
+    END IF;
+
+    -- =========================================================================
+    -- 3. Последнее сравнение профилей
+    -- =========================================================================
+    BEGIN
+        SELECT current_window_end, status, js_divergence,
+               pre_alert_flag, pre_alert_flag_advanced, matched_pre_incident_id
+        INTO v_comp_window_end, v_comp_status, v_comp_js,
+             v_comp_pre_alert, v_comp_pre_alert_adv, v_comp_matched_id
+        FROM profile_comparison_log
+        ORDER BY current_window_end DESC
+        LIMIT 1;
+    EXCEPTION WHEN OTHERS THEN
+        v_comp_window_end := NULL;
+    END;
+
+    IF v_comp_window_end IS NOT NULL
+       AND v_comp_window_end >= now() - v_recent_interval THEN
+        v_comp_fresh := TRUE;
+    ELSE
+        v_comp_fresh := FALSE;
+    END IF;
+
+    -- =========================================================================
+    -- 4. Прогноз риска на текущий горизонт
+    -- =========================================================================
+    BEGIN
+        v_risk := mchain_predict_risk_current_horizon();
+    EXCEPTION WHEN OTHERS THEN
+        v_risk := NULL;
+        RAISE DEBUG '[preincident] mchain_predict_risk_current_horizon failed: %', SQLERRM;
+    END;
+
+    -- =========================================================================
+    -- 5. ALARM (100) — сильные предпосылки
+    -- =========================================================================
+    IF v_is_critical THEN
+        RAISE DEBUG '[preincident] ALARM=100: state_id=% in critical_states', v_state_id;
+        RETURN 100;
+    END IF;
+
+    IF v_sicpp_fresh AND v_sicpp_strength IS NOT NULL
+       AND v_sicpp_strength >= p_alarm_signal_strength THEN
+        RAISE DEBUG '[preincident] ALARM=100: SICPP active, strength=% >= %',
+                    v_sicpp_strength, p_alarm_signal_strength;
+        RETURN 100;
+    END IF;
+
+    IF v_comp_fresh AND v_comp_pre_alert_adv = 100 THEN
+        RAISE DEBUG '[preincident] ALARM=100: pre_alert_flag_advanced=100 in recent comparison';
+        RETURN 100;
+    END IF;
+
+    IF v_comp_fresh AND v_comp_matched_id IS NOT NULL THEN
+        RAISE DEBUG '[preincident] ALARM=100: matched_pre_incident_id=% (recent)', v_comp_matched_id;
+        RETURN 100;
+    END IF;
+
+    IF v_comp_fresh AND v_comp_status = 'INCIDENT' THEN
+        RAISE DEBUG '[preincident] ALARM=100: recent comparison status=INCIDENT';
+        RETURN 100;
+    END IF;
+
+    IF v_risk IS NOT NULL AND v_risk >= p_alarm_risk THEN
+        RAISE DEBUG '[preincident] ALARM=100: predicted_risk=% >= %', v_risk, p_alarm_risk;
+        RETURN 100;
+    END IF;
+
+    -- =========================================================================
+    -- 6. WARNING (50) — незначительные предпосылки
+    -- =========================================================================
+    IF v_sicpp_fresh AND v_sicpp_active THEN
+        RAISE DEBUG '[preincident] WARNING=50: SICPP active, strength=% below alarm %',
+                    v_sicpp_strength, p_alarm_signal_strength;
+        RETURN 50;
+    END IF;
+
+    IF v_comp_fresh THEN
+        IF v_comp_pre_alert = 100 THEN
+            RAISE DEBUG '[preincident] WARNING=50: pre_alert_flag=100';
+            RETURN 50;
+        END IF;
+
+        IF v_comp_status IN ('CRITICAL', 'WARNING') THEN
+            RAISE DEBUG '[preincident] WARNING=50: comparison status=%', v_comp_status;
+            RETURN 50;
+        END IF;
+
+        IF v_comp_js IS NOT NULL AND v_comp_js >= p_warning_js THEN
+            RAISE DEBUG '[preincident] WARNING=50: js_divergence=% >= %', v_comp_js, p_warning_js;
+            RETURN 50;
+        END IF;
+    END IF;
+
+    IF v_risk IS NOT NULL AND v_risk >= p_warning_risk THEN
+        RAISE DEBUG '[preincident] WARNING=50: predicted_risk=% >= %', v_risk, p_warning_risk;
+        RETURN 50;
+    END IF;
+
+    -- =========================================================================
+    -- 7. NORMAL (0) — предпосылок нет
+    -- =========================================================================
+    RAISE DEBUG '[preincident] NORMAL=0: no triggers (state_id=%, sicpp_fresh=%, comp_fresh=%, risk=%)',
+                v_state_id, v_sicpp_fresh, v_comp_fresh, v_risk;
+    RETURN 0;
+END;
+$$;
+
+COMMENT ON FUNCTION get_current_preincident_status(REAL, REAL, REAL, REAL, INT, INT) IS
+'Текущий интегральный статус предынцедентного состояния СУБД.
+Возвращает: 0 (NORMAL), 50 (WARNING), 100 (ALARM).
+Источники: critical_states, sicpp_current_state, profile_comparison_log,
+mchain_predict_risk_current_horizon(). Пороги настраиваются через параметры.
+Не бросает исключений — при сбое подчинённых функций возвращает NORMAL/частичный результат.
+Диагностика: SET client_min_messages = DEBUG1; SELECT get_current_preincident_status();';
+
+CREATE OR REPLACE FUNCTION get_current_preincident_status_detail(
+    p_alarm_signal_strength   REAL DEFAULT 1.1,
+    p_alarm_risk              REAL DEFAULT 0.90,
+    p_warning_risk            REAL DEFAULT 0.60,
+    p_warning_js              REAL DEFAULT 0.10,
+    p_recent_minutes          INT  DEFAULT 5,
+    p_state_staleness_min     INT  DEFAULT 5
+)
+RETURNS TEXT[]
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    v_report    TEXT[] := '{}';
+    v_status    INTEGER;
+    v_state_id  SMALLINT;
+    v_is_crit   BOOLEAN;
+    v_sicpp     RECORD;
+    v_comp      RECORD;
+    v_risk      REAL;
+BEGIN
+    v_status := get_current_preincident_status(
+        p_alarm_signal_strength, p_alarm_risk, p_warning_risk,
+        p_warning_js, p_recent_minutes, p_state_staleness_min
+    );
+
+    v_report := array_append(v_report, format('=== PREINCIDENT STATUS: %s (%s) ===',
+        v_status,
+        CASE v_status WHEN 0 THEN 'NORMAL' WHEN 50 THEN 'WARNING'
+                      WHEN 100 THEN 'ALARM' ELSE 'UNKNOWN' END));
+    v_report := array_append(v_report, format('Timestamp: %s', to_char(now(), 'YYYY-MM-DD HH24:MI:SS')));
+    v_report := array_append(v_report, '');
+
+    -- State
+    BEGIN v_state_id := mchain_get_current_state_id();
+    EXCEPTION WHEN OTHERS THEN v_state_id := NULL; END;
+    SELECT EXISTS(SELECT 1 FROM critical_states WHERE state_id = v_state_id) INTO v_is_crit;
+    v_report := array_append(v_report, format('1. State:  id=%s, critical=%s',
+        COALESCE(v_state_id::TEXT, 'NULL'), v_is_crit));
+
+    -- SICPP
+    SELECT updated_at, signal_active, signal_strength, signal_duration
+    INTO v_sicpp FROM sicpp_current_state WHERE id = 1;
+    v_report := array_append(v_report, format('2. SICPP:  updated=%s, active=%s, strength=%s, duration=%s min',
+        COALESCE(to_char(v_sicpp.updated_at, 'HH24:MI:SS'), 'NULL'),
+        COALESCE(v_sicpp.signal_active::TEXT, 'NULL'),
+        COALESCE(round(v_sicpp.signal_strength::NUMERIC, 4)::TEXT, 'NULL'),
+        COALESCE(v_sicpp.signal_duration::TEXT, 'NULL')));
+
+    -- Comparison
+    SELECT current_window_end, status, js_divergence,
+           pre_alert_flag, pre_alert_flag_advanced, matched_pre_incident_id
+    INTO v_comp FROM profile_comparison_log ORDER BY current_window_end DESC LIMIT 1;
+    v_report := array_append(v_report, format('3. Comp:   window_end=%s, status=%s, js=%s, pre_alert=%s, pre_alert_adv=%s, matched_id=%s',
+        COALESCE(to_char(v_comp.current_window_end, 'HH24:MI:SS'), 'NULL'),
+        COALESCE(v_comp.status, 'NULL'),
+        COALESCE(round(v_comp.js_divergence::NUMERIC, 4)::TEXT, 'NULL'),
+        COALESCE(v_comp.pre_alert_flag::TEXT, 'NULL'),
+        COALESCE(v_comp.pre_alert_flag_advanced::TEXT, 'NULL'),
+        COALESCE(v_comp.matched_pre_incident_id::TEXT, 'NULL')));
+
+    -- Risk
+    BEGIN v_risk := mchain_predict_risk_current_horizon();
+    EXCEPTION WHEN OTHERS THEN v_risk := NULL; END;
+    v_report := array_append(v_report, format('4. Risk:   predicted_risk=%s',
+        COALESCE(round(v_risk::NUMERIC, 4)::TEXT, 'NULL')));
+
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, 'Пороги:');
+    v_report := array_append(v_report, format('  ALARM:   sicpp_strength >= %s OR risk >= %s',
+        p_alarm_signal_strength, p_alarm_risk));
+    v_report := array_append(v_report, format('  WARNING: sicpp_active OR js >= %s OR risk >= %s',
+        p_warning_js, p_warning_risk));
+    v_report := array_append(v_report, format('  Окна: comparison %s мин, staleness %s мин',
+        p_recent_minutes, p_state_staleness_min));
+
+    RETURN v_report;
+END;
+$$;
+
+COMMENT ON FUNCTION get_current_preincident_status_detail(REAL, REAL, REAL, REAL, INT, INT) IS
+'Детализация решения get_current_preincident_status: разложение по источникам и порогам.
+Возвращает TEXT[] для удобного отображения (SELECT unnest(get_current_preincident_status_detail())).';
