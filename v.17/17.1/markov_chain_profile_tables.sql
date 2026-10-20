@@ -1,4 +1,4 @@
-﻿-- Copyright 2026 Ринат (markov_chain)
+-- Copyright 2026 Ринат (markov_chain)
 --
 -- Licensed under the Apache License, Version 2.0 (the "License");
 -- you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_profile_tables.sql
---  version 16.10
+--  version 17.1
 --------------------------------------------------------------------------------
 -- Таблицы для расчета метрик профиля нагрузки на основе цепи Маркова 
 --------------------------------------------------------------------------------
@@ -188,9 +188,10 @@ CREATE TABLE profile_comparison_log (
 -- Индекс для ускорения выборок по этой колонке
 CREATE INDEX idx_profile_comparison_log_matched_pre_incident ON profile_comparison_log(matched_pre_incident_id);
 
-CREATE INDEX IF NOT EXISTS idx_profile_comparison_log_window_end_js
-    ON profile_comparison_log (current_window_end, js_divergence)
-    WHERE js_divergence IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_profile_comparison_log_window_end_js ON profile_comparison_log (current_window_end, js_divergence) WHERE js_divergence IS NOT NULL;
+	
+CREATE INDEX IF NOT EXISTS idx_profile_comparison_log_window_end_desc    ON profile_comparison_log (current_window_end DESC);
+	
 
 COMMENT ON TABLE profile_comparison_log IS 'Журнал сравнений эталонного и текущего профилей';
 COMMENT ON COLUMN profile_comparison_log.status IS 'Итоговый статус из compare_profile_windows (например, "КРИТИЧЕСКОЕ")';
@@ -296,8 +297,15 @@ CREATE TABLE incident_forecast_config (
     updated_at                      TIMESTAMPTZ DEFAULT now() , 
 	series_filter_enabled BOOLEAN NOT NULL DEFAULT TRUE ,
 	sicpp_coverage_warn_threshold_pct REAL DEFAULT 10.0 ,
-	coverage_lead_threshold_min INT NOT NULL DEFAULT 60
+	coverage_lead_threshold_min INT NOT NULL DEFAULT 60 , 
+	hybrid_js_min_threshold       REAL    NOT NULL DEFAULT 0.14,
+	hybrid_p90_min_threshold      REAL    NOT NULL DEFAULT 0.98,
+	hybrid_w_score_min_threshold  REAL    NOT NULL DEFAULT 0.0,
+	hybrid_window_minutes         INT     NOT NULL DEFAULT 20,
+	hybrid_include_b              BOOLEAN NOT NULL DEFAULT FALSE , 
+	hybrid_include_a 			  BOOLEAN NOT NULL DEFAULT FALSE
 );
+
 
 -- Индекс для быстрого доступа (всегда одна строка)
 CREATE UNIQUE INDEX idx_incident_forecast_config_single ON incident_forecast_config ((1));
@@ -307,6 +315,12 @@ COMMENT ON COLUMN incident_forecast_config.sicpp_coverage_warn_threshold_pct IS 
 -- optimize_thresholds: помечаем как not implemented (не удаляем — на случай внешних ссылок)
 COMMENT ON COLUMN incident_forecast_config.optimize_thresholds IS 'NOT IMPLEMENTED с v3.0.0. Игнорируется. Используйте auto_threshold (percentile-based) или evaluate_forgetting_params.';
 COMMENT ON COLUMN incident_forecast_config.coverage_lead_threshold_min IS 'Порог lead time (минут) для метрики «покрытие с учётом lead time». Инцидент считается «предсказанным заранее», если покрыт эпизодом SICPP И lead_time >= порога. 60 — отделяет «сигнал был активен при инциденте» от «сигнал предсказал заранее».';
+COMMENT ON COLUMN incident_forecast_config.hybrid_p90_min_threshold IS 'v3.4.0. Минимальный risk_p90 для условия C''. v2=0.98 (ужесточено с 0.95). Для v1 установить 0.95.';
+COMMENT ON COLUMN incident_forecast_config.hybrid_w_score_min_threshold IS 'v3.4.0. Минимальный W_score для условия C''. v2=0.80. Для v1 установить 0.0 (условие отключено).';
+COMMENT ON COLUMN incident_forecast_config.hybrid_window_minutes IS 'v3.4.0. Окно проверки «был ли ALERT перед инцидентом» (минуты). v2=20 (сокращено с 60). Для v1 установить 60.';
+COMMENT ON COLUMN incident_forecast_config.hybrid_include_b IS 'v3.4.0. Включать условие B (W_score>1 AND risk_max>=1.0). v2=FALSE (B не даёт уникального покрытия). Для v1 установить TRUE.';
+COMMENT ON COLUMN incident_forecast_config.hybrid_include_a IS 'v3.5.0. Включать условие A (PreAlertAdv = 100) в ALERT. FALSE (по умолчанию с v3.5.0) — ALERT = C-only.  Результаты: ALERT 14.1%, precision эпизодов 34.5%, recall 51.4% (все 4 цели, тест 20261020_test6).TRUE — ALERT = A ∪ C (v3.4.1).
+  Результаты: ALERT 20.9%, precision эпизодов 12.5%, recall 57.1% (A разбавляет C). A-alone (без C) — шум: precision 5.9%, recall 17.1%. НЕ рекомендуется.';
 
 
 
@@ -521,4 +535,54 @@ COMMENT ON COLUMN sicpp_coverage_alerts.incident_id IS
 ---------------------------------------
 
 
+-- 1.2. Singleton-таблица текущего операционного индикатора
+CREATE TABLE IF NOT EXISTS operational_alert_state (
+    id              INT             PRIMARY KEY DEFAULT 1,
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT now(),
+    alert_active    BOOLEAN         NOT NULL DEFAULT FALSE,
+    fired_c         BOOLEAN         NOT NULL DEFAULT FALSE,
+    fired_a_would   BOOLEAN         NOT NULL DEFAULT FALSE,  -- raw A (для диагностики)
+    fired_b         BOOLEAN         NOT NULL DEFAULT FALSE,
+    risk_p90        REAL,
+    js_avg          REAL,
+    last_history_id BIGINT,
+    CONSTRAINT operational_alert_state_singleton CHECK (id = 1)
+);
+
+COMMENT ON TABLE operational_alert_state IS
+'v3.5.0. Текущее состояние операционного индикатора ALERT (C-only по умолчанию).
+Обновляется ежеминутно из mchain_train_step() -> update_operational_alert_state().
+Используется dashboard вместо pre_alert_flag_advanced.';
+
+INSERT INTO operational_alert_state (id, alert_active, fired_c)
+VALUES (1, FALSE, FALSE)
+ON CONFLICT (id) DO NOTHING;
+
+-- 1.3. История изменений ALERT
+CREATE TABLE IF NOT EXISTS operational_alert_history (
+    id           BIGSERIAL       PRIMARY KEY,
+    changed_at   TIMESTAMPTZ     NOT NULL DEFAULT now(),
+    alert_active BOOLEAN         NOT NULL,
+    fired_c      BOOLEAN         NOT NULL DEFAULT FALSE,
+    fired_a_would BOOLEAN        NOT NULL DEFAULT FALSE,
+    fired_b      BOOLEAN         NOT NULL DEFAULT FALSE,
+    risk_p90     REAL,
+    js_avg       REAL,
+    reason       TEXT,
+    created_at   TIMESTAMPTZ     NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_operational_alert_history_changed_at
+    ON operational_alert_history (changed_at DESC);
+
+COMMENT ON TABLE operational_alert_history IS
+'v3.5.0. Журнал смены состояния операционного индикатора ALERT.
+Записи добавляются только при изменении alert_active.';
+
+-- 1.4. Ускорение lookup
+CREATE INDEX IF NOT EXISTS idx_sicpp_history_changed_at_desc
+    ON sicpp_history (changed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_prediction_log_time_risk
+    ON prediction_log (prediction_time, predicted_risk)
+    WHERE predicted_risk IS NOT NULL;
 
