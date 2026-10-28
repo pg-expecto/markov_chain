@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_profile_functions.sql
--- version 22.2
+-- version 22.2.1
 --------------------------------------------------------------------------------
 -- Функции для расчета метрик профиля нагрузки на основе цепи Маркова 
 --------------------------------------------------------------------------------
@@ -1704,15 +1704,19 @@ COMMENT ON FUNCTION histogram_divergence(JSONB, JSONB) IS
 'Вычисляет JS-дивергенцию между двумя гистограммами (поля pct в процентах).';
 
 -- =============================================================================
--- compare_profiles (версия 5, 2026-10-19)
+-- compare_profiles (версия 6, 2026-10-29)
 -- Назначение: выполняет сравнение текущего профиля нагрузки с эталонным окном.
 --
--- ИЗМЕНЕНИЯ (v5):
---   - При выборе эталона из incident_free_window_current и profile_aggregated.baseline
---     дополнительно проверяется is_valid_baseline_window (период продуктивной
---     нагрузки + зазор после инцидента). Невалидные окна пропускаются.
---   - Динамический поиск через get_incident_free_window_before уже учитывает
---     эти ограничения.
+-- ИЗМЕНЕНИЯ (v6):
+--   - БЛОК 1: проверка «внутри инцидента» заменена с точечной (по v_now)
+--     на проверку ПЕРЕСЕЧЕНИЯ всего текущего окна [v_current_start, v_current_end]
+--     с любым инцидентом. Раньше, если инцидент завершился до now(), но
+--     начался внутри 60-минутного текущего окна (finish_timepoint < now()
+--     AND start_timepoint >= v_current_start), текущее окно «проскакивало»
+--     проверку и сравнивалось с эталоном, что давало завышенную JS-дивергенцию
+--     и ложные WARNING/CRITICAL.
+--   - В v_details добавлен ключ 'incident_overlap', сообщающий, что текущее
+--     окно пересекается с инцидентом (для диагностики).
 -- =============================================================================
 CREATE OR REPLACE FUNCTION compare_profiles(
     p_window_minutes      INT DEFAULT 60,
@@ -1737,6 +1741,7 @@ DECLARE
     v_report        TEXT[] := '{}';
     v_details       JSONB;
     v_inside_incident BOOLEAN;
+    v_incident_overlap RECORD;
     v_max_pred_risk REAL;
     v_risk_p90      REAL;
     v_stability_met BOOLEAN;
@@ -1748,28 +1753,49 @@ DECLARE
     v_crit_or_warn_count INT;
     v_baseline_source TEXT := 'unknown';
 BEGIN
-    -- 1. Проверяем, находится ли текущий момент внутри активного инцидента
-    SELECT EXISTS (
-        SELECT 1
-        FROM markov_chain_performance_incident
-        WHERE start_timepoint <= v_now
-          AND (finish_timepoint IS NULL OR finish_timepoint >= v_now)
-    ) INTO v_inside_incident;
+    -- 1. Проверяем, пересекается ли ТЕКУЩЕЕ ОКНО [v_current_start, v_current_end]
+    --    с любым инцидентом производительности (включая незавершённые).
+    --    v6: раньше проверялась только точка v_now — это пропускало инциденты,
+    --    которые завершились до v_now, но начались внутри окна (например,
+    --    инцидент 14:24–15:10 при v_current_start=14:54, v_current_end=15:54).
+    SELECT
+        pi.id,
+        pi.start_timepoint,
+        pi.finish_timepoint
+    INTO v_incident_overlap
+    FROM markov_chain_performance_incident pi
+    WHERE pi.start_timepoint <  v_current_end
+      AND (pi.finish_timepoint IS NULL OR pi.finish_timepoint > v_current_start)
+    ORDER BY pi.start_timepoint DESC
+    LIMIT 1;
 
-    -- 2. Вычисляем максимальный и 90-й перцентиль предсказанного риска за текущее окно
-    SELECT 
+    v_inside_incident := FOUND;
+
+    -- 2. Вычисляем максимальный и 90-й перцентиль предсказанного риска
+    SELECT
         MAX(predicted_risk),
         PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY predicted_risk)
     INTO v_max_pred_risk, v_risk_p90
     FROM prediction_log
     WHERE prediction_time BETWEEN v_current_start AND v_current_end;
 
-    -- 3. Если внутри инцидента – записываем INCIDENT и выходим
+    -- 3. Если текущее окно пересекается с инцидентом – записываем INCIDENT
+    --    и выходим, не выполняя сравнение с эталоном.
     IF v_inside_incident THEN
         v_status := 'INCIDENT';
         v_report := array_append(v_report, '=== СРАВНЕНИЕ ПРОФИЛЕЙ ===');
         v_report := array_append(v_report, format('Текущий момент: %s', v_now));
-        v_report := array_append(v_report, 'Статус: INCIDENT – система находится внутри инцидента, эталонное окно недоступно.');
+        v_report := array_append(v_report, format('Текущее окно: %s – %s',
+            to_char(v_current_start, 'YYYY-MM-DD HH24:MI'),
+            to_char(v_current_end,   'YYYY-MM-DD HH24:MI')));
+        v_report := array_append(v_report, format(
+            'Инцидент (пересечение): ID=%s, %s – %s',
+            v_incident_overlap.id,
+            to_char(v_incident_overlap.start_timepoint, 'YYYY-MM-DD HH24:MI'),
+            COALESCE(to_char(v_incident_overlap.finish_timepoint, 'YYYY-MM-DD HH24:MI'),
+                     'не завершён')));
+        v_report := array_append(v_report,
+            'Статус: INCIDENT – текущее окно пересекается с инцидентом, эталонное окно недоступно.');
         v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
 
         v_pre_alert := 0;
@@ -1779,7 +1805,12 @@ BEGIN
             report, details, max_predicted_risk, pre_alert_flag, pre_alert_flag_advanced
         ) VALUES (
             v_current_start, v_current_end, v_status, NULL,
-            to_jsonb(v_report), jsonb_build_object('reason', 'inside_incident'),
+            to_jsonb(v_report),
+            jsonb_build_object(
+                'reason', 'incident_overlap',
+                'incident_id', v_incident_overlap.id,
+                'incident_start', v_incident_overlap.start_timepoint,
+                'incident_finish', v_incident_overlap.finish_timepoint),
             v_max_pred_risk, v_pre_alert, v_pre_alert_advanced
         );
         RETURN v_report;
@@ -1823,8 +1854,6 @@ BEGIN
     END IF;
 
     -- fallback 2: динамический поиск безынцидентного окна
-    --             (get_incident_free_window_before уже учитывает период нагрузки
-    --              и зазор после инцидента)
     IF v_baseline_start IS NULL OR v_baseline_end >= v_current_start THEN
         SELECT start_ts, end_ts INTO v_baseline_start, v_baseline_end
         FROM get_incident_free_window_before(
@@ -2072,10 +2101,12 @@ $$;
 
 COMMENT ON FUNCTION compare_profiles(INT, INT, INT) IS
 'Сравнивает текущий профиль нагрузки с эталонным, сохраняет результат в profile_comparison_log.
-Версия 5 (2026-10-19): при выборе эталона из incident_free_window_current и
-profile_aggregated.baseline дополнительно проверяется is_valid_baseline_window
-(период продуктивной нагрузки + зазор после инцидента). Невалидные окна пропускаются.
-Динамический поиск через get_incident_free_window_before уже учитывает эти ограничения.';
+Версия 6 (2026-10-29): проверка «внутри инцидента» теперь выполняется для всего
+текущего окна [v_current_start, v_current_end], а не только для точки now().
+Это устраняет ложные CRITICAL/WARNING, когда инцидент завершился до now(),
+но начался внутри 60-минутного текущего окна.
+При выборе эталона из incident_free_window_current и profile_aggregated.baseline
+дополнительно проверяется is_valid_baseline_window.';
 
 --------------------------------------------------------------------------------
 -- 6. Пример использования (для справки)
@@ -4399,16 +4430,18 @@ END;
 $$;
 
 -- =============================================================================
--- compare_profiles_at (версия 4, 2026-10-26)
+-- compare_profiles_at (версия 4, 2026-10-29)
 -- Назначение: выполняет сравнение эталонного и текущего профилей для заданного
 --             момента времени (исторического).
 --
--- ИЗМЕНЕНИЯ (v3):
---   - При выборе эталона из incident_free_window_current и profile_aggregated.baseline
---     дополнительно проверяется is_valid_baseline_window (период продуктивной
---     нагрузки + зазор после инцидента). Невалидные окна пропускаются.
---   - Динамический поиск через get_incident_free_window_before уже учитывает
---     эти ограничения.
+-- ИЗМЕНЕНИЯ (v4):
+--   - БЛОК 1: проверка «внутри инцидента» заменена с точечной (по p_ts)
+--     на проверку ПЕРЕСЕЧЕНИЯ всего текущего окна [v_current_start, v_current_end]
+--     с любым инцидентом. Аналогично правке в compare_profiles v6.
+--     Это устраняет ложные WARNING/CRITICAL при историческом заполнении
+--     profile_comparison_log (fill_profile_comparison_historically), когда
+--     инцидент завершился до p_ts, но попал в 60-минутное окно.
+--   - В v_details добавлен ключ 'incident_overlap' (для диагностики).
 -- =============================================================================
 CREATE OR REPLACE FUNCTION compare_profiles_at(
     p_ts                   TIMESTAMPTZ,
@@ -4435,6 +4468,7 @@ DECLARE
     v_report        TEXT[] := '{}';
     v_details       JSONB;
     v_inside_incident BOOLEAN;
+    v_incident_overlap RECORD;
     v_max_pred_risk REAL;
     v_risk_p90      REAL;
     v_stability_met BOOLEAN;
@@ -4446,28 +4480,47 @@ DECLARE
     v_last_statuses TEXT[];
     v_crit_or_warn_count INT;
 BEGIN
-    -- 1. Проверяем, находится ли заданный момент внутри активного инцидента
-    SELECT EXISTS (
-        SELECT 1
-        FROM markov_chain_performance_incident
-        WHERE start_timepoint <= v_now
-          AND (finish_timepoint IS NULL OR finish_timepoint >= v_now)
-    ) INTO v_inside_incident;
+    -- 1. Проверяем, пересекается ли ТЕКУЩЕЕ ОКНО [v_current_start, v_current_end]
+    --    с любым инцидентом производительности (включая незавершённые).
+    --    v4: раньше проверялась только точка p_ts — это пропускало инциденты,
+    --    которые завершились до p_ts, но начались внутри окна.
+    SELECT
+        pi.id,
+        pi.start_timepoint,
+        pi.finish_timepoint
+    INTO v_incident_overlap
+    FROM markov_chain_performance_incident pi
+    WHERE pi.start_timepoint <  v_current_end
+      AND (pi.finish_timepoint IS NULL OR pi.finish_timepoint > v_current_start)
+    ORDER BY pi.start_timepoint DESC
+    LIMIT 1;
+
+    v_inside_incident := FOUND;
 
     -- 2. Вычисляем максимальный и 90-й перцентиль предсказанного риска
-    SELECT 
+    SELECT
         MAX(predicted_risk),
         PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY predicted_risk)
     INTO v_max_pred_risk, v_risk_p90
     FROM prediction_log
     WHERE prediction_time BETWEEN v_current_start AND v_current_end;
 
-    -- 3. Если внутри инцидента – записываем INCIDENT
+    -- 3. Если текущее окно пересекается с инцидентом – записываем INCIDENT
     IF v_inside_incident THEN
         v_status := 'INCIDENT';
         v_report := array_append(v_report, '=== СРАВНЕНИЕ ПРОФИЛЕЙ ===');
         v_report := array_append(v_report, format('Текущий момент: %s', v_now));
-        v_report := array_append(v_report, 'Статус: INCIDENT – система находится внутри инцидента.');
+        v_report := array_append(v_report, format('Текущее окно: %s – %s',
+            to_char(v_current_start, 'YYYY-MM-DD HH24:MI'),
+            to_char(v_current_end,   'YYYY-MM-DD HH24:MI')));
+        v_report := array_append(v_report, format(
+            'Инцидент (пересечение): ID=%s, %s – %s',
+            v_incident_overlap.id,
+            to_char(v_incident_overlap.start_timepoint, 'YYYY-MM-DD HH24:MI'),
+            COALESCE(to_char(v_incident_overlap.finish_timepoint, 'YYYY-MM-DD HH24:MI'),
+                     'не завершён')));
+        v_report := array_append(v_report,
+            'Статус: INCIDENT – текущее окно пересекается с инцидентом.');
         v_report := array_append(v_report, '=== КОНЕЦ ОТЧЁТА ===');
 
         v_pre_alert := 0;
@@ -4479,7 +4532,12 @@ BEGIN
             pre_alert_flag, pre_alert_flag_advanced, matched_pre_incident_id
         ) VALUES (
             v_now, v_current_start, v_current_end, v_status, NULL,
-            to_jsonb(v_report), jsonb_build_object('reason', 'inside_incident'),
+            to_jsonb(v_report),
+            jsonb_build_object(
+                'reason', 'incident_overlap',
+                'incident_id', v_incident_overlap.id,
+                'incident_start', v_incident_overlap.start_timepoint,
+                'incident_finish', v_incident_overlap.finish_timepoint),
             v_max_pred_risk, v_pre_alert, v_pre_alert_advanced, v_matched_id
         );
         RETURN v_report;
@@ -4492,25 +4550,23 @@ BEGIN
     LIMIT 1;
 
     IF v_baseline_start IS NOT NULL
-		AND v_baseline_end < v_current_start
-		AND is_valid_baseline_window(v_baseline_start, v_baseline_end, v_now) THEN
-		-- используем это окно
-		NULL;
+        AND v_baseline_end < v_current_start
+        AND is_valid_baseline_window(v_baseline_start, v_baseline_end, v_now) THEN
+        NULL;
     ELSE
         v_baseline_start := NULL;
         v_baseline_end := NULL;
     END IF;
 
-    -- 4.1. Если окно из incident_free_window_current не подходит,
-    --      пробуем взять исторический baseline из profile_aggregated (только валидный)
+    -- 4.1. Исторический baseline из profile_aggregated (только валидный)
     IF v_baseline_start IS NULL OR v_baseline_end >= v_current_start THEN
         SELECT window_start, window_end INTO v_baseline_start, v_baseline_end
-		FROM profile_aggregated
-		WHERE profile_type = 'baseline'
-			AND window_end < v_current_start
-			AND is_valid_baseline_window(window_start, window_end, v_now)
-		ORDER BY window_end DESC
-		LIMIT 1;
+        FROM profile_aggregated
+        WHERE profile_type = 'baseline'
+            AND window_end < v_current_start
+            AND is_valid_baseline_window(window_start, window_end, v_now)
+        ORDER BY window_end DESC
+        LIMIT 1;
 
         IF v_baseline_start IS NOT NULL AND v_baseline_end >= v_current_start THEN
             v_baseline_start := NULL;
@@ -4518,8 +4574,7 @@ BEGIN
         END IF;
     END IF;
 
-    -- 4.2. Если и это не помогло — ищем безынцидентное окно динамически
-    --      (get_incident_free_window_before уже учитывает период нагрузки и зазор)
+    -- 4.2. Динамический поиск безынцидентного окна
     IF v_baseline_start IS NULL OR v_baseline_end >= v_current_start THEN
         SELECT start_ts, end_ts
         INTO v_baseline_start, v_baseline_end
@@ -4715,10 +4770,13 @@ $$;
 
 COMMENT ON FUNCTION compare_profiles_at(TIMESTAMPTZ, INT, INT, INT, INT) IS
 'Сравнивает профили для заданного момента времени.
-Версия 3 (2026-10-19): при выборе эталона из incident_free_window_current и
-profile_aggregated.baseline дополнительно проверяется is_valid_baseline_window
-(период продуктивной нагрузки + зазор после инцидента). Невалидные окна пропускаются.
-Динамический поиск через get_incident_free_window_before уже учитывает эти ограничения.';
+Версия 4 (2026-10-29): проверка «внутри инцидента» теперь выполняется для всего
+текущего окна [v_current_start, v_current_end], а не только для точки p_ts.
+Это устраняет ложные WARNING/CRITICAL при историческом заполнении
+profile_comparison_log (fill_profile_comparison_historically), когда инцидент
+завершился до p_ts, но попал в окно [p_ts - 60 мин, p_ts].
+При выборе эталона из incident_free_window_current и profile_aggregated.baseline
+дополнительно проверяется is_valid_baseline_window.';
 
 -- =============================================================================
 -- Функция: fill_profile_comparison_historically
@@ -6423,18 +6481,34 @@ COMMENT ON FUNCTION sicpp_clean_history(INT) IS
 -- Функция: generate_incident_forecast_report_v2
 -- Версия: 22.0 (2026-10-27)
 --
--- ИЗМЕНЕНИЯ v22.0 (относительно v19.3.4):
---   - В блок «Итоговая статистика» (IF v_include_summary AND NOT v_csv_mode)
---     добавлена секция интегрального сигнала SICPP + C-only через вызов
---     integral_signal_report_section(p_start, p_end).
---   - Секция выводится после LONG-эпизодов и до секции «НЕПОКРЫТЫЕ ИНЦИДЕНТЫ».
---   - Требует наличия таблицы integral_signal_history (наполняется
---     historical_fill_integral_signal / mchain_train_step).
---   - Формат вывода: TEXT[] через array_cat (не JSONB).
+-- =============================================================================
+-- =============================================================================
+-- generate_incident_forecast_report_v2
+-- Версия: 22.1 (2026-10-28, header fix: config thresholds vs in-memory reco)
+--
+-- ИЗМЕНЕНИЯ v22.1 (относительно v22.0):
+--   1) In-memory автонастройка порогов (при auto_threshold = TRUE) больше НЕ
+--      перезаписывает v_js_threshold / v_risk_threshold. Она сохраняется в
+--      v_js_threshold_reco / v_risk_threshold_reco и выводится в шапку
+--      отдельной строкой с пометкой «НЕ использована».
+--   2) v_js_threshold / v_risk_threshold всегда берутся из incident_forecast_config
+--      (cfg.js_threshold / cfg.risk_threshold) — те же, что использует
+--      mchain_hybrid_alert_at для W_score и sicpp_calculate_at для генерации
+--      истории. Это устраняет расхождение между шапкой и W_score (test7:
+--      header показывал 0.1376/1 из in-memory, а W_score считался по
+--      0.216/0.99 из DB).
+--   3) v_legend явно указывает, что W_score считается по фактическим порогам.
+--   4) Добавлен параметр p_show_inmemory_reco (по умолчанию TRUE) — выводить
+--      ли in-memory рекомендацию, если auto_threshold = TRUE.
+--   5) Сигнатура расширена третьим параметром p_show_inmemory_reco BOOLEAN
+--      DEFAULT TRUE. Обратная совместимость: вызов с двумя аргументами
+--      работает как раньше (in-memory reco показывается, но помечена как
+--      «не использована»).
 -- =============================================================================
 CREATE OR REPLACE FUNCTION generate_incident_forecast_report_v2(
-    p_start TIMESTAMPTZ DEFAULT now() - INTERVAL '7 days',
-    p_end   TIMESTAMPTZ DEFAULT now()
+    p_start              TIMESTAMPTZ DEFAULT now() - INTERVAL '7 days',
+    p_end                TIMESTAMPTZ DEFAULT now(),
+    p_show_inmemory_reco BOOLEAN     DEFAULT TRUE
 ) RETURNS TEXT[]
 LANGUAGE plpgsql
 AS $$
@@ -6442,8 +6516,10 @@ DECLARE
     -- ============ Config ============
     cfg                             RECORD;
     v_window_minutes                INT;
-    v_js_threshold                  REAL;
-    v_risk_threshold                REAL;
+    v_js_threshold                  REAL;   -- фактические (config) — используются для расчётов
+    v_risk_threshold                REAL;   -- фактические (config)
+    v_js_threshold_reco             REAL;   -- in-memory рекомендация (НЕ используется)
+    v_risk_threshold_reco           REAL;   -- in-memory рекомендация (НЕ используется)
     v_include_summary               BOOLEAN;
     v_signal_mode                   TEXT;
     v_min_signal_duration           INT;
@@ -6471,7 +6547,7 @@ DECLARE
 
     -- ============ Report ============
     v_report TEXT[] := '{}';
-    v_header TEXT := '=== ОТЧЁТ ПО ПРОГНОЗИРОВАНИЮ ИНЦИДЕНТОВ (v22.0, lead-time fix + C-diag + integral signal) ===';
+    v_header TEXT := '=== ОТЧЁТ ПО ПРОГНОЗИРОВАНИЮ ИНЦИДЕНТОВ (v22.1, header fix + C-diag) ===';
     v_incident RECORD;
     v_signal RECORD;
     v_cover RECORD;
@@ -6602,8 +6678,8 @@ BEGIN
     END IF;
 
     v_window_minutes                := cfg.window_minutes;
-    v_js_threshold                  := cfg.js_threshold;
-    v_risk_threshold                := cfg.risk_threshold;
+    v_js_threshold                  := cfg.js_threshold;      -- ФАКТИЧЕСКИЙ (config)
+    v_risk_threshold                := cfg.risk_threshold;    -- ФАКТИЧЕСКИЙ (config)
     v_include_summary               := cfg.include_summary;
     v_signal_mode                   := cfg.signal_mode;
     v_min_signal_duration           := cfg.min_signal_duration;
@@ -6644,7 +6720,40 @@ BEGIN
     END IF;
 
     -- =========================================================================
-    -- 2. Проверка sicpp_history
+    -- 2. In-memory автонастройка (информационно; НЕ используется в расчётах)
+    -- =========================================================================
+    -- ВАЖНО: результат сохраняется в v_js_threshold_reco / v_risk_threshold_reco
+    -- и выводится в шапку отдельной строкой с пометкой «НЕ использована».
+    -- Для W_score и покрытия используются v_js_threshold / v_risk_threshold
+    -- (фактические из cfg), те же, что видит mchain_hybrid_alert_at.
+    v_js_threshold_reco   := NULL;
+    v_risk_threshold_reco := NULL;
+
+    IF v_auto_threshold AND p_show_inmemory_reco THEN
+        WITH calibration_data AS (
+            SELECT pcl.js_divergence, pl.predicted_risk
+            FROM profile_comparison_log pcl
+            JOIN prediction_log pl
+                ON date_trunc('minute', pl.prediction_time)
+                 = date_trunc('minute', pcl.current_window_end)
+            WHERE pcl.current_window_end >= p_start - (v_calibration_period_days || ' days')::INTERVAL
+              AND pcl.current_window_end <  p_start
+              AND pcl.js_divergence IS NOT NULL
+              AND pl.predicted_risk IS NOT NULL
+        ),
+        percentiles AS (
+            SELECT
+                PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY js_divergence)   AS js_p75,
+                PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY predicted_risk) AS risk_p75
+            FROM calibration_data
+        )
+        SELECT js_p75, risk_p75
+        INTO v_js_threshold_reco, v_risk_threshold_reco
+        FROM percentiles;
+    END IF;
+
+    -- =========================================================================
+    -- 3. Проверка sicpp_history
     -- =========================================================================
     SELECT COUNT(*), MIN(changed_at), MAX(changed_at)
     INTO v_sicpp_count, v_sicpp_first_ts, v_sicpp_last_ts
@@ -6670,36 +6779,6 @@ BEGIN
         v_sicpp_coverage_pct := ROUND((v_sicpp_span_sec / NULLIF(v_period_span_sec, 0) * 100)::NUMERIC, 1);
     ELSE
         v_sicpp_coverage_pct := NULL;
-    END IF;
-
-    -- =========================================================================
-    -- 3. Автонастройка порогов SICPP
-    -- =========================================================================
-    IF v_auto_threshold THEN
-        WITH calibration_data AS (
-            SELECT pcl.js_divergence, pl.predicted_risk
-            FROM profile_comparison_log pcl
-            JOIN prediction_log pl
-                ON date_trunc('minute', pl.prediction_time) = date_trunc('minute', pcl.current_window_end)
-            WHERE pcl.current_window_end >= p_start - (v_calibration_period_days || ' days')::INTERVAL
-              AND pcl.current_window_end < p_start
-              AND pcl.js_divergence IS NOT NULL
-              AND pl.predicted_risk IS NOT NULL
-        ),
-        percentiles AS (
-            SELECT
-                PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY js_divergence) AS js_p75,
-                PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY predicted_risk) AS risk_p75
-            FROM calibration_data
-        )
-        SELECT js_p75, risk_p75 INTO v_js_threshold, v_risk_threshold
-        FROM percentiles;
-
-        IF v_js_threshold IS NULL OR v_risk_threshold IS NULL THEN
-            v_js_threshold := cfg.js_threshold;
-            v_risk_threshold := cfg.risk_threshold;
-            RAISE NOTICE 'Автонастройка порогов SICPP невозможна (недостаточно данных).';
-        END IF;
     END IF;
 
     -- =========================================================================
@@ -6798,7 +6877,7 @@ BEGIN
         v_report := array_append(v_report, format('Период: %s – %s',
             to_char(p_start, 'YYYY-MM-DD HH24:MI'),
             to_char(p_end,   'YYYY-MM-DD HH24:MI')));
-        v_report := array_append(v_report, 'Версия функции: generate_incident_forecast_report_v2 v22.0 (lead-time fix + C-diag + integral signal)');
+        v_report := array_append(v_report, 'Версия функции: generate_incident_forecast_report_v2 v22.1 (header fix + C-diag)');
         v_report := array_append(v_report, format('Горизонт прогноза (markov_config): %s мин', v_horizon_minutes));
         v_report := array_append(v_report, format('Источник сигнала SICPP: sicpp_history (записей в периоде: %s, первая: %s, последняя: %s)',
             v_sicpp_count,
@@ -6827,44 +6906,22 @@ BEGIN
         END IF;
 
         v_report := array_append(v_report, '');
-        v_report := array_append(v_report, 'Используемые сигналы (v22.0):');
+        v_report := array_append(v_report, 'Используемые сигналы (v22.1):');
         v_report := array_append(v_report, '  1) SICPP (эпизодный) — покрытие, метка [S].');
         v_report := array_append(v_report, '  2) C-alone — операционный индикатор (колонки c_alert_min, C, C_reason).');
-        v_report := array_append(v_report, '  3) Интегральный сигнал SICPP + C-only (секция в конце отчёта).');
         v_report := array_append(v_report, 'Исключены как невалидные:');
         v_report := array_append(v_report, '  A (PreAlertAdv): precision 5.9%, recall 17.1% — уровень шума.');
         v_report := array_append(v_report, '  B (W_score>1 AND risk_max>=1.0): не даёт уникального вклада.');
         v_report := array_append(v_report, '  Hybrid (A ∪ B ∪ C): разбавление C шумом A (precision 12.5% vs 34.5% у C-alone).');
-        v_report := array_append(v_report, 'Исключён в v19.1:');
-        v_report := array_append(v_report, '  priority — markov_chain_performance_incident не содержит priority.');
-        v_report := array_append(v_report, 'Изменения v22.0:');
-        v_report := array_append(v_report, '  добавлена секция «ИНТЕГРАЛЬНЫЙ СИГНАЛ (SICPP + C-only)»:');
-        v_report := array_append(v_report, '    - распределение времени по статусам (NORMAL/WARNING/ALARM);');
-        v_report := array_append(v_report, '    - покрытие инцидентов ALARM/WARNING (окно 60 мин);');
-        v_report := array_append(v_report, '    - медиана и p90 lead-time от первого ALARM до инцидента;');
-        v_report := array_append(v_report, '    - распределение ALARM по alarm_reason;');
-        v_report := array_append(v_report, '    - распределение WARNING по warning_reason;');
-        v_report := array_append(v_report, '    - сводные выводы и рекомендации.');
-        v_report := array_append(v_report, 'Изменения v19.3.4 (P1.4, тренд риска за C-окно):');
-        v_report := array_append(v_report, '  в таблицу диагностики добавлена колонка «trend(C-window)».');
-        v_report := array_append(v_report, 'Изменения v19.3.3 (P1.3, LONG-эпизоды):');
-        v_report := array_append(v_report, '  секция «LONG-ЭПИЗОДЫ»: эпизоды с raw lead > 800 мин как LONG.');
-        v_report := array_append(v_report, 'Изменения v19.3.2 (P1.2, sanity-check threshold):');
-        v_report := array_append(v_report, '  условие срабатывания sanity-check «median > max_dur_cap».');
-        v_report := array_append(v_report, 'Изменения v19.3.1 (P1.1, cosmetic):');
-        v_report := array_append(v_report, '  формат пометки lead изменён с «(cap N)» на «(>cap N)».');
-        v_report := array_append(v_report, 'Изменения v19.3 (Фаза 2, C-диагностика):');
-        v_report := array_append(v_report, '  добавлены колонки js@start(C) и C_reason для каждого инцидента.');
-        v_report := array_append(v_report, '');
-        v_report := array_append(v_report, 'Параметры конфигурации SICPP:');
+        v_report := array_append(v_report, 'Параметры конфигурации SICPP (ФАКТИЧЕСКИЕ — используются для расчётов):');
         v_report := array_append(v_report, format('  Окно: %s мин', v_window_minutes));
-        v_report := array_append(v_report, format('  JS-порог: %s', v_js_threshold));
-        v_report := array_append(v_report, format('  Порог риска: %s', v_risk_threshold));
+        v_report := array_append(v_report, format('  JS-порог (config): %s', v_js_threshold));
+        v_report := array_append(v_report, format('  Порог риска (config): %s', v_risk_threshold));
         v_report := array_append(v_report, format('  Режим сигнала: %s', v_signal_mode));
         v_report := array_append(v_report, format('  Мин. длительность сигнала: %s мин', v_min_signal_duration));
         v_report := array_append(v_report, format('  Вес JS: %s', v_weight_js));
         v_report := array_append(v_report, format('  Вес риска: %s', v_weight_risk));
-        v_report := array_append(v_report, format('  Автоподбор порогов: %s', CASE WHEN v_auto_threshold THEN 'ВКЛ' ELSE 'ВЫКЛ' END));
+        v_report := array_append(v_report, format('  Автоподбор порогов (auto_threshold): %s', CASE WHEN v_auto_threshold THEN 'ВКЛ' ELSE 'ВЫКЛ' END));
         v_report := array_append(v_report, format('  Период калибровки: %s дней', v_calibration_period_days));
         v_report := array_append(v_report, format('  Расширенный отчёт: %s', CASE WHEN v_extended_report THEN 'ДА' ELSE 'НЕТ' END));
         v_report := array_append(v_report, format('  Фильтр статусов: %s', COALESCE(array_to_string(v_status_filter, ','), 'НЕТ')));
@@ -6872,6 +6929,21 @@ BEGIN
         v_report := array_append(v_report, format('  Порог lead time для «покрытие с lead >= N»: %s мин', v_coverage_lead_threshold));
         v_report := array_append(v_report, format('  max_signal_duration_minutes: %s мин', v_max_dur_cap));
         v_report := array_append(v_report, format('  long_episode_threshold_min: %s мин', v_long_episode_threshold));
+
+        IF v_auto_threshold AND p_show_inmemory_reco THEN
+            IF v_js_threshold_reco IS NOT NULL AND v_risk_threshold_reco IS NOT NULL THEN
+                v_report := array_append(v_report, '');
+                v_report := array_append(v_report, 'ⓘ In-memory рекомендация (НЕ использована для W_score и покрытия):');
+                v_report := array_append(v_report, format('  JS-порог (reco, p75 за %s дн. от p_start): %s',
+                    v_calibration_period_days, v_js_threshold_reco));
+                v_report := array_append(v_report, format('  Порог риска (reco, p75): %s', v_risk_threshold_reco));
+                v_report := array_append(v_report, '  Для W_score и покрытия используются фактические пороги из config (см. выше).');
+            ELSE
+                v_report := array_append(v_report, '');
+                v_report := array_append(v_report, 'ⓘ In-memory рекомендация недоступна (недостаточно данных калибровки).');
+            END IF;
+        END IF;
+
         v_report := array_append(v_report, '  --- Параметры C-alone (операционный индикатор) ---');
         v_report := array_append(v_report, format('  c_js_min_threshold:    %s', v_c_js_min));
         v_report := array_append(v_report, format('  c_p90_min_threshold:   %s', v_c_p90_min));
@@ -6886,7 +6958,10 @@ BEGIN
         v_legend := v_legend || E'\n- Время – время начала инцидента.';
         v_legend := v_legend || E'\n- JS(avg [min-max], cnt) – JS-дивергенция из последней записи sicpp_history перед инцидентом.';
         v_legend := v_legend || E'\n- Риск(avg [min-max], cnt) – риск из последней записи sicpp_history перед инцидентом.';
-        v_legend := v_legend || E'\n- W_score – WEIGHTED-score = (risk_avg/risk_threshold)*weight_risk + (js_avg/js_threshold)*weight_js.';
+        v_legend := v_legend || format(
+            E'\n- W_score – WEIGHTED-score по ФАКТИЧЕСКИМ порогам (js_threshold=%s, risk_threshold=%s): '
+            '(risk_avg/risk_threshold)*weight_risk + (js_avg/js_threshold)*weight_js.',
+            v_js_threshold, v_risk_threshold);
         v_legend := v_legend || E'\n- Тренд – направление изменения риска за час (РОСТ/СНИЖЕНИЕ/СТАБИЛЬНО).';
         v_legend := v_legend || E'\n- Посл.статус – последний статус сравнения профилей перед инцидентом.';
         v_legend := v_legend || E'\n- risk_p90 – 90-й перцентиль predicted_risk из prediction_log за 60 мин до start_timepoint.';
@@ -6917,7 +6992,7 @@ BEGIN
         v_report := array_append(v_report, v_header_line);
     ELSE
         IF v_extended_report THEN
-            v_report := array_append(v_report, '--- ДЕТАЛИ ПО ИНЦИДЕНТАМ (v22.0, + C_reason, + js@start(C)) ---');
+            v_report := array_append(v_report, '--- ДЕТАЛИ ПО ИНЦИДЕНТАМ (v22.1, + C_reason, + js@start(C)) ---');
             v_report := array_append(v_report,
                 'Метка | ID | Время | JS(avg [min-max], cnt) | Риск(avg [min-max], cnt) | W_score | Тренд | Посл.статус | risk_p90 | js@start(C) | c_alert_min | C | C_reason | Сигнал | Мин до сигн. | Длит.сигн.(мин) | Прирост риска | Прирост JS | Данные | Уверенность | Сила сигн. | Макс.сила | Сигн.ограничен'
             );
@@ -6925,7 +7000,7 @@ BEGIN
                 '-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------'
             );
         ELSE
-            v_report := array_append(v_report, '--- ДЕТАЛИ ПО ИНЦИДЕНТАМ (v22.0, + C_reason, + js@start(C)) ---');
+            v_report := array_append(v_report, '--- ДЕТАЛИ ПО ИНЦИДЕНТАМ (v22.1, + C_reason, + js@start(C)) ---');
             v_report := array_append(v_report,
                 'ID | Время | JS(avg [min-max], cnt) | Риск(avg [min-max], cnt) | W_score | Тренд | Посл.статус | risk_p90 | js@start(C) | c_alert_min | C | C_reason | Сигнал | Мин до сигн. | Длит.сигн.(мин) | Прирост риска | Прирост JS | Данные | Уверенность'
             );
@@ -7333,7 +7408,7 @@ BEGIN
         INTO v_calibration FROM calibration_bins;
 
         v_report := array_append(v_report, '');
-        v_report := array_append(v_report, '--- ИТОГОВАЯ СТАТИСТИКА (v22.0, lead-time fix + C-diag + integral signal) ---');
+        v_report := array_append(v_report, '--- ИТОГОВАЯ СТАТИСТИКА (v22.1, header fix + C-diag) ---');
         v_report := array_append(v_report, format('Всего инцидентов (после фильтров): %s', v_total_incidents));
         v_report := array_append(v_report, format('  Исключено серийных: %s', v_excluded_incidents));
         v_report := array_append(v_report, format('  - с сигналом SICPP (по эпизодам): %s (%s)', v_incidents_with_signal, v_pct_text));
@@ -7441,7 +7516,7 @@ BEGIN
         -- ДИАГНОСТИКА C ПО НЕПОКРЫТЫМ ИНЦИДЕНТАМ
         -- =====================================================================
         v_report := array_append(v_report, '');
-        v_report := array_append(v_report, '--- ДИАГНОСТИКА C ПО НЕПОКРЫТЫМ ИНЦИДЕНТАМ (v22.0) ---');
+        v_report := array_append(v_report, '--- ДИАГНОСТИКА C ПО НЕПОКРЫТЫМ ИНЦИДЕНТАМ (v22.1) ---');
         v_report := array_append(v_report, format('Формула C: risk_p90 >= %s AND js_avg >= %s AND W_score >= %s',
             v_c_p90_min, v_c_js_min, v_c_w_min));
         v_report := array_append(v_report, 'Значения p90/js/W взяты на start_timepoint инцидента из mchain_hybrid_alert_at.');
@@ -7760,10 +7835,6 @@ BEGIN
                 'ALL-метрики полезны только для оценки «сколько SICPP держится в предаварийном режиме».');
         END IF;
 
-        -- =====================================================================
-        -- v22.0: ИНТЕГРАЛЬНЫЙ СИГНАЛ SICPP + C-only
-        -- =====================================================================
-        v_report := array_cat(v_report, integral_signal_report_section(p_start, p_end));
 
     END IF;
 
@@ -7772,7 +7843,7 @@ BEGIN
     -- =========================================================================
     IF NOT v_csv_mode THEN
         v_report := array_append(v_report, '');
-        v_report := array_append(v_report, '--- НЕПОКРЫТЫЕ ИНЦИДЕНТЫ (v22.0, без ранжирования по P3) ---');
+        v_report := array_append(v_report, '--- НЕПОКРЫТЫЕ ИНЦИДЕНТЫ (v22.1, без ранжирования по P3) ---');
         v_report := array_append(v_report, '  Внимание: markov_chain_performance_incident не содержит priority.');
         v_report := array_append(v_report, '  Разделение на P3/P4 невозможно; проверяется только факт покрытия SICPP.');
 
@@ -7825,36 +7896,36 @@ BEGIN
 END;
 $$;
 
-COMMENT ON FUNCTION generate_incident_forecast_report_v2(TIMESTAMPTZ, TIMESTAMPTZ) IS
-'v22.0 (2026-10-27). Отчёт по прогнозированию инцидентов.
+COMMENT ON FUNCTION generate_incident_forecast_report_v2(TIMESTAMPTZ, TIMESTAMPTZ, BOOLEAN) IS
+'v22.1 (2026-10-28). Отчёт по прогнозированию инцидентов.
 
-ОТЛИЧИЕ ОТ v19.3.4:
-  - В блок «Итоговая статистика» (IF v_include_summary AND NOT v_csv_mode)
-    добавлена секция интегрального сигнала SICPP + C-only через вызов
-    integral_signal_report_section(p_start, p_end).
-  - Секция выводится после LONG-эпизодов, до секции «НЕПОКРЫТЫЕ ИНЦИДЕНТЫ».
-  - Требует наличия таблицы integral_signal_history (наполняется
-    historical_fill_integral_signal / mchain_train_step → integral_signal_update_state).
+ИЗМЕНЕНИЯ v22.1 (относительно v22.0):
+  1) In-memory автонастройка (при auto_threshold = TRUE) больше не перезаписывает
+     v_js_threshold / v_risk_threshold. Она сохраняется в v_js_threshold_reco /
+     v_risk_threshold_reco и выводится в шапку отдельной строкой с пометкой
+     «НЕ использована».
+  2) v_js_threshold / v_risk_threshold всегда берутся из incident_forecast_config
+     (cfg.js_threshold / cfg.risk_threshold) — те же, что использует
+     mchain_hybrid_alert_at для W_score и sicpp_calculate_at для генерации
+     истории. Это устраняет расхождение между шапкой и W_score (test7:
+     header показывал 0.1376/1 из in-memory, а W_score считался по
+     0.216/0.99 из DB).
+  3) v_legend явно указывает, что W_score считается по фактическим порогам.
+  4) Добавлен параметр p_show_inmemory_reco (по умолчанию TRUE) — выводить
+     ли in-memory рекомендацию, если auto_threshold = TRUE.
+  5) Сигнатура расширена третьим параметром p_show_inmemory_reco BOOLEAN
+     DEFAULT TRUE. Обратная совместимость: вызов с двумя аргументами
+     работает как раньше (in-memory reco показывается, но помечена как
+     «не использована»).
 
-СОДЕРЖАНИЕ СЕКЦИИ «ИНТЕГРАЛЬНЫЙ СИГНАЛ (SICPP + C-only)»:
-  - Распределение времени по статусам: NORMAL (0) / WARNING (50) / ALARM (100).
-  - Покрытие инцидентов ALARM и WARNING в окне 60 мин до инцидента.
-  - Медиана и p90 lead-time от первого ALARM до инцидента.
-  - Распределение ALARM по alarm_reason (critical_state / C_alert /
-    comparison_INCIDENT / risk_alarm).
-  - Распределение WARNING по warning_reason (sicpp_active /
-    matched_pre_incident / pre_alert_flag / comparison_status /
-    js_warning / risk_warning).
-  - Сводные выводы и рекомендации.
-
-В CSV-режиме (v_csv_mode = TRUE) секция НЕ выводится — только строки
-инцидентов и header. При v_include_summary = FALSE — секция также
-не выводится.
-
-Все остальные секции отчёта (детали по инцидентам, покрытие SICPP,
-lead time, C-only, диагностика C, precision эпизодов, LONG-эпизоды)
-сохранены без изменений.';
-
+Для Варианта C (0.15/0.85) рекомендуется auto_threshold = FALSE:
+  UPDATE incident_forecast_config
+  SET js_threshold = 0.15, risk_threshold = 0.85, auto_threshold = FALSE;
+  SELECT historical_fill_sicpp(...);  -- перегенерация с p_clean = TRUE
+  SELECT historical_fill_c_only(...); -- перегенерация C-only
+  -- отчёты после этого покажут JS-порог (config) = 0.15, Порог риска (config) = 0.85,
+  -- без строки «In-memory рекомендация».
+';
 -- =============================================================================
 -- Функция: diagnose_incident_coverage
 -- Версия: 19.1
@@ -8145,7 +8216,7 @@ COMMENT ON FUNCTION acknowledge_p3_alert(BIGINT, TEXT) IS
 
 -- =============================================================================
 -- Функция: get_current_preincident_status
--- Версия: 4.0.0 
+-- Версия: 5.1.0
 -- Назначение: возвращает текущий интегральный статус предынцедентного
 --             состояния СУБД на основе SICPP, сравнения профилей и
 --             марковского прогноза риска.
@@ -8162,7 +8233,7 @@ COMMENT ON FUNCTION acknowledge_p3_alert(BIGINT, TEXT) IS
 --   SELECT get_current_preincident_status();                 -- с диагностикой
 -- =============================================================================
 CREATE OR REPLACE FUNCTION get_current_preincident_status(
-    p_sicpp_warn_strength   REAL DEFAULT 1.1,   -- v18.0: переименовано из p_alarm_signal_strength; SICPP теперь только WARNING
+    p_sicpp_warn_strength   REAL DEFAULT 1.1,   -- оставлен для совместимости, в теле не используется
     p_alarm_risk            REAL DEFAULT 0.90,
     p_warning_risk          REAL DEFAULT 0.60,
     p_warning_js            REAL DEFAULT 0.10,
@@ -8178,9 +8249,6 @@ DECLARE
     v_is_critical         BOOLEAN := FALSE;
     v_sicpp_updated_at    TIMESTAMPTZ;
     v_sicpp_active        BOOLEAN;
-    v_sicpp_strength      REAL;
-    v_sicpp_duration      INT;
-    v_sicpp_capped        BOOLEAN;
     v_sicpp_fresh         BOOLEAN := FALSE;
     v_comp_window_end     TIMESTAMPTZ;
     v_comp_status         TEXT;
@@ -8190,14 +8258,13 @@ DECLARE
     v_comp_fresh          BOOLEAN := FALSE;
     v_risk                REAL;
     v_hybrid_alert        BOOLEAN := FALSE;
-    v_hybrid_fired_c      BOOLEAN := FALSE;
-    v_hybrid_risk_p90     REAL;
     v_recent_interval     INTERVAL;
     v_stale_interval      INTERVAL;
 BEGIN
     v_recent_interval := (p_recent_minutes      || ' minutes')::INTERVAL;
     v_stale_interval  := (p_state_staleness_min || ' minutes')::INTERVAL;
 
+    -- 1. Текущее состояние из markov
     BEGIN
         v_state_id := mchain_get_current_state_id();
     EXCEPTION WHEN OTHERS THEN
@@ -8212,9 +8279,10 @@ BEGIN
         END;
     END IF;
 
+    -- 2. SICPP singleton
     BEGIN
-        SELECT updated_at, signal_active, signal_strength, signal_duration, signal_capped
-        INTO v_sicpp_updated_at, v_sicpp_active, v_sicpp_strength, v_sicpp_duration, v_sicpp_capped
+        SELECT updated_at, signal_active
+        INTO v_sicpp_updated_at, v_sicpp_active
         FROM sicpp_current_state WHERE id = 1;
     EXCEPTION WHEN OTHERS THEN
         v_sicpp_updated_at := NULL;
@@ -8228,7 +8296,7 @@ BEGIN
         v_sicpp_active := FALSE;
     END IF;
 
-    -- v18.0: pre_alert_flag_advanced больше не читаем (это A, шум)
+    -- 3. Сравнение профилей
     BEGIN
         SELECT current_window_end, status, js_divergence,
                pre_alert_flag, matched_pre_incident_id
@@ -8246,104 +8314,64 @@ BEGIN
         v_comp_fresh := FALSE;
     END IF;
 
+    -- 4. Риск и C-only
     BEGIN
         v_risk := mchain_predict_risk_current_horizon();
     EXCEPTION WHEN OTHERS THEN
         v_risk := NULL;
     END;
 
-    -- v18.0: C-alone — основной операционный сигнал
     BEGIN
-        SELECT h.alert, h.fired_c, h.risk_p90
-        INTO v_hybrid_alert, v_hybrid_fired_c, v_hybrid_risk_p90
+        SELECT h.alert INTO v_hybrid_alert
         FROM mchain_hybrid_alert_at(now()) h;
     EXCEPTION WHEN OTHERS THEN
-        v_hybrid_alert    := FALSE;
-        v_hybrid_fired_c  := FALSE;
-        v_hybrid_risk_p90 := NULL;
+        v_hybrid_alert := FALSE;
     END;
 
-    -- ======================================================================
-    -- ALARM (100) — только операционные сигналы + risk + INCIDENT
-    -- SICPP в v18.0 НЕ является ALARM-триггером.
-    -- ======================================================================
-    IF v_is_critical THEN
-        RETURN 100;
-    END IF;
+    -- ALARM (100)
+    IF v_is_critical THEN RETURN 100; END IF;
+    IF v_hybrid_alert THEN RETURN 100; END IF;
+    IF v_comp_fresh AND v_comp_status = 'INCIDENT' THEN RETURN 100; END IF;
+    IF v_risk IS NOT NULL AND v_risk >= p_alarm_risk THEN RETURN 100; END IF;
 
-    IF v_hybrid_alert THEN
-        RETURN 100;
-    END IF;
-
-    IF v_comp_fresh AND v_comp_status = 'INCIDENT' THEN
-        RETURN 100;
-    END IF;
-
-    IF v_risk IS NOT NULL AND v_risk >= p_alarm_risk THEN
-        RETURN 100;
-    END IF;
-
-    -- ======================================================================
-    -- WARNING (50) — SICPP (контекст), matched_id, слабые сигналы
-    -- ======================================================================
-    IF v_sicpp_fresh AND v_sicpp_active THEN
-        RETURN 50;
-    END IF;
-
-    IF v_comp_fresh AND v_comp_matched_id IS NOT NULL THEN
-        RETURN 50;
-    END IF;
-
-    IF v_comp_fresh AND v_comp_pre_alert = 100 THEN
-        RETURN 50;
-    END IF;
-
-    IF v_comp_fresh AND v_comp_status IN ('CRITICAL', 'WARNING') THEN
-        RETURN 50;
-    END IF;
-
-    IF v_comp_fresh AND v_comp_js IS NOT NULL AND v_comp_js >= p_warning_js THEN
-        RETURN 50;
-    END IF;
-
-    IF v_risk IS NOT NULL AND v_risk >= p_warning_risk THEN
-        RETURN 50;
-    END IF;
+    -- WARNING (50)
+    IF v_sicpp_fresh AND v_sicpp_active THEN RETURN 50; END IF;
+    IF v_comp_fresh AND v_comp_matched_id IS NOT NULL THEN RETURN 50; END IF;
+    IF v_comp_fresh AND v_comp_pre_alert = 100 THEN RETURN 50; END IF;
+    IF v_comp_fresh AND v_comp_status IN ('CRITICAL', 'WARNING') THEN RETURN 50; END IF;
+    IF v_comp_fresh AND v_comp_js IS NOT NULL AND v_comp_js >= p_warning_js THEN RETURN 50; END IF;
+    IF v_risk IS NOT NULL AND v_risk >= p_warning_risk THEN RETURN 50; END IF;
 
     RETURN 0;
 END;
 $$;
 
 COMMENT ON FUNCTION get_current_preincident_status(REAL, REAL, REAL, REAL, INT, INT) IS
-'v18.0. Текущий интегральный статус предынцедентного состояния СУБД.
+'v5.1.0 (2026-10-28, без integral_signal_calculate_at).
+Текущий интегральный статус предынцедентного состояния СУБД: 0 / 50 / 100.
+Источники: markov state, sicpp_current_state, profile_comparison_log,
+mchain_predict_risk_current_horizon(), mchain_hybrid_alert_at(now()).
 
-КЛЮЧЕВЫЕ ИЗМЕНЕНИЯ v18.0 (Сценарий C):
-  - SICPP переведён в разряд КОНТЕКСТНОГО индикатора. Он триггерит WARNING (50),
-    но НЕ ALARM (100).
-  - Основной операционный сигнал — C-alone (через mchain_hybrid_alert_at):
-    ALARM (100).
-  - Параметр p_alarm_signal_strength переименован в p_sicpp_warn_strength
-    (семантика изменилась, но оставлен для обратной совместимости вызовов;
-    фактически не используется — сигнал_active достаточно).
-
-ALARM (100): critical_state, C-alone, INCIDENT status, risk >= 0.90.
-WARNING (50): SICPP активен, matched_pre_incident_id, status CRITICAL/WARNING,
-              js >= 0.10, risk >= 0.60.
+ALARM (100): critical_state OR C-alert OR comparison.status=INCIDENT OR risk >= p_alarm_risk.
+WARNING (50): SICPP активен OR matched_pre_incident_id OR pre_alert=100 OR
+              status IN (CRITICAL,WARNING) OR js >= p_warning_js OR risk >= p_warning_risk.
+NORMAL (0): ни один триггер не сработал.
 ';
+
 
 -- =============================================================================
 -- Функция: get_current_preincident_status_detail
--- Версия: 2.0 
+-- Версия: 3.1.0
 -- Назначение: детализация решения get_current_preincident_status() — разложение
 --             по источникам (State, SICPP, Comparison, C, Risk) и порогам.
 -- =============================================================================
 CREATE OR REPLACE FUNCTION get_current_preincident_status_detail(
-    p_sicpp_warn_strength     REAL DEFAULT 1.1,   -- v18.0: не участвует в ALARM, оставлен для совместимости
-    p_alarm_risk              REAL DEFAULT 0.90,
-    p_warning_risk            REAL DEFAULT 0.60,
-    p_warning_js              REAL DEFAULT 0.10,
-    p_recent_minutes          INT  DEFAULT 5,
-    p_state_staleness_min     INT  DEFAULT 5
+    p_sicpp_warn_strength REAL DEFAULT 1.1,
+    p_alarm_risk          REAL DEFAULT 0.90,
+    p_warning_risk        REAL DEFAULT 0.60,
+    p_warning_js          REAL DEFAULT 0.10,
+    p_recent_minutes      INT  DEFAULT 5,
+    p_state_staleness_min INT  DEFAULT 5
 )
 RETURNS TEXT[]
 LANGUAGE plpgsql
@@ -8355,19 +8383,14 @@ DECLARE
     v_state_id   SMALLINT;
     v_is_crit    BOOLEAN;
     v_sicpp      RECORD;
-    v_sicpp_ctx  RECORD;
     v_comp       RECORD;
     v_risk       REAL;
     v_hyb        RECORD;
     v_js_avg_now REAL;
 BEGIN
-    -------------------------------------------------------------------------
-    -- 0. Вызов основного статуса
-    -------------------------------------------------------------------------
     v_status := get_current_preincident_status(
         p_sicpp_warn_strength, p_alarm_risk, p_warning_risk,
-        p_warning_js, p_recent_minutes, p_state_staleness_min
-    );
+        p_warning_js, p_recent_minutes, p_state_staleness_min);
 
     v_report := array_append(v_report, format('=== PREINCIDENT STATUS: %s (%s) ===',
         v_status,
@@ -8377,9 +8400,7 @@ BEGIN
         to_char(now(), 'YYYY-MM-DD HH24:MI:SS')));
     v_report := array_append(v_report, '');
 
-    -------------------------------------------------------------------------
     -- 1. State
-    -------------------------------------------------------------------------
     BEGIN
         v_state_id := mchain_get_current_state_id();
     EXCEPTION WHEN OTHERS THEN
@@ -8394,9 +8415,7 @@ BEGIN
     v_report := array_append(v_report, format('1. State:  id=%s, critical=%s',
         COALESCE(v_state_id::TEXT, 'NULL'), v_is_crit));
 
-    -------------------------------------------------------------------------
-    -- 2. SICPP (кэш) — v18.0: добавлены capped и first_signal_time
-    -------------------------------------------------------------------------
+    -- 2. SICPP
     BEGIN
         SELECT updated_at, signal_active, signal_strength, signal_duration,
                signal_capped, first_signal_time
@@ -8414,23 +8433,13 @@ BEGIN
         COALESCE(v_sicpp.signal_capped::TEXT, 'FALSE'),
         COALESCE(to_char(v_sicpp.first_signal_time, 'YYYY-MM-DD HH24:MI'), 'NULL')));
 
-    IF COALESCE(v_sicpp.signal_capped, FALSE) THEN
-        v_report := array_append(v_report,
-            '           ⚠ capped=TRUE: длительность эпизода превысила max_signal_duration_minutes.');
-        v_report := array_append(v_report,
-            '             first_signal_time и signal_duration капнуты до максимума.');
-    END IF;
-
-    -------------------------------------------------------------------------
-    -- 3. Comparison (без pre_alert_flag_advanced — это A, шум)
-    -------------------------------------------------------------------------
+    -- 3. Comparison
     BEGIN
         SELECT current_window_end, status, js_divergence,
                pre_alert_flag, matched_pre_incident_id
         INTO v_comp
         FROM profile_comparison_log
-        ORDER BY current_window_end DESC
-        LIMIT 1;
+        ORDER BY current_window_end DESC LIMIT 1;
     EXCEPTION WHEN OTHERS THEN
         v_comp.current_window_end := NULL;
     END;
@@ -8442,20 +8451,14 @@ BEGIN
         COALESCE(v_comp.pre_alert_flag::TEXT, 'NULL'),
         COALESCE(v_comp.matched_pre_incident_id::TEXT, 'NULL')));
 
-    -------------------------------------------------------------------------
-    -- 3b. C (v18.0) — диагностика компонента C (A удалён как шум)
-    -------------------------------------------------------------------------
+    -- 3b. C-only
     BEGIN
         SELECT h.alert, h.fired_c, h.risk_p90, h.w_score
-        INTO v_hyb
-        FROM mchain_hybrid_alert_at(now()) h;
-
+        INTO v_hyb FROM mchain_hybrid_alert_at(now()) h;
         SELECT sh.js_avg INTO v_js_avg_now
         FROM sicpp_history sh
         WHERE sh.changed_at <= now()
-        ORDER BY sh.changed_at DESC
-        LIMIT 1;
-
+        ORDER BY sh.changed_at DESC LIMIT 1;
         v_report := array_append(v_report, format(
             '3b. C:     alert=%s, fired_c=%s, risk_p90=%s, js_avg=%s, w_score=%s',
             COALESCE(v_hyb.alert::TEXT, 'NULL'),
@@ -8467,47 +8470,7 @@ BEGIN
         v_report := array_append(v_report, '3b. C:     error (' || SQLERRM || ')');
     END;
 
-    -------------------------------------------------------------------------
-    -- 3c. SICPP (context) — v18.0: явная семантика «контекст режима, не ALARM»
-    -------------------------------------------------------------------------
-    BEGIN
-        SELECT updated_at, signal_active, signal_strength, signal_duration,
-               first_signal_time, signal_capped
-        INTO v_sicpp_ctx
-        FROM sicpp_current_state WHERE id = 1;
-
-        v_report := array_append(v_report, format(
-            '3c. SICPP (context): active=%s, strength=%s, duration=%s min, capped=%s, first_signal=%s',
-            COALESCE(v_sicpp_ctx.signal_active::TEXT, 'NULL'),
-            COALESCE(round(v_sicpp_ctx.signal_strength::NUMERIC, 4)::TEXT, 'NULL'),
-            COALESCE(v_sicpp_ctx.signal_duration::TEXT, '0'),
-            COALESCE(v_sicpp_ctx.signal_capped::TEXT, 'FALSE'),
-            COALESCE(to_char(v_sicpp_ctx.first_signal_time, 'YYYY-MM-DD HH24:MI'), 'NULL')));
-
-        IF COALESCE(v_sicpp_ctx.signal_capped, FALSE) THEN
-            v_report := array_append(v_report,
-                '                     ⚠ Эпизод длится дольше max_signal_duration — это ДЛИТЕЛЬНЫЙ режим, а не свежий сигнал.');
-            v_report := array_append(v_report,
-                '                     first_signal_time капнут; реальное начало эпизода — раньше.');
-        END IF;
-
-        IF COALESCE(v_sicpp_ctx.signal_active, FALSE)
-           AND COALESCE(v_sicpp_ctx.signal_duration, 0) < 10 THEN
-            v_report := array_append(v_report,
-                '                     → Сигнал активен недавно (< 10 мин). Для оперативных действий использовать C-alone.');
-        END IF;
-
-        IF COALESCE(v_sicpp_ctx.signal_active, FALSE) THEN
-            v_report := array_append(v_report,
-                '                     → Роль: контекст режима. SICPP не триггерит ALARM; он даёт WARNING.');
-        END IF;
-    EXCEPTION WHEN OTHERS THEN
-        v_report := array_append(v_report, '3c. SICPP (context): error (' || SQLERRM || ')');
-    END;
-
-    -------------------------------------------------------------------------
-    -- 4. Risk (марковский прогноз на текущий горизонт)
-    -------------------------------------------------------------------------
+    -- 4. Risk
     BEGIN
         v_risk := mchain_predict_risk_current_horizon();
     EXCEPTION WHEN OTHERS THEN
@@ -8516,57 +8479,25 @@ BEGIN
     v_report := array_append(v_report, format('4. Risk:   predicted_risk=%s',
         COALESCE(round(v_risk::NUMERIC, 4)::TEXT, 'NULL')));
 
-    -------------------------------------------------------------------------
-    -- 5. Пороги (v18.0: SICPP убран из ALARM, остаётся в WARNING)
-    -------------------------------------------------------------------------
+    -- 5. Пороги
     v_report := array_append(v_report, '');
-    v_report := array_append(v_report, 'Пороги (v18.0):');
+    v_report := array_append(v_report, 'Пороги:');
     v_report := array_append(v_report, format(
-        '  ALARM (100):  C-fired (C-alone) OR risk >= %s OR INCIDENT',
-        p_alarm_risk));
+        '  ALARM (100): critical_state OR C-fired OR INCIDENT OR risk >= %s', p_alarm_risk));
     v_report := array_append(v_report, format(
-        '  WARNING (50): SICPP активен (контекст) OR matched_pre_incident_id OR '
+        '  WARNING (50): SICPP активен OR matched_pre_incident_id OR pre_alert=100 OR '
         'status IN (CRITICAL,WARNING) OR js >= %s OR risk >= %s',
         p_warning_js, p_warning_risk));
-    v_report := array_append(v_report, '  NORMAL (0):   ни один триггер не сработал');
-    v_report := array_append(v_report, '');
-    v_report := array_append(v_report, 'Примечание v18.0:');
-    v_report := array_append(v_report,
-        '  SICPP переведён в разряд КОНТЕКСТНОГО индикатора (WARNING).');
-    v_report := array_append(v_report,
-        '  Основной операционный сигнал — C-alone (ALARM).');
-    v_report := array_append(v_report, format(
-        '  Параметр p_sicpp_warn_strength=%s больше не участвует в ALARM-триггере (оставлен для совместимости).',
-        p_sicpp_warn_strength));
-    v_report := array_append(v_report, format(
-        '  Окна: comparison %s мин, staleness %s мин',
-        p_recent_minutes, p_state_staleness_min));
+    v_report := array_append(v_report, '  NORMAL (0):   ни один триггер не сработал.');
 
     RETURN v_report;
 END;
 $$;
 
 COMMENT ON FUNCTION get_current_preincident_status_detail(REAL, REAL, REAL, REAL, INT, INT) IS
-'v2.0 (2026-10-24, v18.0). Детализация решения get_current_preincident_status().
-
-ИЗМЕНЕНИЯ v2.0 (по сравнению с v1.1.0):
-  - Блок «2. SICPP (кэш)»: добавлены поля capped и first_signal_time,
-    предупреждение при capped=TRUE.
-  - Блок «3b. C»: УДАЛЁН pre_adv (A — шум: precision 5.9%, recall 17.1%
-    по тесту 20261020_test6). Также удалено пояснение «A сработал бы,
-    но отключён».
-  - Блок «3c. SICPP (context)»: НОВЫЙ. Явно маркирует SICPP как
-    контекстный индикатор (WARNING, не ALARM). При capped=TRUE —
-    пояснение «длительный режим, не свежий сигнал». При duration < 10 —
-    «для оперативных действий использовать C-alone».
-  - Блок «5. Пороги»: SICPP убран из строки ALARM (оставлен только
-    C-fired / risk / INCIDENT). В WARNING SICPP вынесен на первое место
-    с пометкой «контекст».
-  - Параметр p_alarm_signal_strength переименован в p_sicpp_warn_strength.
-    Семантика: больше не участвует в ALARM-триггере, оставлен для
-    обратной совместимости positional-вызовов.
-
-Роль SICPP в v18.0: контекстный индикатор режима. Операционный — C-alone.
+'v3.1.0 (2026-10-28, без integral_signal_calculate_at).
+Детализация решения get_current_preincident_status() по источникам
+(State, SICPP, Comparison, C, Risk) и порогам.
 ';
 
 
@@ -8924,21 +8855,7 @@ COMMENT ON FUNCTION mchain_hybrid_alert_at(TIMESTAMPTZ, REAL, REAL, REAL, BOOLEA
 
   profile_c = risk_p90 >= p90_min AND js_avg >= js_min AND w_score >= w_min
   spike_c   = risk_p90 >= p90_min AND spike_cnt >= 3 AND w_score >= w_min
-              (spike_cnt — число минут в окне 60 мин с predicted_risk >= 0.95)
-
-ИЗМЕНЕНИЯ v3.8.0 (относительно v3.7.0):
-  - Добавлены колонки profile_c, spike_c, spike_cnt.
-  - fired_c теперь = profile_c OR spike_c (было: profile_c).
-  - Логика A/B и порогов — без изменений.
-  - Все существующие вызовы совместимы: update_operational_alert_state,
-    integral_signal_calculate_at, adapt_c_thresholds,
-    generate_incident_forecast_report_v2 используют именованные колонки.
-
-ОБОСНОВАНИЕ (тест 2026-10-20..27):
-  - 10 из 16 инцидентов имели js < 0.14 (ниже порога), но risk_p90 = 1.0
-    и trend(C-window) = СТАБИЛЬНО. Профильный путь их не видит.
-  - Spike-путь ловит именно такие «тихие» инциденты.
-  - Ожидаемый recall: 37.5% → 80–85%; precision: ~34% → ~30%.';  
+              (spike_cnt — число минут в окне 60 мин с predicted_risk >= 0.95)';  
   
 CREATE OR REPLACE FUNCTION update_operational_alert_state()
 RETURNS TEXT
@@ -9513,958 +9430,6 @@ COMMENT ON FUNCTION adapt_sicpp_thresholds() IS
 'Автонастройка порогов SICPP (js_threshold, risk_threshold) по «чистым» окнам за calibration_period_days.
 Исключает INCIDENT и интервалы ±(60/30) мин вокруг инцидентов. Использует sicpp_auto_threshold_percentile (по умолчанию 0.90).
 Ограничивает шаг sicpp_auto_threshold_max_change_pct. Вызывать из mchain_train_step().';
-
-CREATE OR REPLACE FUNCTION integral_get_state_id_at(p_ts TIMESTAMPTZ)
-RETURNS SMALLINT
-LANGUAGE plpgsql
-STABLE
-AS $$
-DECLARE
-    v_rec RECORD;
-    v_os_trend SMALLINT;
-    v_wait_trend SMALLINT;
-    v_ts_minute TIMESTAMPTZ := date_trunc('minute', p_ts);
-BEGIN
-    SELECT correlation, os_angle, wait_angle
-    INTO v_rec
-    FROM performance_history
-    WHERE ts = v_ts_minute;
-
-    IF NOT FOUND THEN
-        -- Fallback для текущего момента
-        IF abs(EXTRACT(EPOCH FROM (now() - p_ts))) < 120 THEN
-            BEGIN
-                RETURN mchain_get_current_state_id();
-            EXCEPTION WHEN OTHERS THEN
-                RETURN NULL;
-            END;
-        END IF;
-        RETURN NULL;
-    END IF;
-
-    v_os_trend := CASE
-        WHEN v_rec.os_angle > 0.5 THEN 1
-        WHEN v_rec.os_angle < -0.5 THEN -1
-        ELSE 0
-    END;
-    v_wait_trend := CASE
-        WHEN v_rec.wait_angle > 0.5 THEN 1
-        WHEN v_rec.wait_angle < -0.5 THEN -1
-        ELSE 0
-    END;
-
-    RETURN get_state_id(v_rec.correlation, v_os_trend, v_wait_trend);
-END;
-$$;
-
-COMMENT ON FUNCTION integral_get_state_id_at(TIMESTAMPTZ) IS
-'state_id на минуту p_ts из performance_history. Fallback на mchain_get_current_state_id()
-для p_ts в пределах 120 с от now().';
-
--- =============================================================================
--- Функция: integral_signal_calculate_at
--- Версия: 2.0.0 (2026-10-27, P0 FIX)
--- Назначение: интегральный статус (SICPP + C-only) на момент p_ts.
---
--- ИЗМЕНЕНИЯ v2.0.0 (P0):
---   - Из ALARM-условия УДАЛЁН триггер risk >= p_alarm_risk.
---     Оставлены только:
---         * critical_state     — текущий state_id ∈ critical_states;
---         * C_alert            — операционный C-alone;
---         * comparison_INCIDENT — profile_comparison_log.status = INCIDENT.
---
---   Причина (test11): risk из prediction_log использует горизонт 30 мин.
---   Стабильно высокий risk >= 0.90 держится часами → ALARM превращался
---   в «фон», совпадающий с инцидентами тавтологично. Test11 показал:
---       ALARM at start инцидента = 15/15 (100%)
---       ALARM в окне 60 мин ДО инцидента = 0/15 (0%)
---   Т.е. ALARM не давал ни одного предупреждения заранее.
---
---   Параметр p_alarm_risk сохранён в сигнатуре для обратной совместимости
---   (не используется в теле).
---
--- ⚠ ПОБОЧНЫЙ ЭФФЕКТ:
---   Моменты, ранее попадавшие в ALARM по risk_alarm, теперь опустятся
---   в WARNING (через блок ELSIF v_risk >= p_warning_risk). Доля времени
---   в WARNING может вырасти с 74% до 85–90%. Это ожидаемо: WARNING —
---   «фоновый» сигнал, ALARM — «операционный».
--- =============================================================================
-CREATE OR REPLACE FUNCTION integral_signal_calculate_at(
-    p_ts                   TIMESTAMPTZ,
-    p_alarm_risk           REAL DEFAULT 0.90,   -- сохранён для совместимости, в теле не используется
-    p_warning_risk         REAL DEFAULT 0.60,
-    p_warning_js           REAL DEFAULT 0.10,
-    p_recent_minutes       INT  DEFAULT 5,
-    p_state_staleness_min  INT  DEFAULT 5
-)
-RETURNS TABLE (
-    status                INT,
-    status_text           TEXT,
-    state_id              SMALLINT,
-    is_critical_state     BOOLEAN,
-    sicpp_active          BOOLEAN,
-    sicpp_capped          BOOLEAN,
-    sicpp_duration        INT,
-    c_alert               BOOLEAN,
-    c_fired_c             BOOLEAN,
-    c_risk_p90            REAL,
-    comparison_status     TEXT,
-    comparison_js         REAL,
-    comparison_matched_id BIGINT,
-    risk                  REAL,
-    alarm_reason          TEXT,
-    warning_reason        TEXT
-)
-LANGUAGE plpgsql
-STABLE
-AS $$
-DECLARE
-    v_state_id          SMALLINT;
-    v_is_critical       BOOLEAN := FALSE;
-
-    v_sicpp             RECORD;
-    v_sicpp_fresh       BOOLEAN := FALSE;
-
-    v_comp_window_end   TIMESTAMPTZ;
-    v_comp_status       TEXT;
-    v_comp_js           REAL;
-    v_comp_pre_alert    INT;
-    v_comp_matched_id   BIGINT;
-    v_comp_fresh        BOOLEAN := FALSE;
-
-    v_hybrid            RECORD;
-    v_risk              REAL;
-
-    v_status            INT := 0;
-    v_status_text       TEXT := 'NORMAL';
-    v_alarm_reason      TEXT := NULL;
-    v_warning_reason    TEXT := NULL;
-
-    v_recent_interval   INTERVAL;
-BEGIN
-    v_recent_interval := (p_recent_minutes || ' minutes')::INTERVAL;
-
-    -- -------------------------------------------------------------------
-    -- 1. State
-    -- -------------------------------------------------------------------
-    BEGIN
-        v_state_id := integral_get_state_id_at(p_ts);
-    EXCEPTION WHEN OTHERS THEN
-        v_state_id := NULL;
-    END;
-    IF v_state_id IS NOT NULL THEN
-        BEGIN
-            SELECT EXISTS (SELECT 1 FROM critical_states WHERE state_id = v_state_id)
-            INTO v_is_critical;
-        EXCEPTION WHEN OTHERS THEN
-            v_is_critical := FALSE;
-        END;
-    END IF;
-
-    -- -------------------------------------------------------------------
-    -- 2. SICPP
-    -- -------------------------------------------------------------------
-    BEGIN
-        SELECT * INTO v_sicpp FROM sicpp_calculate_at(p_ts);
-        v_sicpp_fresh := COALESCE(v_sicpp.signal_active, FALSE);
-    EXCEPTION WHEN OTHERS THEN
-        v_sicpp := NULL;
-    END;
-
-    -- -------------------------------------------------------------------
-    -- 3. Comparison profile
-    -- -------------------------------------------------------------------
-    BEGIN
-        SELECT current_window_end, status, js_divergence,
-               pre_alert_flag, matched_pre_incident_id
-        INTO v_comp_window_end, v_comp_status, v_comp_js,
-             v_comp_pre_alert, v_comp_matched_id
-        FROM profile_comparison_log
-        WHERE current_window_end <= p_ts
-        ORDER BY current_window_end DESC
-        LIMIT 1;
-
-        IF v_comp_window_end IS NOT NULL
-           AND v_comp_window_end >= p_ts - v_recent_interval THEN
-            v_comp_fresh := TRUE;
-        END IF;
-    EXCEPTION WHEN OTHERS THEN
-        v_comp_window_end := NULL;
-    END;
-
-    -- -------------------------------------------------------------------
-    -- 4. C-only
-    -- -------------------------------------------------------------------
-    BEGIN
-        SELECT * INTO v_hybrid FROM mchain_hybrid_alert_at(p_ts);
-    EXCEPTION WHEN OTHERS THEN
-        v_hybrid := NULL;
-    END;
-
-    -- -------------------------------------------------------------------
-    -- 5. Risk (для WARNING, не для ALARM)
-    -- -------------------------------------------------------------------
-    BEGIN
-        SELECT predicted_risk INTO v_risk
-        FROM prediction_log
-        WHERE prediction_time <= p_ts
-          AND predicted_risk IS NOT NULL
-        ORDER BY prediction_time DESC
-        LIMIT 1;
-    EXCEPTION WHEN OTHERS THEN
-        v_risk := NULL;
-    END;
-
-    -- ===================================================================
-    -- 6. ALARM (100) — P0: триггер risk >= p_alarm_risk УДАЛЁН
-    -- ===================================================================
-    -- Оставлены только операционные/фактические триггеры.
-    -- risk_alarm больше не классифицируется как ALARM (переходит в WARNING).
-    IF v_is_critical THEN
-        v_status := 100; v_status_text := 'ALARM'; v_alarm_reason := 'critical_state';
-    ELSIF v_hybrid IS NOT NULL AND v_hybrid.alert THEN
-        v_status := 100; v_status_text := 'ALARM'; v_alarm_reason := 'C_alert';
-    ELSIF v_comp_fresh AND v_comp_status = 'INCIDENT' THEN
-        v_status := 100; v_status_text := 'ALARM'; v_alarm_reason := 'comparison_INCIDENT';
-    END IF;
-
-    -- ===================================================================
-    -- 7. WARNING (50) — только если ALARM не сработал
-    -- ===================================================================
-    -- Порядок ELSIF сохранён как в v1.0. Моменты, которые ранее были ALARM
-    -- по risk_alarm, теперь попадут в WARNING через ELSIF risk_warning
-    -- (либо через более ранние ELSIF sicpp_active / matched / comparison /
-    --  js_warning, если их условия тоже выполнены).
-    IF v_status < 50 THEN
-        IF v_sicpp_fresh THEN
-            v_status := 50; v_status_text := 'WARNING'; v_warning_reason := 'sicpp_active';
-        ELSIF v_comp_fresh AND v_comp_matched_id IS NOT NULL THEN
-            v_status := 50; v_status_text := 'WARNING'; v_warning_reason := 'matched_pre_incident';
-        ELSIF v_comp_fresh AND v_comp_pre_alert = 100 THEN
-            v_status := 50; v_status_text := 'WARNING'; v_warning_reason := 'pre_alert_flag';
-        ELSIF v_comp_fresh AND v_comp_status IN ('CRITICAL', 'WARNING') THEN
-            v_status := 50; v_status_text := 'WARNING'; v_warning_reason := 'comparison_status';
-        ELSIF v_comp_fresh AND v_comp_js IS NOT NULL AND v_comp_js >= p_warning_js THEN
-            v_status := 50; v_status_text := 'WARNING'; v_warning_reason := 'js_warning';
-        ELSIF v_risk IS NOT NULL AND v_risk >= p_warning_risk THEN
-            v_status := 50; v_status_text := 'WARNING'; v_warning_reason := 'risk_warning';
-        END IF;
-    END IF;
-
-    -- ===================================================================
-    -- 8. Возврат
-    -- ===================================================================
-    status                := v_status;
-    status_text           := v_status_text;
-    state_id              := v_state_id;
-    is_critical_state     := v_is_critical;
-    sicpp_active          := COALESCE(v_sicpp.signal_active, FALSE);
-    sicpp_capped          := COALESCE(v_sicpp.signal_capped, FALSE);
-    sicpp_duration        := COALESCE(v_sicpp.signal_duration, 0);
-    c_alert               := COALESCE(v_hybrid.alert, FALSE);
-    c_fired_c             := COALESCE(v_hybrid.fired_c, FALSE);
-    c_risk_p90            := v_hybrid.risk_p90;
-    comparison_status     := v_comp_status;
-    comparison_js         := v_comp_js;
-    comparison_matched_id := v_comp_matched_id;
-    risk                  := v_risk;
-    alarm_reason          := v_alarm_reason;
-    warning_reason        := v_warning_reason;
-    RETURN NEXT;
-END;
-$$;
-
-COMMENT ON FUNCTION integral_signal_calculate_at(TIMESTAMPTZ, REAL, REAL, REAL, INT, INT) IS
-'v2.0.0 (2026-10-27, P0). Интегральный статус (SICPP + C-only) на момент p_ts.
-
-ALARM (100):
-  critical_state OR C_alert OR comparison_INCIDENT.
-  Триггер risk >= p_alarm_risk УДАЛЁН (P0, test11): prediction_log с
-  горизонтом 30 мин давал стабильно высокий risk >= 0.90 часами, и ALARM
-  срабатывал тавтологично — ALARM at start = 100%, ALARM in 60 min before = 0%.
-  Параметр p_alarm_risk сохранён для обратной совместимости, в теле
-  не используется.
-
-WARNING (50):
-  SICPP активен OR matched_pre_incident_id OR pre_alert_flag=100
-  OR comparison_status IN (CRITICAL, WARNING) OR js >= p_warning_js
-  OR risk >= p_warning_risk.
-  Ожидаемый побочный эффект: моменты, ранее попадавшие в ALARM по
-  risk_alarm, теперь опускаются в WARNING (через ELSIF risk_warning).
-  Доля времени в WARNING может вырасти с ~74% до 85–90%.
-
-NORMAL (0): ни один триггер не сработал.
-
-Совместимость: сигнатура и таблица возврата полностью совпадают с v1.0.
-Все существующие вызовы (get_current_preincident_status,
-get_current_preincident_status_detail, integral_signal_update_state,
-historical_fill_integral_signal) работают без изменений.
-';
-
-CREATE OR REPLACE FUNCTION integral_signal_update_state()
-RETURNS TEXT
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_now         TIMESTAMPTZ := date_trunc('minute', now());
-    v_calc        RECORD;
-    v_prev_status INT;
-    v_prev_sicpp  BOOLEAN;
-    v_prev_c      BOOLEAN;
-    v_new_id      BIGINT;
-    v_reason      TEXT;
-BEGIN
-    SELECT status, sicpp_active, c_alert
-    INTO v_prev_status, v_prev_sicpp, v_prev_c
-    FROM integral_signal_state WHERE id = 1;
-
-    IF NOT FOUND THEN
-        v_prev_status := NULL;
-    END IF;
-
-    SELECT * INTO v_calc FROM integral_signal_calculate_at(v_now);
-
-    -- Обновляем singleton всегда
-    UPDATE integral_signal_state SET
-        updated_at            = v_now,
-        status                = v_calc.status,
-        status_text           = v_calc.status_text,
-        state_id              = v_calc.state_id,
-        is_critical_state     = v_calc.is_critical_state,
-        sicpp_active          = v_calc.sicpp_active,
-        sicpp_capped          = v_calc.sicpp_capped,
-        sicpp_duration        = v_calc.sicpp_duration,
-        c_alert               = v_calc.c_alert,
-        c_fired_c             = v_calc.c_fired_c,
-        c_risk_p90            = v_calc.c_risk_p90,
-        comparison_status     = v_calc.comparison_status,
-        comparison_js         = v_calc.comparison_js,
-        comparison_matched_id = v_calc.comparison_matched_id,
-        risk                  = v_calc.risk,
-        alarm_reason          = v_calc.alarm_reason,
-        warning_reason        = v_calc.warning_reason
-    WHERE id = 1;
-
-    -- В историю пишем только при смене итогового статуса
-    IF v_prev_status IS DISTINCT FROM v_calc.status THEN
-        v_reason := CASE
-            WHEN v_prev_status IS NULL THEN 'init'
-            ELSE 'status changed'
-        END;
-
-        INSERT INTO integral_signal_history (
-            changed_at, status, status_text, state_id, is_critical_state,
-            sicpp_active, sicpp_capped, sicpp_duration,
-            c_alert, c_fired_c, c_risk_p90,
-            comparison_status, comparison_js, comparison_matched_id,
-            risk, alarm_reason, warning_reason, reason
-        ) VALUES (
-            v_now, v_calc.status, v_calc.status_text, v_calc.state_id, v_calc.is_critical_state,
-            v_calc.sicpp_active, v_calc.sicpp_capped, v_calc.sicpp_duration,
-            v_calc.c_alert, v_calc.c_fired_c, v_calc.c_risk_p90,
-            v_calc.comparison_status, v_calc.comparison_js, v_calc.comparison_matched_id,
-            v_calc.risk, v_calc.alarm_reason, v_calc.warning_reason, v_reason
-        ) RETURNING id INTO v_new_id;
-
-        UPDATE integral_signal_state SET last_history_id = v_new_id WHERE id = 1;
-
-        RETURN format('Integral signal: %s at %s (history_id=%s)',
-                      v_calc.status_text, v_now, v_new_id);
-    END IF;
-
-    RETURN format('Integral signal unchanged (%s) at %s', v_calc.status_text, v_now);
-END;
-$$;
-
-COMMENT ON FUNCTION integral_signal_update_state() IS
-'Ежеминутное обновление integral_signal_state и добавление записи
-в integral_signal_history при смене итогового статуса.
-Вызывается из mchain_train_step().';
-
-CREATE OR REPLACE FUNCTION integral_signal_clean_history(p_retention_days INT DEFAULT 90)
-RETURNS TEXT
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_deleted BIGINT;
-BEGIN
-    IF p_retention_days <= 0 THEN
-        RETURN 'Ошибка: срок хранения должен быть положительным.';
-    END IF;
-
-    DELETE FROM integral_signal_history
-    WHERE changed_at < now() - (p_retention_days || ' days')::INTERVAL;
-    GET DIAGNOSTICS v_deleted = ROW_COUNT;
-
-    RETURN format('Удалено %s записей из integral_signal_history старше %s дней.',
-                  v_deleted, p_retention_days);
-END;
-$$;
-
-COMMENT ON FUNCTION integral_signal_clean_history(INT) IS
-'Удаляет устаревшие записи integral_signal_history. По умолчанию 90 дней.';
-
-CREATE OR REPLACE FUNCTION historical_fill_integral_signal(
-    p_start        TIMESTAMPTZ DEFAULT NULL,
-    p_end          TIMESTAMPTZ DEFAULT NULL,
-    p_step_minutes INT         DEFAULT 1,
-    p_clean        BOOLEAN     DEFAULT TRUE
-)
-RETURNS TEXT
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_start          TIMESTAMPTZ;
-    v_end            TIMESTAMPTZ;
-    v_ts             TIMESTAMPTZ;
-    v_prev_status    INT := NULL;
-    v_calc           RECORD;
-    v_inserted       INT := 0;
-    v_processed      BIGINT := 0;
-    v_total_minutes  BIGINT;
-    v_last_percent   INT := -1;
-    v_current_percent INT;
-    v_step_interval  INTERVAL := (p_step_minutes || ' minutes')::INTERVAL;
-    v_reason         TEXT;
-BEGIN
-    IF p_start IS NULL THEN
-        SELECT MIN(curr_timestamp) INTO v_start FROM cluster_stat_median;
-    ELSE
-        v_start := p_start;
-    END IF;
-
-    IF p_end IS NULL THEN
-        v_end := now();
-    ELSE
-        v_end := p_end;
-    END IF;
-
-    IF v_start IS NULL OR v_start >= v_end THEN
-        RETURN 'Ошибка: некорректный диапазон.';
-    END IF;
-
-    v_start := date_trunc('minute', v_start);
-    v_end   := date_trunc('minute', v_end);
-
-    IF p_clean THEN
-        DELETE FROM integral_signal_history
-        WHERE changed_at BETWEEN v_start AND v_end;
-        RAISE NOTICE 'Очищены записи integral_signal_history за период % – %', v_start, v_end;
-    END IF;
-
-    v_total_minutes := EXTRACT(EPOCH FROM (v_end - v_start)) / 60 + 1;
-    RAISE NOTICE 'Начало исторического заполнения integral_signal_history с % по % (шаг %s мин)',
-                 v_start, v_end, p_step_minutes;
-
-    v_ts := v_start;
-    WHILE v_ts <= v_end LOOP
-        SELECT * INTO v_calc FROM integral_signal_calculate_at(v_ts);
-
-        IF NOT FOUND THEN
-            v_ts := v_ts + v_step_interval;
-            v_processed := v_processed + 1;
-            CONTINUE;
-        END IF;
-
-        IF v_prev_status IS NULL
-           OR v_calc.status IS DISTINCT FROM v_prev_status THEN
-            v_reason := CASE
-                WHEN v_prev_status IS NULL THEN 'init'
-                ELSE 'status changed'
-            END;
-
-            INSERT INTO integral_signal_history (
-                changed_at, status, status_text, state_id, is_critical_state,
-                sicpp_active, sicpp_capped, sicpp_duration,
-                c_alert, c_fired_c, c_risk_p90,
-                comparison_status, comparison_js, comparison_matched_id,
-                risk, alarm_reason, warning_reason, reason
-            ) VALUES (
-                v_ts, v_calc.status, v_calc.status_text, v_calc.state_id, v_calc.is_critical_state,
-                v_calc.sicpp_active, v_calc.sicpp_capped, v_calc.sicpp_duration,
-                v_calc.c_alert, v_calc.c_fired_c, v_calc.c_risk_p90,
-                v_calc.comparison_status, v_calc.comparison_js, v_calc.comparison_matched_id,
-                v_calc.risk, v_calc.alarm_reason, v_calc.warning_reason, v_reason
-            );
-            v_inserted := v_inserted + 1;
-            v_prev_status := v_calc.status;
-        END IF;
-
-        v_ts := v_ts + v_step_interval;
-        v_processed := v_processed + 1;
-
-        v_current_percent := floor((v_processed::NUMERIC / v_total_minutes) * 100);
-        IF v_current_percent > v_last_percent THEN
-            RAISE NOTICE 'Прогресс: % %% (обработано % из %, вставлено %)',
-                         v_current_percent, v_processed, v_total_minutes, v_inserted;
-            v_last_percent := v_current_percent;
-        END IF;
-    END LOOP;
-
-    -- Обновляем singleton на p_end
-    SELECT * INTO v_calc FROM integral_signal_calculate_at(v_end);
-    UPDATE integral_signal_state SET
-        updated_at            = v_end,
-        status                = v_calc.status,
-        status_text           = v_calc.status_text,
-        state_id              = v_calc.state_id,
-        is_critical_state     = v_calc.is_critical_state,
-        sicpp_active          = v_calc.sicpp_active,
-        sicpp_capped          = v_calc.sicpp_capped,
-        sicpp_duration        = v_calc.sicpp_duration,
-        c_alert               = v_calc.c_alert,
-        c_fired_c             = v_calc.c_fired_c,
-        c_risk_p90            = v_calc.c_risk_p90,
-        comparison_status     = v_calc.comparison_status,
-        comparison_js         = v_calc.comparison_js,
-        comparison_matched_id = v_calc.comparison_matched_id,
-        risk                  = v_calc.risk,
-        alarm_reason          = v_calc.alarm_reason,
-        warning_reason        = v_calc.warning_reason
-    WHERE id = 1;
-
-    RAISE NOTICE 'Заполнение завершено. Обработано % минут, вставлено % записей.',
-                 v_processed, v_inserted;
-    RETURN format('Историческое заполнение integral_signal_history завершено. Обработано %s минут, вставлено %s записей.',
-                  v_processed, v_inserted);
-END;
-$$;
-
-COMMENT ON FUNCTION historical_fill_integral_signal(TIMESTAMPTZ, TIMESTAMPTZ, INT, BOOLEAN) IS
-'Заполняет integral_signal_history за указанный период.
-Требует предварительного заполнения:
-  1) performance_history (append_performance_history / mchain_initial_train_from_history)
-  2) prediction_log (collect_prediction вызывается в mchain_train_step_at)
-  3) profile_comparison_log (fill_profile_comparison_historically)
-  4) sicpp_history (historical_fill_sicpp)
-  5) critical_states (refresh_critical_states)
-Пишет запись только при смене итогового статуса (0/50/100).';
-
-
-CREATE OR REPLACE FUNCTION get_current_preincident_status(
-    p_sicpp_warn_strength REAL DEFAULT 1.1,
-    p_alarm_risk          REAL DEFAULT 0.90,
-    p_warning_risk        REAL DEFAULT 0.60,
-    p_warning_js          REAL DEFAULT 0.10,
-    p_recent_minutes      INT  DEFAULT 5,
-    p_state_staleness_min INT  DEFAULT 5
-)
-RETURNS INTEGER
-LANGUAGE plpgsql
-STABLE
-AS $$
-DECLARE
-    v_status INT;
-BEGIN
-    SELECT s.status INTO v_status
-    FROM integral_signal_calculate_at(
-        now(),
-        p_alarm_risk,
-        p_warning_risk,
-        p_warning_js,
-        p_recent_minutes,
-        p_state_staleness_min
-    ) s;
-
-    RETURN COALESCE(v_status, 0);
-END;
-$$;
-
-COMMENT ON FUNCTION get_current_preincident_status(REAL, REAL, REAL, REAL, INT, INT) IS
-'Текущий интегральный статус (0/50/100).
-v22.0: делегирует в integral_signal_calculate_at(now()).
-Параметр p_sicpp_warn_strength сохранён для обратной совместимости,
-фактически не используется (SICPP-активности достаточно для WARNING).';
-
-CREATE OR REPLACE FUNCTION get_current_preincident_status_detail(
-    p_sicpp_warn_strength REAL DEFAULT 1.1,
-    p_alarm_risk          REAL DEFAULT 0.90,
-    p_warning_risk        REAL DEFAULT 0.60,
-    p_warning_js          REAL DEFAULT 0.10,
-    p_recent_minutes      INT  DEFAULT 5,
-    p_state_staleness_min INT  DEFAULT 5
-)
-RETURNS TEXT[]
-LANGUAGE plpgsql
-STABLE
-AS $$
-DECLARE
-    v_report TEXT[] := '{}';
-    v_calc   RECORD;
-BEGIN
-    SELECT * INTO v_calc FROM integral_signal_calculate_at(
-        now(), p_alarm_risk, p_warning_risk, p_warning_js,
-        p_recent_minutes, p_state_staleness_min
-    );
-
-    v_report := array_append(v_report, format(
-        '=== PREINCIDENT STATUS: %s (%s) ===',
-        v_calc.status, v_calc.status_text));
-    v_report := array_append(v_report, format('Timestamp: %s',
-        to_char(now(), 'YYYY-MM-DD HH24:MI:SS')));
-    v_report := array_append(v_report, '');
-
-    v_report := array_append(v_report, format(
-        '1. State:  id=%s, critical=%s',
-        COALESCE(v_calc.state_id::TEXT, 'NULL'),
-        COALESCE(v_calc.is_critical_state::TEXT, 'FALSE')));
-
-    v_report := array_append(v_report, format(
-        '2. SICPP:  active=%s, duration=%s min, capped=%s',
-        COALESCE(v_calc.sicpp_active::TEXT, 'NULL'),
-        COALESCE(v_calc.sicpp_duration::TEXT, '0'),
-        COALESCE(v_calc.sicpp_capped::TEXT, 'FALSE')));
-
-    v_report := array_append(v_report, format(
-        '3. Comp:   status=%s, js=%s, matched_id=%s',
-        COALESCE(v_calc.comparison_status, 'NULL'),
-        COALESCE(round(v_calc.comparison_js::NUMERIC, 4)::TEXT, 'NULL'),
-        COALESCE(v_calc.comparison_matched_id::TEXT, 'NULL')));
-
-    v_report := array_append(v_report, format(
-        '4. C:      alert=%s, fired_c=%s, risk_p90=%s',
-        COALESCE(v_calc.c_alert::TEXT, 'NULL'),
-        COALESCE(v_calc.c_fired_c::TEXT, 'NULL'),
-        COALESCE(round(v_calc.c_risk_p90::NUMERIC, 4)::TEXT, 'NULL')));
-
-    v_report := array_append(v_report, format(
-        '5. Risk:   predicted_risk=%s',
-        COALESCE(round(v_calc.risk::NUMERIC, 4)::TEXT, 'NULL')));
-
-    v_report := array_append(v_report, '');
-    v_report := array_append(v_report, 'Причины:');
-    v_report := array_append(v_report, format('  alarm_reason:   %s',
-        COALESCE(v_calc.alarm_reason, '—')));
-    v_report := array_append(v_report, format('  warning_reason: %s',
-        COALESCE(v_calc.warning_reason, '—')));
-
-    v_report := array_append(v_report, '');
-    v_report := array_append(v_report, 'Пороги:');
-    v_report := array_append(v_report, format(
-        '  ALARM (100): critical_state OR C_alert OR INCIDENT OR risk >= %s', p_alarm_risk));
-    v_report := array_append(v_report, format(
-        '  WARNING (50): SICPP активен OR matched_id OR pre_alert=100 OR '
-        'status IN (CRITICAL,WARNING) OR js >= %s OR risk >= %s',
-        p_warning_js, p_warning_risk));
-    v_report := array_append(v_report, '  NORMAL (0):   ни один триггер не сработал.');
-
-    RETURN v_report;
-END;
-$$;
-
-COMMENT ON FUNCTION get_current_preincident_status_detail(REAL, REAL, REAL, REAL, INT, INT) IS
-'v22.0: делегирует в integral_signal_calculate_at(now()).
-Формат вывода унифицирован с integral_signal_history.';
-
--- =============================================================================
--- R0.1. integral_signal_report_section v22.1
--- Исправлен баг: покрытие = 0% из-за проверки «changed_at в окне 60 мин»
--- (не видит активный статус, начавшийся ДО открытия окна).
--- Новая логика: две независимые метрики —
---   1) состояние на момент старта инцидента (последний статус строго до start);
---   2) хотя бы одна смена статуса в окне 60 мин до старта (для «раннего» покрытия).
--- =============================================================================
-CREATE OR REPLACE FUNCTION integral_signal_report_section(
-    p_start TIMESTAMPTZ,
-    p_end   TIMESTAMPTZ
-)
-RETURNS TEXT[]
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    v_report TEXT[] := '{}';
-
-    v_total_minutes NUMERIC := 0;
-    v_n_alarm       NUMERIC := 0;
-    v_n_warning     NUMERIC := 0;
-    v_n_normal      NUMERIC := 0;
-    v_pct_alarm     NUMERIC := 0;
-    v_pct_warning   NUMERIC := 0;
-    v_pct_normal    NUMERIC := 0;
-
-    v_incidents_total    INT := 0;
-    v_inc_alarm_at_start INT := 0;
-    v_inc_warning_at_start INT := 0;
-    v_inc_normal_at_start INT := 0;
-    v_inc_alarm_in_60    INT := 0;
-    v_inc_warning_in_60  INT := 0;
-
-    v_alarm_lead_median  REAL;
-    v_alarm_lead_p90     REAL;
-
-    v_rec RECORD;
-BEGIN
-    -- =========================================================================
-    -- 1. Распределение времени по статусам (через интервалы между сменами)
-    -- =========================================================================
-    WITH ordered AS (
-        SELECT id, changed_at, status,
-               LAG(changed_at) OVER (ORDER BY changed_at, id) AS prev_ts
-        FROM integral_signal_history
-        WHERE changed_at <= p_end
-    ),
-    intervals AS (
-        SELECT status,
-               GREATEST(prev_ts, p_start) AS istart,
-               LEAST(changed_at, p_end)   AS iend
-        FROM ordered
-        WHERE prev_ts IS NOT NULL
-          AND changed_at > p_start
-          AND prev_ts   < p_end
-          AND LEAST(changed_at, p_end) > GREATEST(prev_ts, p_start)
-    )
-    SELECT
-        COALESCE(SUM(EXTRACT(EPOCH FROM (iend - istart)) / 60)
-                 FILTER (WHERE status = 100), 0),
-        COALESCE(SUM(EXTRACT(EPOCH FROM (iend - istart)) / 60)
-                 FILTER (WHERE status = 50),  0),
-        COALESCE(SUM(EXTRACT(EPOCH FROM (iend - istart)) / 60)
-                 FILTER (WHERE status = 0),   0),
-        COALESCE(SUM(EXTRACT(EPOCH FROM (iend - istart)) / 60), 0)
-    INTO v_n_alarm, v_n_warning, v_n_normal, v_total_minutes
-    FROM intervals;
-
-    IF v_total_minutes > 0 THEN
-        v_pct_alarm   := ROUND((v_n_alarm   / v_total_minutes * 100)::NUMERIC, 2);
-        v_pct_warning := ROUND((v_n_warning / v_total_minutes * 100)::NUMERIC, 2);
-        v_pct_normal  := ROUND((v_n_normal  / v_total_minutes * 100)::NUMERIC, 2);
-    END IF;
-
-    v_report := array_append(v_report, '');
-    v_report := array_append(v_report, '--- ИНТЕГРАЛЬНЫЙ СИГНАЛ (SICPP + C-only) v22.1 ---');
-    v_report := array_append(v_report, format('Период: %s – %s',
-        to_char(p_start, 'YYYY-MM-DD HH24:MI'),
-        to_char(p_end,   'YYYY-MM-DD HH24:MI')));
-    v_report := array_append(v_report, '');
-    v_report := array_append(v_report, 'Распределение времени по статусам:');
-    v_report := array_append(v_report, format('  ALARM (100):   %s мин (%s%%)',
-        ROUND(v_n_alarm,   1), v_pct_alarm));
-    v_report := array_append(v_report, format('  WARNING (50):  %s мин (%s%%)',
-        ROUND(v_n_warning, 1), v_pct_warning));
-    v_report := array_append(v_report, format('  NORMAL (0):    %s мин (%s%%)',
-        ROUND(v_n_normal,  1), v_pct_normal));
-    v_report := array_append(v_report, format('  Всего: %s мин',
-        ROUND(v_total_minutes, 1)));
-
-    -- =========================================================================
-    -- 2. Покрытие инцидентов — ИСПРАВЛЕНО
-    -- =========================================================================
-    v_report := array_append(v_report, '');
-    v_report := array_append(v_report,
-        'Покрытие инцидентов (три метрики, интерпретируются независимо):');
-
-    SELECT COUNT(*) INTO v_incidents_total
-    FROM markov_chain_performance_incident
-    WHERE start_timepoint BETWEEN p_start AND p_end;
-
-    SELECT
-        COUNT(*) FILTER (WHERE status_at_start = 100),
-        COUNT(*) FILTER (WHERE status_at_start = 50),
-        COUNT(*) FILTER (WHERE status_at_start = 0 OR status_at_start IS NULL),
-        COUNT(*) FILTER (WHERE any_alarm_in_60),
-        COUNT(*) FILTER (WHERE any_warning_in_60)
-    INTO v_inc_alarm_at_start,
-         v_inc_warning_at_start,
-         v_inc_normal_at_start,
-         v_inc_alarm_in_60,
-         v_inc_warning_in_60
-    FROM (
-        SELECT pi.id,
-               COALESCE((
-                   SELECT h.status
-                   FROM integral_signal_history h
-                   WHERE h.changed_at <= pi.start_timepoint
-                   ORDER BY h.changed_at DESC, h.id DESC
-                   LIMIT 1
-               ), 0) AS status_at_start,
-               EXISTS (
-                   SELECT 1 FROM integral_signal_history h
-                   WHERE h.status = 100
-                     AND h.changed_at BETWEEN pi.start_timepoint - INTERVAL '60 minutes'
-                                          AND pi.start_timepoint
-               ) AS any_alarm_in_60,
-               EXISTS (
-                   SELECT 1 FROM integral_signal_history h
-                   WHERE h.status IN (50, 100)
-                     AND h.changed_at BETWEEN pi.start_timepoint - INTERVAL '60 minutes'
-                                          AND pi.start_timepoint
-               ) AS any_warning_in_60
-        FROM markov_chain_performance_incident pi
-        WHERE pi.start_timepoint BETWEEN p_start AND p_end
-    ) t;
-
-    v_report := array_append(v_report, format('  Всего инцидентов: %s', v_incidents_total));
-
-    v_report := array_append(v_report, '  (a) Состояние на момент старта инцидента:');
-    v_report := array_append(v_report, format('      ALARM (100):     %s (%s%%)',
-        v_inc_alarm_at_start,
-        CASE WHEN v_incidents_total > 0
-             THEN ROUND((v_inc_alarm_at_start::NUMERIC / v_incidents_total * 100), 1)::TEXT
-             ELSE '0' END));
-    v_report := array_append(v_report, format('      WARNING (50):    %s (%s%%)',
-        v_inc_warning_at_start,
-        CASE WHEN v_incidents_total > 0
-             THEN ROUND((v_inc_warning_at_start::NUMERIC / v_incidents_total * 100), 1)::TEXT
-             ELSE '0' END));
-    v_report := array_append(v_report, format('      NORMAL или нет:  %s (%s%%)',
-        v_inc_normal_at_start,
-        CASE WHEN v_incidents_total > 0
-             THEN ROUND((v_inc_normal_at_start::NUMERIC / v_incidents_total * 100), 1)::TEXT
-             ELSE '0' END));
-
-    v_report := array_append(v_report,
-        '  (b) Хотя бы одна смена статуса в окне 60 мин до старта:');
-    v_report := array_append(v_report, format('      ALARM (100):     %s (%s%%)',
-        v_inc_alarm_in_60,
-        CASE WHEN v_incidents_total > 0
-             THEN ROUND((v_inc_alarm_in_60::NUMERIC / v_incidents_total * 100), 1)::TEXT
-             ELSE '0' END));
-    v_report := array_append(v_report, format('      WARNING/ALARM:   %s (%s%%)',
-        v_inc_warning_in_60,
-        CASE WHEN v_incidents_total > 0
-             THEN ROUND((v_inc_warning_in_60::NUMERIC / v_incidents_total * 100), 1)::TEXT
-             ELSE '0' END));
-
-    v_report := array_append(v_report,
-        '  Примечание: (a) — фактическое состояние системы в момент инцидента;');
-    v_report := array_append(v_report,
-        '              (b) — «раннее» предупреждение (сигнал сменился в пределах 60 мин до инцидента).');
-
-    -- =========================================================================
-    -- 3. Lead-time от первого ALARM до инцидента
-    -- =========================================================================
-    v_report := array_append(v_report, '');
-    v_report := array_append(v_report, 'Lead-time от первого ALARM до инцидента:');
-
-    WITH incident_first_alarm AS (
-        SELECT pi.id,
-               EXTRACT(EPOCH FROM (
-                   pi.start_timepoint - MIN(h.changed_at)
-               )) / 60 AS lead_min
-        FROM markov_chain_performance_incident pi
-        JOIN integral_signal_history h
-          ON h.status = 100
-         AND h.changed_at BETWEEN pi.start_timepoint - INTERVAL '120 minutes'
-                              AND pi.start_timepoint
-        WHERE pi.start_timepoint BETWEEN p_start AND p_end
-        GROUP BY pi.id, pi.start_timepoint
-    )
-    SELECT
-        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY lead_min),
-        PERCENTILE_CONT(0.9) WITHIN GROUP (ORDER BY lead_min)
-    INTO v_alarm_lead_median, v_alarm_lead_p90
-    FROM incident_first_alarm;
-
-    IF v_alarm_lead_median IS NOT NULL THEN
-        v_report := array_append(v_report, format('  Медиана lead-time: %s мин',
-            ROUND(v_alarm_lead_median::NUMERIC, 1)));
-        v_report := array_append(v_report, format('  p90 lead-time:     %s мин',
-            ROUND(v_alarm_lead_p90::NUMERIC, 1)));
-    ELSE
-        v_report := array_append(v_report,
-            '  Нет инцидентов с предшествующим ALARM в окне 120 мин.');
-    END IF;
-
-    -- =========================================================================
-    -- 4. ALARM — распределение по причинам
-    -- =========================================================================
-    v_report := array_append(v_report, '');
-    v_report := array_append(v_report, 'ALARM — распределение по причинам (alarm_reason):');
-    FOR v_rec IN
-        SELECT alarm_reason, COUNT(*) AS cnt
-        FROM integral_signal_history
-        WHERE changed_at BETWEEN p_start AND p_end
-          AND status = 100
-          AND alarm_reason IS NOT NULL
-        GROUP BY alarm_reason
-        ORDER BY cnt DESC
-    LOOP
-        v_report := array_append(v_report, format('  %s: %s',
-            v_rec.alarm_reason, v_rec.cnt));
-    END LOOP;
-    IF NOT FOUND THEN
-        v_report := array_append(v_report, '  ALARM не зафиксирован.');
-    END IF;
-
-    -- =========================================================================
-    -- 5. WARNING — распределение по причинам
-    -- =========================================================================
-    v_report := array_append(v_report, '');
-    v_report := array_append(v_report, 'WARNING — распределение по причинам (warning_reason):');
-    FOR v_rec IN
-        SELECT warning_reason, COUNT(*) AS cnt
-        FROM integral_signal_history
-        WHERE changed_at BETWEEN p_start AND p_end
-          AND status = 50
-          AND warning_reason IS NOT NULL
-        GROUP BY warning_reason
-        ORDER BY cnt DESC
-    LOOP
-        v_report := array_append(v_report, format('  %s: %s',
-            v_rec.warning_reason, v_rec.cnt));
-    END LOOP;
-    IF NOT FOUND THEN
-        v_report := array_append(v_report, '  WARNING не зафиксирован.');
-    END IF;
-
-    -- =========================================================================
-    -- 6. Выводы
-    -- =========================================================================
-    v_report := array_append(v_report, '');
-    v_report := array_append(v_report, 'Выводы по интегральному сигналу:');
-
-    IF v_incidents_total = 0 THEN
-        v_report := array_append(v_report,
-            '  Инцидентов за период нет — оценка покрытия недоступна.');
-    ELSE
-        DECLARE
-            v_rate_alarm_start NUMERIC := v_inc_alarm_at_start::NUMERIC / v_incidents_total;
-            v_rate_warn_start  NUMERIC := (v_inc_alarm_at_start + v_inc_warning_at_start)::NUMERIC / v_incidents_total;
-        BEGIN
-            IF v_rate_alarm_start >= 0.5 THEN
-                v_report := array_append(v_report,
-                    '  ✔ ALARM на момент старта ≥ 50% — сигнал своевременен.');
-            ELSIF v_rate_alarm_start >= 0.2 THEN
-                v_report := array_append(v_report,
-                    '  ⚠ ALARM на момент старта 20–50% — часть инцидентов приходит «без предупреждения».');
-            ELSE
-                v_report := array_append(v_report,
-                    '  🔴 ALARM на момент старта < 20% — требуется расширение C-only (spike-pathway).');
-            END IF;
-
-            IF v_rate_warn_start >= 0.85 THEN
-                v_report := array_append(v_report,
-                    '  ✔ WARNING или ALARM ≥ 85% — контекстные сигналы работают.');
-            END IF;
-        END;
-    END IF;
-
-    IF v_total_minutes > 0 AND v_n_alarm / v_total_minutes > 0.5 THEN
-        v_report := array_append(v_report,
-            '  ⚠ ALARM занимает >50% времени — вероятен залипающий сигнал (critical_state или слишком низкий порог C).');
-    END IF;
-
-    IF v_total_minutes > 0 AND v_n_warning / v_total_minutes > 0.5 THEN
-        v_report := array_append(v_report,
-            '  ⚠ WARNING занимает >50% времени — кандидат на ужесточение p_warning_risk / sicpp_fresh.');
-    END IF;
-
-    RETURN v_report;
-END;
-$$;
-
-COMMENT ON FUNCTION integral_signal_report_section(TIMESTAMPTZ, TIMESTAMPTZ) IS
-'v22.1 (2026-10-27). Секция интегрального сигнала SICPP + C-only.
-
-ИСПРАВЛЕНИЕ v22.1:
-  - Покрытие инцидентов разделено на три независимые метрики:
-    (a) состояние системы на момент старта инцидента (последний статус
-        строго до start_timepoint);
-    (b) наличие хотя бы одной смены статуса в окне 60 мин до старта;
-    (c) распределение времени по статусам (интервалы).
-  - Устранён баг v22.0: при активном статусе, начавшемся до открытия
-    окна, coverage давал 0%, так как проверял только changed_at внутри
-    [start-60, start].';
 	
 	
 
@@ -11039,7 +10004,7 @@ status_filter) — для воспроизводимости и сверки с 
 
 -- =============================================================================
 -- signals_false_positive_report
--- Версия: 1.0 (2026-10-27)
+-- Версия: 1.1 (2026-10-28)
 --
 -- Назначение: контрольный отчёт о ложных срабатываниях (FP) сигналов
 --             SICPP / C-only / ALARM.
@@ -11096,10 +10061,6 @@ DECLARE
     v_c_cov_first TIMESTAMPTZ; v_c_cov_last TIMESTAMPTZ;
     v_c_has_data BOOLEAN;
 
-    -- ALARM
-    v_a_tot INT := 0; v_a_tp INT := 0; v_a_tpg INT := 0; v_a_fp INT := 0;
-    v_a_fp_min NUMERIC := 0;
-
     -- ширины колонок
     c_id      CONSTANT INT := 8;
     c_time    CONSTANT INT := 16;
@@ -11135,7 +10096,7 @@ BEGIN
         to_char(p_start, 'YYYY-MM-DD HH24:MI'),
         to_char(p_end,   'YYYY-MM-DD HH24:MI')));
     v_report := array_append(v_report,
-        'Версия: signals_false_positive_report v1.0 (2026-10-27)');
+        'Версия: signals_false_positive_report v1.1 (2026-10-28; ALARM удалён)');
     v_report := array_append(v_report, '');
     v_report := array_append(v_report, 'Определения:');
     v_report := array_append(v_report,
@@ -11157,8 +10118,6 @@ BEGIN
         '  C-only — operational_alert_history.alert_active=TRUE.');
     v_report := array_append(v_report,
         '           При include_a/b=FALSE alert_active == fired_c.');
-    v_report := array_append(v_report,
-        '  ALARM  — integral_signal_history.status=100.');
     v_report := array_append(v_report, format(
         '  Параметры C-only: js_min=%s, p90_min=%s, W_min=%s.',
         v_js_thr, v_risk_thr, v_w_thr));
@@ -11269,47 +10228,7 @@ BEGIN
     END IF;
 
     -- =================================================================
-    -- 4. ALARM — статистика
-    -- =================================================================
-    WITH a_hist AS (
-        SELECT id, changed_at, status,
-               LEAD(changed_at) OVER (ORDER BY changed_at, id) AS next_change
-        FROM integral_signal_history WHERE changed_at <= p_end
-    ),
-    a_episodes AS (
-        SELECT id, changed_at AS ep_start_raw,
-               COALESCE(next_change, p_end) AS ep_end_raw
-        FROM a_hist WHERE status = 100
-    ),
-    a_clipped AS (
-        SELECT id,
-               GREATEST(ep_start_raw, p_start) AS ep_start,
-               LEAST(ep_end_raw, p_end) AS ep_end
-        FROM a_episodes
-        WHERE ep_end_raw >= p_start AND ep_start_raw <= p_end
-    ),
-    a_classified AS (
-        SELECT e.id, e.ep_start, e.ep_end,
-               EXISTS (SELECT 1 FROM markov_chain_performance_incident pi
-                       WHERE pi.start_timepoint >= e.ep_start
-                         AND pi.start_timepoint <  e.ep_end) AS is_tp,
-               EXISTS (SELECT 1 FROM markov_chain_performance_incident pi
-                       WHERE pi.start_timepoint >= e.ep_start
-                         AND pi.start_timepoint <  e.ep_end + v_grace) AS is_tp_grace
-        FROM a_clipped e
-    )
-    SELECT
-        COUNT(*),
-        COUNT(*) FILTER (WHERE is_tp),
-        COUNT(*) FILTER (WHERE is_tp_grace),
-        COUNT(*) FILTER (WHERE NOT is_tp_grace),
-        COALESCE(SUM(EXTRACT(EPOCH FROM (ep_end - ep_start)) / 60)
-                 FILTER (WHERE NOT is_tp_grace), 0)
-    INTO v_a_tot, v_a_tp, v_a_tpg, v_a_fp, v_a_fp_min
-    FROM a_classified;
-
-    -- =================================================================
-    -- 5. СВОДКА
+    -- 4. СВОДКА
     -- =================================================================
     v_report := array_append(v_report, '--- СВОДКА ПО ЛОЖНЫМ СРАБАТЫВАНИЯМ ---');
     v_report := array_append(v_report,
@@ -11327,7 +10246,6 @@ BEGIN
         repeat('-', c_num) || v_sep || repeat('-', c_num) || v_sep ||
         repeat('-', c_num) || v_sep || repeat('-', c_num));
 
-    -- SICPP
     v_report := array_append(v_report,
         rpad('SICPP', 12) || v_sep ||
         lpad(v_s_tot::TEXT, c_num) || v_sep ||
@@ -11342,7 +10260,6 @@ BEGIN
                   THEN ROUND((v_s_fp_min / v_s_fp)::NUMERIC, 1)::TEXT
                   ELSE '—' END, c_num));
 
-    -- C-only
     IF v_c_has_data THEN
         v_report := array_append(v_report,
             rpad('C-only', 12) || v_sep ||
@@ -11366,21 +10283,6 @@ BEGIN
             lpad('—', c_num));
     END IF;
 
-    -- ALARM
-    v_report := array_append(v_report,
-        rpad('ALARM', 12) || v_sep ||
-        lpad(v_a_tot::TEXT, c_num) || v_sep ||
-        lpad(v_a_tp::TEXT, c_num) || v_sep ||
-        lpad(v_a_tpg::TEXT, c_num) || v_sep ||
-        lpad(v_a_fp::TEXT, c_num) || v_sep ||
-        lpad(CASE WHEN (v_a_tpg + v_a_fp) > 0
-                  THEN ROUND(v_a_tpg::NUMERIC / (v_a_tpg + v_a_fp) * 100, 1)::TEXT
-                  ELSE '—' END, c_num) || v_sep ||
-        lpad(ROUND(v_a_fp_min, 0)::TEXT, c_num) || v_sep ||
-        lpad(CASE WHEN v_a_fp > 0
-                  THEN ROUND((v_a_fp_min / v_a_fp)::NUMERIC, 1)::TEXT
-                  ELSE '—' END, c_num));
-
     v_report := array_append(v_report, '');
     v_report := array_append(v_report, 'Покрытие источников данных:');
     v_report := array_append(v_report, format(
@@ -11399,7 +10301,7 @@ BEGIN
     v_report := array_append(v_report, '');
 
     -- =================================================================
-    -- 6. ДЕТАЛИ FP — SICPP
+    -- 5. ДЕТАЛИ FP — SICPP
     -- =================================================================
     IF v_s_fp > 0 THEN
         v_report := array_append(v_report,
@@ -11495,7 +10397,7 @@ BEGIN
     END IF;
 
     -- =================================================================
-    -- 7. ДЕТАЛИ FP — C-only
+    -- 6. ДЕТАЛИ FP — C-only
     -- =================================================================
     IF v_c_has_data AND v_c_fp > 0 THEN
         v_report := array_append(v_report,
@@ -11553,7 +10455,8 @@ BEGIN
         END LOOP;
         v_report := array_append(v_report, '');
     ELSIF NOT v_c_has_data THEN
-        v_report := array_append(v_report, '--- C-only: НЕТ ДАННЫХ (operational_alert_history пуста за период) ---');
+        v_report := array_append(v_report,
+            '--- C-only: НЕТ ДАННЫХ (operational_alert_history пуста за период) ---');
         v_report := array_append(v_report, '');
     ELSE
         v_report := array_append(v_report, '--- C-only: FP-эпизодов нет ---');
@@ -11561,74 +10464,7 @@ BEGIN
     END IF;
 
     -- =================================================================
-    -- 8. ДЕТАЛИ FP — ALARM
-    -- =================================================================
-    IF v_a_fp > 0 THEN
-        v_report := array_append(v_report,
-            format('--- ДЕТАЛИ FP — ALARM (%s эпизодов) ---', v_a_fp));
-        v_report := array_append(v_report,
-            rpad('ID', c_id) || v_sep ||
-            rpad('Старт эпизода', c_time) || v_sep ||
-            rpad('Конец эпизода', c_time) || v_sep ||
-            lpad('Длит', c_dur) || v_sep ||
-            rpad('alarm_reason', c_reason) || v_sep ||
-            lpad('Ближ.инц', c_delta) || v_sep ||
-            'Δ,мин');
-        v_report := array_append(v_report,
-            repeat('-', c_id) || v_sep || repeat('-', c_time) || v_sep ||
-            repeat('-', c_time) || v_sep || repeat('-', c_dur) || v_sep ||
-            repeat('-', c_reason) || v_sep ||
-            repeat('-', c_delta) || v_sep || repeat('-', 6));
-
-        FOR v_rec IN
-        WITH a_hist AS (
-            SELECT id, changed_at, status, alarm_reason,
-                   LEAD(changed_at) OVER (ORDER BY changed_at, id) AS next_change
-            FROM integral_signal_history WHERE changed_at <= p_end
-        ),
-        a_episodes AS (
-            SELECT id, changed_at AS ep_start_raw,
-                   COALESCE(next_change, p_end) AS ep_end_raw, alarm_reason
-            FROM a_hist WHERE status = 100
-        ),
-        a_clipped AS (
-            SELECT id,
-                   GREATEST(ep_start_raw, p_start) AS ep_start,
-                   LEAST(ep_end_raw, p_end) AS ep_end, alarm_reason
-            FROM a_episodes
-            WHERE ep_end_raw >= p_start AND ep_start_raw <= p_end
-        ),
-        fp AS (
-            SELECT e.id, e.ep_start, e.ep_end, e.alarm_reason
-            FROM a_clipped e
-            WHERE NOT EXISTS (SELECT 1 FROM markov_chain_performance_incident pi
-                              WHERE pi.start_timepoint >= e.ep_start
-                                AND pi.start_timepoint <  e.ep_end + v_grace)
-        )
-        SELECT fp.id, fp.ep_start, fp.ep_end,
-               EXTRACT(EPOCH FROM (fp.ep_end - fp.ep_start)) / 60 AS dur_min,
-               fp.alarm_reason,
-               (SELECT MIN(pi.start_timepoint) FROM markov_chain_performance_incident pi
-                WHERE pi.start_timepoint > fp.ep_end) AS next_incident_ts
-        FROM fp ORDER BY fp.ep_start
-        LOOP
-            v_report := array_append(v_report,
-                rpad(v_rec.id::TEXT, c_id) || v_sep ||
-                rpad(to_char(v_rec.ep_start, 'YYYY-MM-DD HH24:MI'), c_time) || v_sep ||
-                rpad(to_char(v_rec.ep_end,   'YYYY-MM-DD HH24:MI'), c_time) || v_sep ||
-                lpad(ROUND(v_rec.dur_min::NUMERIC, 0)::TEXT, c_dur) || v_sep ||
-                rpad(COALESCE(v_rec.alarm_reason, '—'), c_reason) || v_sep ||
-                lpad(COALESCE(to_char(v_rec.next_incident_ts, 'HH24:MI'), '—'), c_delta) || v_sep ||
-                COALESCE(ROUND(EXTRACT(EPOCH FROM (v_rec.next_incident_ts - v_rec.ep_end)) / 60)::TEXT, '—'));
-        END LOOP;
-        v_report := array_append(v_report, '');
-    ELSE
-        v_report := array_append(v_report, '--- ALARM: FP-эпизодов нет ---');
-        v_report := array_append(v_report, '');
-    END IF;
-
-    -- =================================================================
-    -- 9. РАСПРЕДЕЛЕНИЕ FP ПО ДЛИТЕЛЬНОСТИ
+    -- 7. РАСПРЕДЕЛЕНИЕ FP ПО ДЛИТЕЛЬНОСТИ
     -- =================================================================
     v_report := array_append(v_report, '--- РАСПРЕДЕЛЕНИЕ FP ПО ДЛИТЕЛЬНОСТИ (мин) ---');
     v_report := array_append(v_report,
@@ -11643,7 +10479,6 @@ BEGIN
         repeat('-', c_dur) || v_sep || repeat('-', c_dur) || v_sep ||
         repeat('-', c_dur) || v_sep || repeat('-', c_dur));
 
-    -- SICPP распределение
     DECLARE b1 INT := 0; b2 INT := 0; b3 INT := 0; b4 INT := 0; b5 INT := 0;
     BEGIN
         WITH sicpp_hist AS (
@@ -11690,7 +10525,6 @@ BEGIN
             lpad(b5::TEXT, c_dur));
     END;
 
-    -- C-only распределение
     IF v_c_has_data THEN
         DECLARE b1 INT := 0; b2 INT := 0; b3 INT := 0; b4 INT := 0; b5 INT := 0;
         BEGIN
@@ -11732,60 +10566,19 @@ BEGIN
         END;
     END IF;
 
-    -- ALARM распределение
-    DECLARE b1 INT := 0; b2 INT := 0; b3 INT := 0; b4 INT := 0; b5 INT := 0;
-    BEGIN
-        WITH a_hist AS (
-            SELECT id, changed_at, status,
-                   LEAD(changed_at) OVER (ORDER BY changed_at, id) AS next_change
-            FROM integral_signal_history WHERE changed_at <= p_end
-        ),
-        a_episodes AS (
-            SELECT id, changed_at AS ep_start_raw,
-                   COALESCE(next_change, p_end) AS ep_end_raw
-            FROM a_hist WHERE status = 100
-        ),
-        a_clipped AS (
-            SELECT id, GREATEST(ep_start_raw, p_start) AS ep_start,
-                   LEAST(ep_end_raw, p_end) AS ep_end
-            FROM a_episodes
-            WHERE ep_end_raw >= p_start AND ep_start_raw <= p_end
-        ),
-        fp AS (
-            SELECT EXTRACT(EPOCH FROM (e.ep_end - e.ep_start)) / 60 AS dur_min
-            FROM a_clipped e
-            WHERE NOT EXISTS (SELECT 1 FROM markov_chain_performance_incident pi
-                              WHERE pi.start_timepoint >= e.ep_start
-                                AND pi.start_timepoint <  e.ep_end + v_grace)
-        )
-        SELECT COUNT(*) FILTER (WHERE dur_min < 5),
-               COUNT(*) FILTER (WHERE dur_min >= 5  AND dur_min < 15),
-               COUNT(*) FILTER (WHERE dur_min >= 15 AND dur_min < 60),
-               COUNT(*) FILTER (WHERE dur_min >= 60 AND dur_min < 180),
-               COUNT(*) FILTER (WHERE dur_min >= 180)
-        INTO b1, b2, b3, b4, b5 FROM fp;
-
-        v_report := array_append(v_report,
-            rpad('ALARM', 12) || v_sep ||
-            lpad(b1::TEXT, c_dur) || v_sep || lpad(b2::TEXT, c_dur) || v_sep ||
-            lpad(b3::TEXT, c_dur) || v_sep || lpad(b4::TEXT, c_dur) || v_sep ||
-            lpad(b5::TEXT, c_dur));
-    END;
-
     v_report := array_append(v_report, '');
 
     -- =================================================================
-    -- 10. ТРЕНД FP ПО ДНЯМ
+    -- 8. ТРЕНД FP ПО ДНЯМ
     -- =================================================================
     v_report := array_append(v_report, '--- ТРЕНД FP ПО ДНЯМ ---');
     v_report := array_append(v_report,
         rpad('День', 12) || v_sep ||
         lpad('SICPP', c_dur) || v_sep ||
-        lpad('C-only', c_dur) || v_sep ||
-        lpad('ALARM', c_dur));
+        lpad('C-only', c_dur));
     v_report := array_append(v_report,
         repeat('-', 12) || v_sep || repeat('-', c_dur) || v_sep ||
-        repeat('-', c_dur) || v_sep || repeat('-', c_dur));
+        repeat('-', c_dur));
 
     FOR v_rec IN
     WITH sicpp_hist AS (
@@ -11829,27 +10622,13 @@ BEGIN
                                           WHERE h2.changed_at > h.changed_at AND h2.alert_active = FALSE), p_end)
                                 + v_grace)
     ),
-    a_fp AS (
-        SELECT DATE(GREATEST(h.changed_at, p_start)) AS day
-        FROM integral_signal_history h
-        WHERE h.status = 100
-          AND h.changed_at BETWEEN p_start AND p_end
-          AND NOT EXISTS (SELECT 1 FROM markov_chain_performance_incident pi
-                          WHERE pi.start_timepoint >= h.changed_at
-                            AND pi.start_timepoint <
-                                COALESCE((SELECT MIN(h2.changed_at) FROM integral_signal_history h2
-                                          WHERE h2.changed_at > h.changed_at AND h2.status < 100), p_end)
-                                + v_grace)
-    ),
     all_days AS (
         SELECT DISTINCT day FROM sicpp_fp
         UNION SELECT DISTINCT day FROM c_fp
-        UNION SELECT DISTINCT day FROM a_fp
     )
     SELECT d.day,
            COALESCE((SELECT COUNT(*) FROM sicpp_fp WHERE day = d.day), 0) AS s_cnt,
-           COALESCE((SELECT COUNT(*) FROM c_fp     WHERE day = d.day), 0) AS c_cnt,
-           COALESCE((SELECT COUNT(*) FROM a_fp     WHERE day = d.day), 0) AS a_cnt
+           COALESCE((SELECT COUNT(*) FROM c_fp     WHERE day = d.day), 0) AS c_cnt
     FROM all_days d
     ORDER BY d.day
     LOOP
@@ -11857,8 +10636,7 @@ BEGIN
         v_report := array_append(v_report,
             rpad(v_rec.day::TEXT, 12) || v_sep ||
             lpad(v_rec.s_cnt::TEXT, c_dur) || v_sep ||
-            lpad(v_rec.c_cnt::TEXT, c_dur) || v_sep ||
-            lpad(v_rec.a_cnt::TEXT, c_dur));
+            lpad(v_rec.c_cnt::TEXT, c_dur));
     END LOOP;
 
     IF NOT v_trend_found THEN
@@ -11867,21 +10645,18 @@ BEGIN
     v_report := array_append(v_report, '');
 
     -- =================================================================
-    -- 11. ВЫВОДЫ И РЕКОМЕНДАЦИИ
+    -- 9. ВЫВОДЫ И РЕКОМЕНДАЦИИ
     -- =================================================================
     v_report := array_append(v_report, '--- ВЫВОДЫ ---');
 
     DECLARE
-        v_s_prec NUMERIC; v_c_prec NUMERIC; v_a_prec NUMERIC;
+        v_s_prec NUMERIC; v_c_prec NUMERIC;
     BEGIN
         IF (v_s_tpg + v_s_fp) > 0 THEN
             v_s_prec := ROUND(v_s_tpg::NUMERIC / (v_s_tpg + v_s_fp) * 100, 1);
         END IF;
         IF (v_c_tpg + v_c_fp) > 0 THEN
             v_c_prec := ROUND(v_c_tpg::NUMERIC / (v_c_tpg + v_c_fp) * 100, 1);
-        END IF;
-        IF (v_a_tpg + v_a_fp) > 0 THEN
-            v_a_prec := ROUND(v_a_tpg::NUMERIC / (v_a_tpg + v_a_fp) * 100, 1);
         END IF;
 
         IF v_s_prec IS NOT NULL THEN
@@ -11900,14 +10675,6 @@ BEGIN
                      WHEN v_c_prec >= 30 THEN 'умеренно'
                      ELSE 'низкая' END));
         END IF;
-        IF v_a_prec IS NOT NULL THEN
-            v_report := array_append(v_report, format(
-                '  ALARM:  precision(+grace) = %s%% (FP %s из %s) — %s',
-                v_a_prec, v_a_fp, v_a_tot,
-                CASE WHEN v_a_prec >= 50 THEN 'приемлемо'
-                     WHEN v_a_prec >= 30 THEN 'умеренно'
-                     ELSE 'низкая' END));
-        END IF;
 
         v_report := array_append(v_report, '');
         v_report := array_append(v_report, '  Рекомендации:');
@@ -11924,13 +10691,7 @@ BEGIN
             v_report := array_append(v_report,
                 '      либо скорректировать hybrid_js_min_threshold / hybrid_p90_min_threshold.');
         END IF;
-        IF v_a_fp > 0 AND v_a_prec IS NOT NULL AND v_a_prec < 30 THEN
-            v_report := array_append(v_report,
-                '    → ALARM: проверить alarm_reason в FP-эпизодах');
-            v_report := array_append(v_report,
-                '      (риск залипания critical_state или шума от C-триггера).');
-        END IF;
-        IF (v_s_fp + v_c_fp + v_a_fp) = 0 THEN
+        IF (v_s_fp + v_c_fp) = 0 THEN
             v_report := array_append(v_report,
                 '    ✔ Ложных срабатываний не обнаружено.');
         END IF;
@@ -11944,44 +10705,25 @@ END;
 $$;
 
 COMMENT ON FUNCTION signals_false_positive_report(TIMESTAMPTZ, TIMESTAMPTZ, INT) IS
-'v1.0 (2026-10-27). Контрольный отчёт о ложных срабатываниях сигналов.
+'v1.1 (2026-10-28). Контрольный отчёт о ложных срабатываниях сигналов SICPP и C-only.
 
-FP-эпизод = непрерывный интервал активности сигнала, в течение
-[ep_start, ep_end + p_grace_minutes) НЕ начался ни один инцидент.
+ИЗМЕНЕНИЯ v1.1 (относительно v1.0):
+  - Секция ALARM полностью удалена: источник integral_signal_history
+    удалён из системы вместе с интегральным сигналом SICPP + C-only.
+  - Убраны: секция «ALARM — статистика», детальная секция «ДЕТАЛИ FP — ALARM»,
+    строка «ALARM» в распределении по длительности, CTE `a_fp` в тренде
+    по дням, ALARM-precision в выводах.
+  - Оставлены только SICPP и C-only — два сигнала, которые не зависят
+    от интегрального агрегатора.
 
-Источники эпизодов:
-  - SICPP  : sicpp_history (episode_started_at .. следующая signal_active=FALSE);
-  - C-only : operational_alert_history.alert_active=TRUE
-             (при include_a/b=FALSE совпадает с fired_c=TRUE);
-  - ALARM  : integral_signal_history.status=100.
-
-Метрики:
-  TP (strict) = инцидент в [ep_start, ep_end);
-  TP (+grace) = инцидент в [ep_start, ep_end + grace);
-  FP          = not TP (+grace);
-  precision   = TP (+grace) / (TP (+grace) + FP).
-
-Секции отчёта:
-  1. Определения и параметры.
-  2. Сводка: всего / TP / TP(+grace) / FP / precision / FP-минуты / avg FP.
-  3. Покрытие источников данных.
-  4. Детали FP — SICPP (ID, старт, конец, длительность, JS, risk, W,
-     классификация «js above thr» / «risk above thr» / «weak/no data»,
-     ближайший инцидент, Δ).
-  5. Детали FP — C-only (ID, старт, конец, длительность, ближайший
-     инцидент, Δ).
-  6. Детали FP — ALARM (ID, старт, конец, длительность, alarm_reason,
-     ближайший инцидент, Δ).
-  7. Распределение FP по длительности: <5 / 5-15 / 15-60 / 60-180 / >180 мин.
-  8. Тренд FP по дням.
-  9. Выводы: precision по каждому сигналу + рекомендации по порогам.
+Определения и формулы:
+  Эпизод = непрерывный интервал активности сигнала.
+  TP (strict)  = инцидент в [ep_start, ep_end).
+  TP (+grace)  = инцидент в [ep_start, ep_end + p_grace_minutes).
+  FP           = not TP (+grace).
+  precision    = TP (+grace) / (TP (+grace) + FP).
 
 Возвращает TEXT[].
-
-Пример:
-  SELECT unnest(signals_false_positive_report());
-  SELECT unnest(signals_false_positive_report(
-      now() - INTERVAL ''30 days'', now(), 15));
 ';
 
 -- =============================================================================
@@ -12002,7 +10744,7 @@ CREATE OR REPLACE FUNCTION get_signals_valid_from(
 RETURNS TABLE (
     sicpp_first_record      TIMESTAMPTZ,
     c_only_first_record     TIMESTAMPTZ,
-    alarm_first_record      TIMESTAMPTZ,
+    alarm_first_record      TIMESTAMPTZ,    -- всегда NULL (источник удалён)
     earliest_reliable_ts    TIMESTAMPTZ,
     recommended_start_ts    TIMESTAMPTZ,
     details                 TEXT
@@ -12013,60 +10755,47 @@ AS $$
 DECLARE
     cfg RECORD;
     v_warmup INT;
-    v_sicpp_ts  TIMESTAMPTZ;
-    v_c_only_ts TIMESTAMPTZ;
-    v_alarm_ts  TIMESTAMPTZ;
-    v_max_ts    TIMESTAMPTZ;
+    v_sicpp_ts   TIMESTAMPTZ;
+    v_c_only_ts  TIMESTAMPTZ;
+    v_max_ts     TIMESTAMPTZ;
     v_recommended TIMESTAMPTZ;
 BEGIN
     SELECT * INTO cfg FROM incident_forecast_config LIMIT 1;
     v_warmup := COALESCE(p_warm_up_minutes,
                          GREATEST(cfg.window_minutes, cfg.hybrid_window_minutes) + 5);
 
-    -- SICPP: самое раннее changed_at с reason='init'
+    -- SICPP: первая запись с reason='init' (или самая ранняя, если init нет)
     SELECT MIN(changed_at) INTO v_sicpp_ts
     FROM sicpp_history
     WHERE reason = 'init';
 
-    -- Fallback: если init нет — самый ранний changed_at
     IF v_sicpp_ts IS NULL THEN
         SELECT MIN(changed_at) INTO v_sicpp_ts FROM sicpp_history;
     END IF;
 
-    -- C-only: первый переход alert_active=TRUE в operational_alert_history
+    -- C-only: первый переход alert_active=TRUE
     SELECT MIN(changed_at) INTO v_c_only_ts
     FROM operational_alert_history
     WHERE alert_active = TRUE;
 
-    -- ALARM: первый переход status=100 в integral_signal_history
-    SELECT MIN(changed_at) INTO v_alarm_ts
-    FROM integral_signal_history
-    WHERE status = 100;
+    -- ALARM-источник  удалён вместе с интегральным сигналом.
+    alarm_first_record := NULL;
 
-    -- Fallback для ALARM: если нет ALARM-событий — первая запись в истории
-    IF v_alarm_ts IS NULL THEN
-        SELECT MIN(changed_at) INTO v_alarm_ts FROM integral_signal_history;
-    END IF;
-
-    -- Earliest reliable = max из трёх (все источники должны быть доступны)
+    -- Earliest reliable = max из двух доступных источников.
     v_max_ts := GREATEST(
         COALESCE(v_sicpp_ts,  'infinity'::TIMESTAMPTZ),
-        COALESCE(v_c_only_ts, 'infinity'::TIMESTAMPTZ),
-        COALESCE(v_alarm_ts,  'infinity'::TIMESTAMPTZ)
+        COALESCE(v_c_only_ts, 'infinity'::TIMESTAMPTZ)
     );
 
-    -- Если какой-то источник отсутствует — не возвращаем recommended
     IF v_max_ts = 'infinity'::TIMESTAMPTZ THEN
         earliest_reliable_ts := NULL;
         recommended_start_ts := NULL;
         details := format(
-            'Отсутствуют данные: sicpp=%s, c_only=%s, alarm=%s',
-            COALESCE(v_sicpp_ts::TEXT, 'NULL'),
-            COALESCE(v_c_only_ts::TEXT, 'NULL'),
-            COALESCE(v_alarm_ts::TEXT, 'NULL'));
+            'Отсутствуют данные: sicpp=%s, c_only=%s (ALARM-источник удалён)',
+            COALESCE(v_sicpp_ts::TEXT,  'NULL'),
+            COALESCE(v_c_only_ts::TEXT, 'NULL'));
         sicpp_first_record  := v_sicpp_ts;
         c_only_first_record := v_c_only_ts;
-        alarm_first_record  := v_alarm_ts;
         RETURN NEXT; RETURN;
     END IF;
 
@@ -12079,14 +10808,12 @@ BEGIN
 
     sicpp_first_record  := v_sicpp_ts;
     c_only_first_record := v_c_only_ts;
-    alarm_first_record  := v_alarm_ts;
 
     details := format(
-        'bottleneck=%s; warm-up=%s мин; earliest=%s; recommended=%s',
+        'bottleneck=%s; warm-up=%s мин; earliest=%s; recommended=%s; ALARM-источник удалён',
         CASE
             WHEN v_c_only_ts = v_max_ts THEN 'operational_alert_history'
             WHEN v_sicpp_ts  = v_max_ts THEN 'sicpp_history'
-            WHEN v_alarm_ts  = v_max_ts THEN 'integral_signal_history'
             ELSE 'unknown'
         END,
         v_warmup, v_max_ts, recommended_start_ts);
@@ -12096,10 +10823,16 @@ END;
 $$;
 
 COMMENT ON FUNCTION get_signals_valid_from(INT) IS
-'Возвращает earliest_reliable_ts (max из первых записей sicpp_history,
-operational_alert_history, integral_signal_history) и recommended_start_ts
-(с округлением до 30 мин + warm-up). p_warm_up_minutes по умолчанию = 
-GREATEST(window_minutes, hybrid_window_minutes) + 5.';
+'v1.1 (2026-10-28). Возвращает earliest_reliable_ts (max из первых записей
+sicpp_history и operational_alert_history) и recommended_start_ts
+(с округлением до 30 мин + warm-up).
+
+ИЗМЕНЕНИЯ v1.1 (относительно v1.0):
+  - Поле alarm_first_record всегда NULL — сохранено только для совместимости
+    с существующими вызывающими запросами (например, SELECT * FROM ...).
+  - earliest_reliable_ts считается как GREATEST от двух доступных источников
+    (SICPP и C-only), а не от трёх.
+';
 
 
 CREATE OR REPLACE FUNCTION sicpp_cooldown_status()
@@ -12327,27 +11060,17 @@ STABLE
 AS $$
 DECLARE
     v_now    TIMESTAMPTZ := now();
-    v_calc   RECORD;
     v_sicpp  RECORD;
     v_hybrid RECORD;
     v_out    TEXT := '';
 BEGIN
-    -- Интегральный статус (SICPP + C-only + risk)
-    SELECT * INTO v_calc FROM integral_signal_calculate_at(v_now);
-
-    -- Детали SICPP из singleton-таблицы
-    SELECT * INTO v_sicpp FROM sicpp_get_current() LIMIT 1;
-
-    -- Детали C-only (включая spike-путь v3.8.0)
+    SELECT * INTO v_sicpp  FROM sicpp_get_current() LIMIT 1;
     SELECT * INTO v_hybrid FROM mchain_hybrid_alert_at(v_now) LIMIT 1;
 
     v_out := v_out || '=== ТЕКУЩИЕ СИГНАЛЫ ПРЕДУПРЕЖДЕНИЯ ===' || E'\n';
     v_out := v_out || 'Момент: ' || to_char(v_now, 'YYYY-MM-DD HH24:MI:SS') || E'\n';
     v_out := v_out || repeat('-', 48) || E'\n';
 
-    ----------------------------------------------------------------------
-    -- SICPP
-    ----------------------------------------------------------------------
     v_out := v_out || 'SICPP:' || E'\n';
     v_out := v_out || '  active        : ' || COALESCE(v_sicpp.signal_active::TEXT, 'NULL') || E'\n';
     v_out := v_out || '  strength      : ' || COALESCE(round(v_sicpp.signal_strength::NUMERIC, 4)::TEXT, '—') || E'\n';
@@ -12357,9 +11080,6 @@ BEGIN
     v_out := v_out || '  updated_at    : ' || COALESCE(to_char(v_sicpp.updated_at, 'YYYY-MM-DD HH24:MI:SS'), '—') || E'\n';
     v_out := v_out || E'\n';
 
-    ----------------------------------------------------------------------
-    -- C-only
-    ----------------------------------------------------------------------
     v_out := v_out || 'C-only:' || E'\n';
     v_out := v_out || '  alert         : ' || COALESCE(v_hybrid.alert::TEXT, 'NULL') || E'\n';
     v_out := v_out || '  fired_c       : ' || COALESCE(v_hybrid.fired_c::TEXT, 'NULL') || E'\n';
@@ -12369,36 +11089,14 @@ BEGIN
     v_out := v_out || '  risk_p90      : ' || COALESCE(round(v_hybrid.risk_p90::NUMERIC, 4)::TEXT, '—') || E'\n';
     v_out := v_out || '  js_avg        : ' || COALESCE(round(v_hybrid.js_avg::NUMERIC, 4)::TEXT, '—') || E'\n';
     v_out := v_out || '  w_score       : ' || COALESCE(round(v_hybrid.w_score::NUMERIC, 4)::TEXT, '—') || E'\n';
-    v_out := v_out || E'\n';
-
-    ----------------------------------------------------------------------
-    -- Интегральный статус
-    ----------------------------------------------------------------------
-    v_out := v_out || 'ИНТЕГРАЛЬНЫЙ СТАТУС:' || E'\n';
-    v_out := v_out || '  status        : ' || v_calc.status::TEXT || ' (' || v_calc.status_text || ')' || E'\n';
-    v_out := v_out || '  state_id      : ' || COALESCE(v_calc.state_id::TEXT, 'NULL') || E'\n';
-    v_out := v_out || '  critical_state: ' || COALESCE(v_calc.is_critical_state::TEXT, 'FALSE') || E'\n';
-    v_out := v_out || '  risk          : ' || COALESCE(round(v_calc.risk::NUMERIC, 4)::TEXT, '—') || E'\n';
-    v_out := v_out || '  alarm_reason  : ' || COALESCE(v_calc.alarm_reason, '—') || E'\n';
-    v_out := v_out || '  warning_reason: ' || COALESCE(v_calc.warning_reason, '—') || E'\n';
 
     RETURN v_out;
 END;
 $$;
 
 COMMENT ON FUNCTION get_current_signals_text() IS
-'Возвращает текстовый отчёт о текущих значениях сигналов SICPP, C-only
-и интегрального статуса (SICPP + C-only). Без входных параметров,
-работает на момент now().
-
-Источники:
-  - sicpp_get_current()           — singleton sicpp_current_state;
-  - mchain_hybrid_alert_at(now()) — C-only (profile + spike pathways);
-  - integral_signal_calculate_at(now()) — итоговый статус 0/50/100.
-
-Пример:
-  SELECT get_current_signals_text();
-';
+'Текстовый отчёт о текущих значениях SICPP и C-only (без интегрального сигнала).
+Источники: sicpp_get_current(), mchain_hybrid_alert_at(now()).';
 
 -- =============================================================================
 -- Функция: get_current_signals_status
@@ -12431,6 +11129,30 @@ COMMENT ON FUNCTION get_current_signals_text() IS
 -- Оговорка: при hybrid_include_a=TRUE или hybrid_include_b=TRUE
 -- «Время изменения» для C-only отражает alert_active (A∨B∨C), а не
 -- чистый fired_c; в отчёт добавляется предупреждение.
+-- =============================================================================
+-- =============================================================================
+-- Функция: get_current_signals_status
+-- Версия: 1.2 (2026-10-28)
+--
+-- Назначение: текущее состояние сигналов SICPP и C-only (T/F), время
+--             последнего перехода T↔F, метрики качества (recall / precision)
+--             за последние p_lookback_days дней и информация о последнем
+--             инциденте (текущем или завершённом).
+--
+-- ИЗМЕНЕНИЯ v1.2 (относительно v1.1):
+--   - Добавлена секция «--- ПОСЛЕДНИЙ ИНЦИДЕНТ ---», которая выводит
+--     информацию о самом свежем инциденте из
+--     markov_chain_performance_incident:
+--       * ID, статус (ТЕКУЩИЙ / завершён);
+--       * время начала;
+--       * время окончания (для завершённых);
+--       * длительность (для завершённых) или длительность на текущий момент
+--         (для текущих);
+--       * сколько минут прошло с начала / с завершения.
+--   - Если таблица инцидентов пуста или недоступна, выводится
+--     соответствующее сообщение без ошибки.
+--   - Остальная логика (SICPP / C-only / T↔F / recall / precision) без
+--     изменений.
 -- =============================================================================
 CREATE OR REPLACE FUNCTION get_current_signals_status(
     p_lookback_days INT DEFAULT 7
@@ -12488,6 +11210,13 @@ DECLARE
 
     v_has_sicpp_hist BOOLEAN := FALSE;
     v_has_c_hist     BOOLEAN := FALSE;
+
+    -- NEW v1.2: последний инцидент
+    v_last_inc          RECORD;
+    v_has_incident_tbl  BOOLEAN := FALSE;
+    v_inc_status        TEXT;
+    v_inc_duration_min  NUMERIC;
+    v_inc_elapsed_min   NUMERIC;
 BEGIN
     IF p_lookback_days IS NULL OR p_lookback_days <= 0 THEN
         RETURN ARRAY['Ошибка: p_lookback_days должен быть положительным.'];
@@ -12700,6 +11429,29 @@ BEGIN
         v_c_recall := round(v_c_covered_inc::NUMERIC / v_c_total_inc * 100, 1);
     END IF;
 
+    -- =====================================================================
+    -- 7b. NEW v1.2: последний инцидент (текущий или завершённый)
+    -- =====================================================================
+    SELECT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_name = 'markov_chain_performance_incident'
+    ) INTO v_has_incident_tbl;
+
+    IF v_has_incident_tbl THEN
+        BEGIN
+            SELECT id, start_timepoint, finish_timepoint
+            INTO v_last_inc
+            FROM markov_chain_performance_incident
+            WHERE start_timepoint <= v_now
+            ORDER BY start_timepoint DESC, id DESC
+            LIMIT 1;
+        EXCEPTION WHEN OTHERS THEN
+            v_last_inc := NULL;
+        END;
+    ELSE
+        v_last_inc := NULL;
+    END IF;
+
     -- 8. Формирование отчёта
     v_report := array_append(v_report,
         format('Дата/время: %s', to_char(v_now, 'YYYY-MM-DD HH24:MI:SS')));
@@ -12763,7 +11515,56 @@ BEGIN
             COALESCE(round(v_c_cur.risk_p90::NUMERIC, 4)::TEXT, 'NULL')));
     END IF;
 
+    -- =====================================================================
+    -- NEW v1.2: секция «ПОСЛЕДНИЙ ИНЦИДЕНТ»
+    -- =====================================================================
+    v_report := array_append(v_report, '');
+    v_report := array_append(v_report, '--- ПОСЛЕДНИЙ ИНЦИДЕНТ (markov_chain_performance_incident) ---');
+
+    IF NOT v_has_incident_tbl THEN
+        v_report := array_append(v_report,
+            'Таблица markov_chain_performance_incident недоступна.');
+    ELSIF v_last_inc IS NULL OR v_last_inc.id IS NULL THEN
+        v_report := array_append(v_report,
+            'Инцидентов в истории нет (или все start_timepoint > now()).');
+    ELSE
+        IF v_last_inc.finish_timepoint IS NULL THEN
+            -- Текущий (незавершённый) инцидент
+            v_inc_status := 'ТЕКУЩИЙ (не завершён)';
+            v_inc_elapsed_min := round(
+                (EXTRACT(EPOCH FROM (v_now - v_last_inc.start_timepoint)) / 60)::NUMERIC, 1);
+
+            v_report := array_append(v_report, format('ID:              %s', v_last_inc.id));
+            v_report := array_append(v_report, format('Статус:          %s', v_inc_status));
+            v_report := array_append(v_report, format('Начало:          %s',
+                to_char(v_last_inc.start_timepoint, 'YYYY-MM-DD HH24:MI')));
+            v_report := array_append(v_report, 'Конец:           — (не завершён)');
+            v_report := array_append(v_report, format('Длительность:    %s мин (на текущий момент)',
+                v_inc_elapsed_min));
+            v_report := array_append(v_report, format('Прошло с начала: %s мин',
+                v_inc_elapsed_min));
+        ELSE
+            -- Завершённый инцидент
+            v_inc_status := 'завершён';
+            v_inc_duration_min := round(
+                (EXTRACT(EPOCH FROM (v_last_inc.finish_timepoint - v_last_inc.start_timepoint)) / 60)::NUMERIC, 1);
+            v_inc_elapsed_min := round(
+                (EXTRACT(EPOCH FROM (v_now - v_last_inc.finish_timepoint)) / 60)::NUMERIC, 1);
+
+            v_report := array_append(v_report, format('ID:              %s', v_last_inc.id));
+            v_report := array_append(v_report, format('Статус:          %s', v_inc_status));
+            v_report := array_append(v_report, format('Начало:          %s',
+                to_char(v_last_inc.start_timepoint, 'YYYY-MM-DD HH24:MI')));
+            v_report := array_append(v_report, format('Конец:           %s',
+                to_char(v_last_inc.finish_timepoint, 'YYYY-MM-DD HH24:MI')));
+            v_report := array_append(v_report, format('Длительность:    %s мин', v_inc_duration_min));
+            v_report := array_append(v_report, format('Прошло с завершения: %s мин', v_inc_elapsed_min));
+        END IF;
+    END IF;
+
+    -- Примечания
     IF NOT v_has_sicpp_hist THEN
+        v_report := array_append(v_report, '');
         v_report := array_append(v_report,
             'Примечание: sicpp_history пуста за период — SICPP-метрики недоступны.');
     END IF;
@@ -12783,14 +11584,21 @@ END;
 $$;
 
 COMMENT ON FUNCTION get_current_signals_status(INT) IS
-'v1.1 (2026-10-28). Отчёт о текущем состоянии сигналов SICPP и C-only.
+'v1.2 (2026-10-28). Отчёт о текущем состоянии сигналов SICPP и C-only
++ информация о последнем инциденте (текущем или завершённом).
 
 Возвращает TEXT[]:
-  Дата/время + период оценки метрик;
-  Таблица: Сигнал | T/F | Изменение (T->F, F->T) | Охват | Точность;
-  --- ДЕТАЛИ --- (инцидентов / покрыто / эпизодов / TP, live-состояние, примечания).
+  1. Дата/время и период оценки метрик;
+  2. Таблица: Сигнал | T/F | Изменение (T->F, F->T) | Охват | Точность;
+  3. --- ДЕТАЛИ --- (инцидентов / покрыто / эпизодов / TP, live-состояние);
+  4. --- ПОСЛЕДНИЙ ИНЦИДЕНТ --- (v1.2): ID, статус (ТЕКУЩИЙ / завершён),
+     время начала, время окончания (для завершённых), длительность
+     (для завершённых) или длительность на текущий момент (для текущих),
+     прошло минут с начала / с завершения;
+  5. Примечания (пустая sicpp_history / operational_alert_history,
+     предупреждение при hybrid_include_a/b=TRUE).
 
-Столбцы:
+Столбцы таблицы:
   T/F          — текущее значение (sicpp_calculate_at(now()).signal_active
                  для SICPP; mchain_hybrid_alert_at(now()).fired_c для C-only).
   Изменение    — время последнего реального T↔F перехода:
@@ -12801,9 +11609,6 @@ COMMENT ON FUNCTION get_current_signals_status(INT) IS
                  ''—'' — реальных T↔F переходов в истории нет (только init/capped).
   Охват        — recall = покрытые инциденты / все инциденты за p_lookback_days.
   Точность     — precision = TP эпизоды / все эпизоды за p_lookback_days.
-
-При hybrid_include_a/b=TRUE «Изменение» C-only отражает alert_active,
-а не чистый fired_c — в отчёт добавляется предупреждение.
 
 Пример:
   SELECT unnest(get_current_signals_status());
@@ -12829,4 +11634,387 @@ SELECT unnest(get_current_signals_status());
  C-only: инцидентов 16, покрыто 13, эпизодов 41, TP 13
  SICPP (live):  длительность=0 мин, capped=false
  C-only (live): risk_p90=0.4102
+
+ --- ПОСЛЕДНИЙ ИНЦИДЕНТ (markov_chain_performance_incident) ---
+ ID:              127
+ Статус:          завершён
+ Начало:          2026-10-28 09:14
+ Конец:           2026-10-28 09:52
+ Длительность:    38.0 мин
+ Прошло с завершения: 283.0 мин
 */
+
+
+
+-- =============================================================================
+-- Функция: historical_fill_c_only
+-- Версия: 1.0 (2026-10-28)
+--
+-- Назначение: историческое заполнение значений сигнала C-only в
+--             operational_alert_history. Аналог historical_fill_sicpp для
+--             SICPP, но источник состояния — mchain_hybrid_alert_at()
+--             (двухпутевой C: profile_c OR spike_c; при hybrid_include_a/b=FALSE
+--             alert == fired_c).
+--
+-- СОГЛАСОВАННОСТЬ С RUNTIME:
+--   - Поля и логика вставки совпадают с update_operational_alert_state():
+--       * alert_active  = v_calc.alert  (итог: A ∨ B ∨ C с учётом include_a/b)
+--       * fired_c       = v_calc.fired_c
+--       * fired_a_would = (v_calc.pre_adv = 100)   (raw A, как в runtime)
+--       * fired_b       = v_calc.fired_b
+--       * risk_p90      = v_calc.risk_p90
+--       * js_avg        = последний js_avg из sicpp_history на момент v_ts
+--   - Запись в историю только при смене alert_active (init / started / ended),
+--     что соответствует поведению runtime-функции.
+--
+-- ЗАВИСИМОСТИ (должны быть заполнены до вызова):
+--   1) prediction_log            — риск и spike_cnt для mchain_hybrid_alert_at;
+--   2) sicpp_history             — js_avg для w_score и для поля history.js_avg;
+--   3) incident_forecast_config  — пороги C и include_a/b.
+--
+-- ПАРАМЕТРЫ:
+--   p_start         TIMESTAMPTZ — начало периода (включительно)
+--   p_end           TIMESTAMPTZ — конец периода (включительно)
+--   p_step_minutes  INT         — шаг в минутах (по умолчанию 1)
+--   p_clean         BOOLEAN     — удалять существующие записи за период
+--                                  (по умолчанию TRUE)
+--
+-- ВОЗВРАЩАЕТ: TEXT — отчёт о выполненной работе.
+--
+-- ПРИМЕЧАНИЕ О C-only vs A/B/C:
+--   При hybrid_include_a=TRUE или hybrid_include_b=TRUE поле alert_active
+--   отражает A∨B∨C, а не чистый fired_c. Для чисто C-only анализа
+--   в отчётах (signals_false_positive_report v1.0) alert_active
+--   эквивалентен fired_c только при include_a/b=FALSE. В отчёте это явно
+--   диагностируется (см. сообщение о diff_count).
+-- =============================================================================
+CREATE OR REPLACE FUNCTION historical_fill_c_only(
+    p_start        TIMESTAMPTZ,
+    p_end          TIMESTAMPTZ,
+    p_step_minutes INT     DEFAULT 1,
+    p_clean        BOOLEAN DEFAULT TRUE
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_ts                TIMESTAMPTZ;
+    v_step_interval     INTERVAL := (p_step_minutes || ' minutes')::INTERVAL;
+    v_prev_active       BOOLEAN := FALSE;
+    v_prev_initialized  BOOLEAN := FALSE;
+    v_calc              RECORD;
+    v_inserted          INT := 0;
+    v_processed         BIGINT := 0;
+    v_total_minutes     BIGINT;
+    v_last_percent      INT := -1;
+    v_current_percent   INT;
+    v_reason            TEXT;
+    v_last_history_id   BIGINT;
+
+    -- js_avg-снимок из sicpp_history (как в update_operational_alert_state)
+    v_js_avg            REAL;
+
+    -- Верификация
+    v_inc_total         INT := 0;
+    v_inc_covered       INT := 0;
+    v_inc_missed        INT := 0;
+    v_cov_first         TIMESTAMPTZ;
+    v_cov_last          TIMESTAMPTZ;
+
+    -- Диагностика конфигурации
+    v_include_a         BOOLEAN := FALSE;
+    v_include_b         BOOLEAN := FALSE;
+
+    -- Расхождения alert_active vs fired_c (интересно только при include_a/b=TRUE)
+    v_diff_count        INT := 0;
+BEGIN
+    -- =========================================================================
+    -- 1. Проверки
+    -- =========================================================================
+    IF p_start IS NULL OR p_end IS NULL THEN
+        RETURN 'Ошибка: p_start и p_end обязательны.';
+    END IF;
+    IF p_start > p_end THEN
+        RETURN 'Ошибка: начальная дата позже конечной.';
+    END IF;
+    IF p_step_minutes IS NULL OR p_step_minutes <= 0 THEN
+        RETURN 'Ошибка: p_step_minutes должен быть положительным.';
+    END IF;
+
+    p_start := date_trunc('minute', p_start);
+    p_end   := date_trunc('minute', p_end);
+
+    -- =========================================================================
+    -- 2. Диагностика конфигурации
+    -- =========================================================================
+    BEGIN
+        SELECT COALESCE(hybrid_include_a, FALSE),
+               COALESCE(hybrid_include_b, FALSE)
+        INTO v_include_a, v_include_b
+        FROM incident_forecast_config LIMIT 1;
+    EXCEPTION WHEN OTHERS THEN
+        v_include_a := FALSE;
+        v_include_b := FALSE;
+    END;
+
+    -- =========================================================================
+    -- 3. Очистка существующих записей
+    -- =========================================================================
+    IF p_clean THEN
+        DELETE FROM operational_alert_history
+        WHERE changed_at BETWEEN p_start AND p_end;
+        RAISE NOTICE 'Очищены записи operational_alert_history за период % – %',
+                     p_start, p_end;
+    END IF;
+
+    -- =========================================================================
+    -- 4. Подготовка к циклу
+    -- =========================================================================
+    v_total_minutes := EXTRACT(EPOCH FROM (p_end - p_start)) / 60 + 1;
+    RAISE NOTICE 'Начало исторического заполнения C-only с % по % '
+                 '(шаг %s мин, всего %s минут)',
+                 p_start, p_end, p_step_minutes, v_total_minutes;
+
+    -- =========================================================================
+    -- 5. Основной цикл по минутам
+    -- =========================================================================
+    v_ts := p_start;
+    WHILE v_ts <= p_end LOOP
+        -- Расчёт C-only на минуту
+        BEGIN
+            SELECT * INTO v_calc FROM mchain_hybrid_alert_at(v_ts);
+        EXCEPTION WHEN OTHERS THEN
+            RAISE WARNING 'mchain_hybrid_alert_at(%): %', v_ts, SQLERRM;
+            v_processed := v_processed + 1;
+            v_ts := v_ts + v_step_interval;
+            CONTINUE;
+        END;
+
+        IF NOT FOUND THEN
+            v_processed := v_processed + 1;
+            v_ts := v_ts + v_step_interval;
+            CONTINUE;
+        END IF;
+
+        -- js_avg из sicpp_history на момент v_ts (как в runtime-функции)
+        BEGIN
+            SELECT sh.js_avg INTO v_js_avg
+            FROM sicpp_history sh
+            WHERE sh.changed_at <= v_ts
+            ORDER BY sh.changed_at DESC, sh.id DESC
+            LIMIT 1;
+        EXCEPTION WHEN OTHERS THEN
+            v_js_avg := NULL;
+        END;
+
+        -- Диагностика: alert_active vs fired_c при включённых A/B
+        IF (v_include_a OR v_include_b)
+           AND COALESCE(v_calc.alert, FALSE)
+               IS DISTINCT FROM COALESCE(v_calc.fired_c, FALSE) THEN
+            v_diff_count := v_diff_count + 1;
+        END IF;
+
+        -- Запись в историю: init / alert started / alert ended
+        IF NOT v_prev_initialized THEN
+            INSERT INTO operational_alert_history (
+                changed_at, alert_active, fired_c, fired_a_would, fired_b,
+                risk_p90, js_avg, reason
+            ) VALUES (
+                v_ts, COALESCE(v_calc.alert, FALSE),
+                COALESCE(v_calc.fired_c, FALSE),
+                COALESCE(v_calc.pre_adv = 100, FALSE),
+                COALESCE(v_calc.fired_b, FALSE),
+                v_calc.risk_p90,
+                v_js_avg,
+                'init'
+            ) RETURNING id INTO v_last_history_id;
+            v_inserted := v_inserted + 1;
+            v_prev_active      := COALESCE(v_calc.alert, FALSE);
+            v_prev_initialized := TRUE;
+
+        ELSIF COALESCE(v_calc.alert, FALSE) IS DISTINCT FROM v_prev_active THEN
+            v_reason := CASE WHEN COALESCE(v_calc.alert, FALSE)
+                             THEN 'alert started' ELSE 'alert ended' END;
+
+            INSERT INTO operational_alert_history (
+                changed_at, alert_active, fired_c, fired_a_would, fired_b,
+                risk_p90, js_avg, reason
+            ) VALUES (
+                v_ts, COALESCE(v_calc.alert, FALSE),
+                COALESCE(v_calc.fired_c, FALSE),
+                COALESCE(v_calc.pre_adv = 100, FALSE),
+                COALESCE(v_calc.fired_b, FALSE),
+                v_calc.risk_p90,
+                v_js_avg,
+                v_reason
+            ) RETURNING id INTO v_last_history_id;
+            v_inserted := v_inserted + 1;
+            v_prev_active := COALESCE(v_calc.alert, FALSE);
+        END IF;
+
+        v_processed := v_processed + 1;
+        v_ts := v_ts + v_step_interval;
+
+        v_current_percent := floor((v_processed::NUMERIC / v_total_minutes) * 100);
+        IF v_current_percent > v_last_percent THEN
+            RAISE NOTICE 'Прогресс: % %% (обработано % из %, вставлено %)',
+                         v_current_percent, v_processed, v_total_minutes, v_inserted;
+            v_last_percent := v_current_percent;
+        END IF;
+    END LOOP;
+
+    -- =========================================================================
+    -- 6. Финальный апдейт singleton (аналог update_operational_alert_state)
+    -- =========================================================================
+    BEGIN
+        SELECT * INTO v_calc FROM mchain_hybrid_alert_at(p_end);
+
+        SELECT sh.js_avg INTO v_js_avg
+        FROM sicpp_history sh
+        WHERE sh.changed_at <= p_end
+        ORDER BY sh.changed_at DESC, sh.id DESC
+        LIMIT 1;
+
+        INSERT INTO operational_alert_state (
+            id, updated_at, alert_active, fired_c, fired_a_would, fired_b,
+            risk_p90, js_avg, last_history_id
+        ) VALUES (
+            1, p_end,
+            COALESCE(v_calc.alert, FALSE),
+            COALESCE(v_calc.fired_c, FALSE),
+            COALESCE(v_calc.pre_adv = 100, FALSE),
+            COALESCE(v_calc.fired_b, FALSE),
+            v_calc.risk_p90,
+            v_js_avg,
+            v_last_history_id
+        )
+        ON CONFLICT (id) DO UPDATE SET
+            updated_at      = EXCLUDED.updated_at,
+            alert_active    = EXCLUDED.alert_active,
+            fired_c         = EXCLUDED.fired_c,
+            fired_a_would   = EXCLUDED.fired_a_would,
+            fired_b         = EXCLUDED.fired_b,
+            risk_p90        = EXCLUDED.risk_p90,
+            js_avg          = EXCLUDED.js_avg,
+            last_history_id = EXCLUDED.last_history_id;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'Не удалось обновить operational_alert_state: %', SQLERRM;
+    END;
+
+    -- =========================================================================
+    -- 7. Верификация
+    -- =========================================================================
+    BEGIN
+        SELECT COUNT(*) INTO v_inc_total
+        FROM markov_chain_performance_incident
+        WHERE start_timepoint BETWEEN p_start AND p_end;
+
+        -- Покрытие по alert_active (что фактически записано в history)
+        WITH c_episodes AS (
+            SELECT changed_at AS ep_start,
+                   COALESCE(
+                       LEAD(changed_at) OVER (ORDER BY changed_at, id),
+                       p_end
+                   ) AS ep_end
+            FROM operational_alert_history
+            WHERE changed_at <= p_end
+              AND alert_active = TRUE
+        )
+        SELECT COUNT(*) INTO v_inc_covered
+        FROM markov_chain_performance_incident pi
+        WHERE pi.start_timepoint BETWEEN p_start AND p_end
+          AND EXISTS (
+              SELECT 1 FROM c_episodes e
+              WHERE e.ep_start <= pi.start_timepoint
+                AND e.ep_end   >= pi.start_timepoint
+          );
+
+        v_inc_missed := v_inc_total - v_inc_covered;
+
+        SELECT MIN(changed_at), MAX(changed_at)
+        INTO v_cov_first, v_cov_last
+        FROM operational_alert_history
+        WHERE changed_at BETWEEN p_start AND p_end;
+
+        RAISE NOTICE '--- ВЕРИФИКАЦИЯ ---';
+        RAISE NOTICE 'Всего инцидентов в периоде: %', v_inc_total;
+        RAISE NOTICE 'Покрыто C-only (alert_active): %', v_inc_covered;
+        RAISE NOTICE 'Пропущено: %', v_inc_missed;
+        RAISE NOTICE 'Записей в истории: % (первая: %, последняя: %)',
+                     v_inserted, v_cov_first, v_cov_last;
+
+        IF v_inc_total > 0 THEN
+            RAISE NOTICE 'Recall C-only: % %%',
+                         ROUND((v_inc_covered::NUMERIC / v_inc_total * 100), 1);
+        END IF;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE NOTICE 'Верификация пропущена: %', SQLERRM;
+    END;
+
+    -- =========================================================================
+    -- 8. Итоговый отчёт
+    -- =========================================================================
+    RETURN format(
+        'Историческое заполнение C-only завершено. '
+        'Обработано %s минут, вставлено %s записей в operational_alert_history. '
+        'Верификация: инцидентов %s, покрыто %s, пропущено %s. '
+        'Конфигурация: include_a=%s, include_b=%s%s.',
+        v_processed, v_inserted,
+        v_inc_total, v_inc_covered, v_inc_missed,
+        v_include_a, v_include_b,
+        CASE
+            WHEN (v_include_a OR v_include_b) AND v_diff_count > 0
+                THEN format(' (⚠ alert_active != fired_c в %s минутах — '
+                            'для чистого C-only анализа использовать фильтр fired_c)',
+                            v_diff_count)
+            WHEN (v_include_a OR v_include_b)
+                THEN ' (A/B включены, но alert_active совпадал с fired_c во всех минутах)'
+            ELSE ''
+        END
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION historical_fill_c_only(TIMESTAMPTZ, TIMESTAMPTZ, INT, BOOLEAN) IS
+'v1.0 (2026-10-28). Историческое заполнение C-only в operational_alert_history.
+
+Аналог historical_fill_sicpp, но источник состояния — mchain_hybrid_alert_at().
+Поля вставки и логика точечно совпадают с update_operational_alert_state():
+  alert_active  = v_calc.alert  (A ∨ B ∨ C с учётом hybrid_include_a/b)
+  fired_c       = v_calc.fired_c  (profile_c OR spike_c)
+  fired_a_would = (v_calc.pre_adv = 100)  (raw A, как в runtime)
+  fired_b       = v_calc.fired_b
+  risk_p90      = v_calc.risk_p90
+  js_avg        = последний js_avg из sicpp_history на момент v_ts
+
+Запись в историю — только при смене alert_active (init / alert started /
+alert ended). Singleton operational_alert_state обновляется на p_end.
+
+При hybrid_include_a/b = FALSE (по умолчанию) alert_active == fired_c,
+поэтому отчёты, использующие alert_active как «C-only» (например,
+signals_false_positive_report v1.0), работают корректно. При включённых A/B
+в отчёт выводится диагностика расхождений alert_active vs fired_c —
+для чистого C-only анализа использовать фильтр по колонке fired_c.
+
+ЗАВИСИМОСТИ (до вызова должны быть заполнены):
+  1) prediction_log            — для risk_p90 и spike_cnt внутри C;
+  2) sicpp_history             — для js_avg в w_score и в history.js_avg;
+  3) incident_forecast_config  — пороги C и флаги hybrid_include_a/b.
+
+ПАРАМЕТРЫ:
+  p_start         TIMESTAMPTZ — начало периода (включительно)
+  p_end           TIMESTAMPTZ — конец периода (включительно)
+  p_step_minutes  INT         — шаг в минутах (по умолчанию 1)
+  p_clean         BOOLEAN     — удалять существующие записи (по умолчанию TRUE)
+
+ВОЗВРАЩАЕТ: TEXT — отчёт о работе.
+
+ПРИМЕРЫ:
+  -- Полная перегенерация за последние 30 дней
+  SELECT historical_fill_c_only(now() - INTERVAL ''30 days'', now(), 1, TRUE);
+
+  -- Инкрементальное добавление с шагом 5 мин (быстро, но менее точно)
+  SELECT historical_fill_c_only(
+      (SELECT MAX(changed_at) FROM operational_alert_history),
+      now(), 5, FALSE
+  );';
