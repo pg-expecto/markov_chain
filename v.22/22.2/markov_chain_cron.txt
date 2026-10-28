@@ -1,6 +1,6 @@
-﻿#################################################################
+#################################################################
 # Markov chain
-# version 22.1
+# version 22.2.1
 
 0 */4 * * * echo `date +\%Y-\%m-\%d' '\%H:\%M` > /tmp/crontab_check.log
 #Ansible: FREEZE Заморозка ежемесячно
@@ -14,7 +14,11 @@
 
 */1 * * * * /postgres/pg_expecto/sh/pg_expecto.sh
 */1 * * * * /postgres/pg_expecto/sh/load_test/load_test.sh
-0 * * * * /postgres/pg_expecto/sh/load_test/test.sh 2 >> /postgres/pg_expecto/sh/load_test/test.log 2>&1
+## Генератор инцидентов (каждый час в 0 минут)
+0 * * * * /postgres/pg_expecto/sh/load_test/test.sh 4 >> /postgres/pg_expecto/sh/load_test/test.log 2>&1
+#
+## Постоянная минимальная нагрузка (каждый час в 5 минут, 59 мин работы)
+5 * * * * /postgres/pg_expecto/sh/load_test/baseload.sh 30 >> /postgres/pg_expecto/sh/load_test/baseload.log 2>&1
 
 #################################################################
 # Markov chain
@@ -68,13 +72,5 @@
 
 30 2 * * * psql -d expecto_db -U expecto_user -c "DELETE FROM operational_alert_history WHERE changed_at < now() - INTERVAL '90 days';"
 
-# ============================================================
-# Интегральный сигнал (SICPP + C-only)
-# ============================================================
-# Еженедельная очистка истории интегрального сигнала (воскресенье в 04:30)
-30 4 * * 0 psql -d expecto_db -U expecto_user -c "SELECT integral_signal_clean_history(90);" >/postgres/pg_expecto/sh/integral_signal_clean_history.log 2>&1
-
-# Санитарная проверка «залипания» ALARM (раз в сутки в 06:00)
-0 6 * * * psql -d expecto_db -U expecto_user -c "SELECT count(*) AS alarm_minutes FROM integral_signal_history WHERE status = 100 AND changed_at >= now() - interval '1 day';" >/postgres/pg_expecto/sh/integral_signal_alarm_minutes.log 2>&1
 # Markov chain
 #################################################################
