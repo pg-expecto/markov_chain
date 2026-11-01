@@ -16,7 +16,10 @@
 
 Данная реализация цепи Маркова предназначена для прогнозирования риска возникновения инцидентов производительности в СУБД на основе временных рядов метрик (операционная скорость, ожидания, корреляция). Модель обучается в реальном времени на потоке данных, использует адаптивное забывание для учёта дрейфа распределений и предоставляет вероятностные прогнозы на заданный горизонт.
 
-Версия **16.10** (внутренняя версия `v3.1.1`) развивает функциональность предыдущих релизов, добавляя расширенную отчётность по покрытию инцидентов с учётом времени упреждения (lead time), диагностику качества сигналов и новые параметры конфигурации, позволяющие более точно настраивать пороги срабатывания.
+**Текущая актуальная версия реализации — v24.3:**
+<https://github.com/pg-expecto/markov_chain/tree/main/v.24/24.3>
+
+Версия **24.3** развивает функциональность предыдущих релизов, добавляя расширенную отчётность по покрытию инцидентов с учётом времени упреждения (lead time), диагностику качества сигналов и новые параметры конфигурации, позволяющие более точно настраивать пороги срабатывания.
 
 Ключевые особенности:
 - Дискретизация непрерывных метрик в 189 состояний (3×3×21).
@@ -34,7 +37,7 @@
 
 Система состоит из следующих логических слоёв:
 
-- **Слой данных** – таблицы для хранения переходов, частот, вероятностей, конфигурации, журналов, а также новые таблицы и поля, появившиеся в версии 16.10.
+- **Слой данных** – таблицы для хранения переходов, частот, вероятностей, конфигурации, журналов, а также новые таблицы и поля, появившиеся в версии 24.3.
 - **Слой обучения** – функции `mchain_train_step`, `mchain_log_transition`, механизмы забывания и проверки достаточности данных.
 - **Слой прогнозирования** – функции `mchain_predict_risk_k_v2`, `mchain_predict_risk_current_horizon`, `collect_prediction`.
 - **Слой оценки** – функции `mchain_forecast_reliability`, `calculate_daily_quality_metrics`, отчёты качества, а также новые функции `generate_incident_forecast_report_v2` и `diagnose_incident_coverage`.
@@ -58,7 +61,7 @@
 - `critical_states` – динамический список состояний, считающихся аварийными (обновляется эмпирически).
 - `performance_history` – агрегированные метрики производительности для расчёта профилей (с версии 13).
 - `profile_aggregated`, `profile_baseline`, `anomaly_log`, `profile_comparison_log` – таблицы для профилирования нагрузки (с версии 14).
-- `incident_forecast_config` – параметры режима прогнозирования и весов сигналов. **В версии 16.10 добавлены новые поля:** `coverage_lead_threshold_min` (порог lead time для разделения покрытия), `series_filter_enabled` (флаг фильтрации серийных инцидентов), `sicpp_coverage_warn_threshold_pct` (порог предупреждения о покрытии SICPP).
+- `incident_forecast_config` – параметры режима прогнозирования и весов сигналов. **В версии 24.3 добавлены новые поля:** `coverage_lead_threshold_min` (порог lead time для разделения покрытия), `series_filter_enabled` (флаг фильтрации серийных инцидентов), `sicpp_coverage_warn_threshold_pct` (порог предупреждения о покрытии SICPP).
 - `sicpp_coverage_alerts` – алерты о критических инцидентах (P3) без сигнала SICPP.
 
 ### 3.2. Основные функции
@@ -71,7 +74,7 @@
 - `mchain_forecast_reliability()` – оценка достоверности прогнозов (0–5).
 - `refresh_critical_states()` – автоматическое обновление списка критических состояний на основе эмпирических рисков.
 - `calculate_daily_quality_metrics(date)` – расчёт суточных метрик качества (Brier, ECE, MCE и др.).
-- **`generate_incident_forecast_report_v2()`** – **основная отчётная функция (v3.1.1)**. Формирует детализированный отчёт, включающий разделы:
+- **`generate_incident_forecast_report_v2()`** – **основная отчётная функция (v24.3)**. Формирует детализированный отчёт, включающий разделы:
   - «ПОКРЫТИЕ С УЧЁТОМ LEAD TIME» (количество инцидентов с `lead >= coverage_lead_threshold_min` и `lead < порога`);
   - «ПОКРЫТИЕ ПО ПРИОРИТЕТАМ»;
   - «ТОЧНОСТЬ СИГНАЛА (PRECISION эпизодов)»;
@@ -96,10 +99,7 @@
 ### 4.1. Адаптивное забывание
 
 Забывание управляется коэффициентом α, который может быть фиксированным или адаптивным. В адаптивном режиме:
-
-```
 α(t) = max( min_alpha, base_alpha * exp(-days_since_last_incident / half_life) )
-```
 
 где `days_since_last_incident` – время, прошедшее с последнего попадания в критическое состояние. Это позволяет ускорить забывание после инцидентов (увеличивая α) и замедлить в стабильные периоды.
 
@@ -133,7 +133,7 @@
 - `collect_prediction` сохраняет прогноз в таблицу `prediction_log` с временной меткой.
 - `update_prediction_outcomes` (вызывается по cron) обновляет фактические исходы для прогнозов, у которых истёк горизонт: ищет первый переход в критическое состояние в окне и проставляет `actual_outcome` (1/0).
 
-### 5.4. Расширенная отчётность (новое в 16.10)
+### 5.4. Расширенная отчётность (новое в 24.3)
 
 Функция `generate_incident_forecast_report_v2` предоставляет углублённый анализ покрытия инцидентов, разделяя их на категории в зависимости от времени упреждения (`lead time`). Это позволяет оценить, насколько заранее система предсказывает инциденты, и выявить случаи, когда сигнал был активен, но не привёл к своевременному предупреждению. Отчёт также включает анализ точности (precision) эпизодов сигнала и распределение lead time, что даёт полную картину качества прогнозирования.
 
@@ -180,7 +180,7 @@
 - `generate_full_analytical_report` – всесторонний отчёт в формате Markdown.
 - **`generate_incident_forecast_report_v2`** – расширенный отчёт по покрытию инцидентов с учётом lead time (см. раздел 5.4).
 
-### 6.4. Результаты тестирования (v3.1.1)
+### 6.4. Результаты тестирования (v24.3)
 
 Согласно данным тестирования на наборе test5, достигнуты следующие показатели:
 - Покрытие инцидентов (episode-based): **25/25 (100%)**.
@@ -199,7 +199,7 @@
 - Адаптация к изменению характера нагрузки благодаря забыванию.
 - Гибкая настройка горизонта прогноза и параметров забывания.
 - Встроенные механизмы оценки качества и достоверности.
-- Расширяемая архитектура (добавлены профили нагрузки в версии 14, SICPP в версии 16, расширенная отчётность в версии 16.10).
+- Расширяемая архитектура (добавлены профили нагрузки в версии 14, SICPP в версии 16, расширенная отчётность в версии 24.3).
 
 Система успешно применяется для мониторинга производительности СУБД и предупреждения о возможных сбоях.
 
@@ -292,7 +292,7 @@
   - Добавлена ежечасная проверка P3-покрытия.
   - Рекомендованный порог `refresh_critical_states(p_risk_threshold => 0.10)`.
 
-### Версия 16.10 (актуальная)
+### Версия 16.10 (актуальная на момент предыдущего релиза)
 
 **Ключевые особенности (внутренняя версия v3.1.1):**
 
@@ -330,6 +330,71 @@
 
 ---
 
+### Версия 17
+
+<https://github.com/pg-expecto/markov_chain/tree/main/v.17>
+
+- Развитие подсистемы SICPP: уточнение семантики и структуры истории сигналов.
+- В состав релиза входят обновлённые `markov_chain_functions.sql`, `markov_chain_profile_functions.sql`, `markov_chain_profile_tables.sql`, `markov_chain_tables.sql` и `performance_metrics_for_markov_chain.sql`.
+- В `markov_chain_profile_tables.sql` добавлены/уточнены поля, связанные с длительностью эпизодов SICPP и флагами ограничения (`signal_capped`, `episode_started_at`).
+- В `markov_chain_profile_functions.sql` доработаны функции расчёта SICPP и исторического заполнения.
+
+### Версия 18
+
+<https://github.com/pg-expecto/markov_chain/tree/main/v.18>
+
+- Развитие механизма фиксации реального старта эпизода SICPP (`episode_started_at`) и ограничения максимальной длительности сигнала (`max_signal_duration_minutes`).
+- Уточнена логика работы с «зонами восстановления» (RECOVERY) после инцидентов.
+- В `markov_chain_functions.sql` обновлены отчётные функции, связанные с покрытием SICPP и lead time.
+
+### Версия 19
+
+<https://github.com/pg-expecto/markov_chain/tree/main/v.19>
+
+- Переработка механизма обновления `critical_states`: переход на эмпирический риск (`compute_empirical_incident_risk`) с явным указанием интервала риска.
+- Функция `refresh_critical_states` получила параметр `p_interval_min` (с авто-разрешением из `forecast_horizon_minutes`) и рекомендованный порог `p_risk_threshold = 0.10`.
+- Уточнены функции диагностики покрытия инцидентов (`diagnose_incident_coverage`) и отчёт `generate_incident_forecast_report_v2`.
+
+### Версия 20
+
+<https://github.com/pg-expecto/markov_chain/tree/main/v.20>
+
+- Развитие отчётности и диагностики: добавлены/уточнены `report_prediction_incident_summary`, `operational_signals_report` и связанные функции.
+- В `markov_chain_cron.txt` (появился в 20.2) формализован набор cron-задач сопровождения.
+- В `markov_chain_functions.sql` и `markov_chain_profile_functions.sql` доработаны функции расчёта покрытия, lead time и диагностики C-only.
+
+### Версия 21
+
+<https://github.com/pg-expecto/markov_chain/tree/main/v.21>
+
+- **Автонастройка порогов SICPP** (`adapt_sicpp_thresholds`): периодический пересчёт `js_threshold` и `risk_threshold` по «чистым» окнам калибровки с ограничением шага изменения и записью в `sicpp_threshold_history`.
+- Уточнена логика `mchain_hybrid_alert_at` и связанных функций C-only.
+- В `markov_chain_tables.sql` добавлены поля, необходимые для хранения параметров автонастройки SICPP.
+
+### Версия 22
+
+<https://github.com/pg-expecto/markov_chain/tree/main/v.22>
+
+- Развитие отчётности по прогнозированию инцидентов: обновлён `generate_incident_forecast_report_v2` (v22.0 → v22.1) с разделением «фактических» порогов из `incident_forecast_config` и «in-memory рекомендаций».
+- Уточнена работа с зонами восстановления (`is_in_recovery_zone`) и принудительным подавлением сигналов в `sicpp_calculate_at` и `mchain_hybrid_alert_at`.
+- В `markov_chain_cron.txt` добавлены/уточнены задачи очистки и обслуживания.
+
+### Версия 24.3 (текущая актуальная)
+
+<https://github.com/pg-expecto/markov_chain/tree/main/v.24/24.3>
+
+- **Текущая актуальная версия реализации цепи Маркова.**
+- Включает полную инструкцию по установке, историческому заполнению, настройке тестовой нагрузки и сопровождению.
+- Добавлены/закреплены:
+  - `sicpp_incident_flag_update_step()` и `sicpp_incident_flag_historical_fill()` — флаг инцидентов на основе SICPP (аналог `c_only_incident_flag`);
+  - `operational_signals_report()` — сводный отчёт по результирующим эпизодам `c_only_incident_flag` и `sicpp_incident_flag`;
+  - уточнённые отчёты `get_current_signals_status`, `get_current_signals_text`, `get_c_only_incident_flag_status`, `get_sicpp_incident_flag_status`;
+  - расширенные cron-задачи сопровождения (очистка историй флагов, SICPP, профилей, журналов).
+- Обеспечена совместимость с PostgreSQL 13+.
+- Результаты тестирования (на данных test5): покрытие инцидентов **25/25 (100%)**, покрытие с `lead ≥ 60 мин` — **88%**, precision эпизодов — **37.5%**, ROC‑AUC — **0.9568**, Brier — **0.0652** (при горизонте 120 мин).
+
+---
+
 ### История версии 16 (краткая хронология)
 
 | Версия | Дата (примерная) | Ключевые изменения |
@@ -340,3 +405,17 @@
 | **16.8** | 16 окт. 2026 | Введён SICPP: таблицы `sicpp_history`, `sicpp_current_state`, функции `sicpp_calculate_at()`, `sicpp_update_state()`, `historical_fill_sicpp()`, `report_incidents_vs_sicpp()` (v2.0.1), `diagnose_incident_coverage()`, `check_p3_coverage_gaps()`, `get_active_p3_alerts()`, `acknowledge_p3_alert()`. |
 | **16.9** | 17 окт. 2026 | Финализация SICPP: `sicpp_calculate_at()` v1.1.0, `report_incidents_vs_sicpp()` v2.0.1 (покрытие по эпизодам), `diagnose_incident_coverage()` v2.0.2, обновлён `install.md`, добавлены cron-задачи. |
 | **16.10** | 18 окт. 2026 | **Расширенная отчётность**: `generate_incident_forecast_report_v2()`, обновлённая `diagnose_incident_coverage()`. Новые параметры в `incident_forecast_config`: `coverage_lead_threshold_min`, `series_filter_enabled`, `sicpp_coverage_warn_threshold_pct`. Уточнены легенды и комментарии. Подтверждены высокие метрики на тестовых данных. |
+
+---
+
+### Версии 17–24.3 (краткая хронология)
+
+| Версия | Ссылка | Ключевые изменения |
+|--------|--------|-------------------|
+| **17** | <https://github.com/pg-expecto/markov_chain/tree/main/v.17> | Развитие SICPP: уточнение структуры истории сигналов, полей `signal_capped` и `episode_started_at`. |
+| **18** | <https://github.com/pg-expecto/markov_chain/tree/main/v.18> | Уточнение логики `episode_started_at`, ограничения `max_signal_duration_minutes` и «зон восстановления» (RECOVERY). |
+| **19** | <https://github.com/pg-expecto/markov_chain/tree/main/v.19> | Переработка `refresh_critical_states`: эмпирический риск, `p_interval_min`, `p_risk_threshold = 0.10`. |
+| **20** | <https://github.com/pg-expecto/markov_chain/tree/main/v.20> | Развитие отчётности (`report_prediction_incident_summary`, `operational_signals_report`), формализация `markov_chain_cron.txt`. |
+| **21** | <https://github.com/pg-expecto/markov_chain/tree/main/v.21> | **Автонастройка порогов SICPP** (`adapt_sicpp_thresholds`), расширение `incident_forecast_config`. |
+| **22** | <https://github.com/pg-expecto/markov_chain/tree/main/v.22> | Уточнение отчёта `generate_incident_forecast_report_v2` (фактические пороги из config vs in-memory), работа с RECOVERY-зоной. |
+| **24.3** | <https://github.com/pg-expecto/markov_chain/tree/main/v.24/24.3> | **Текущая актуальная версия.** Полная инструкция, `sicpp_incident_flag`, `operational_signals_report`, расширенные cron-задачи, подтверждённые высокие метрики на test5. |
