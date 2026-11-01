@@ -1,85 +1,153 @@
-﻿#################################################################
-# Markov chain
-# version 24.2.1
-
-0 */4 * * * echo `date +\%Y-\%m-\%d' '\%H:\%M` > /tmp/crontab_check.log
-#Ansible: FREEZE Заморозка ежемесячно
-0 7 1 * * /postgres/scripts/atom_vacuumdb.sh --analyze --freeze
-#Ansible: ANALYZE Анализ и VACUUM каждое утро
-0 08 * * * /postgres/scripts/atom_vacuumdb.sh --analyze
-#Ansible: ANALYZE Анализ и VACUUM каждый вечер
-0 19 * * * /postgres/scripts/atom_vacuumdb.sh --analyze
-#Ansible: Количество ошибок в логах OP306388
-*/5 * * * * /postgres/scripts/errors_count.sh
-
-*/1 * * * * /postgres/pg_expecto/sh/pg_expecto.sh
-*/1 * * * * /postgres/pg_expecto/sh/load_test/load_test.sh
-## Генератор инцидентов (каждый час в 0 минут)
-0 * * * * /postgres/pg_expecto/sh/load_test/test.sh 4 >> /postgres/pg_expecto/sh/load_test/test.log 2>&1
+#################################################################
+# Markov chain — CRON SCHEDULE
+# version 24.3
 #
-## Постоянная минимальная нагрузка (каждый час в 5 минут, 59 мин работы)
-5 * * * * /postgres/pg_expecto/sh/load_test/baseload.sh 30 >> /postgres/pg_expecto/sh/load_test/baseload.log 2>&1
+# Группировка задач по назначению:
+#   [0]   Служебные задачи СУБД (VACUUM, ANALYZE, FREEZE, лог ошибок)
+#   [1]   Генерация нагрузки и инцидентов (тестовый стенд)
+#   [2]   Ядро цепи Маркова — очистка журналов переходов и забывания
+#   [3]   Анализ качества прогнозов и обучение
+#   [4]   Профилирование нагрузки (profile_*)
+#   [5]   SICPP — история сигнала
+#   [6]   Флаги инцидентов (c_only / sicpp) — retention
+#################################################################
+
 
 #################################################################
-# Markov chain
-# 16.9
-# ============================================================
-# Ежедневная очистка журналов и обновление статистик
-# ============================================================
-# Очистка transition_log (в 01:15)
+# [0] СЛУЖЕБНЫЕ ЗАДАЧИ СУБД
+#     Обслуживание БД и инфраструктуры (VACUUM, ANALYZE, FREEZE,
+#     подсчёт ошибок в логах). Не относятся напрямую к цепи Маркова,
+#     но обеспечивают её стабильную работу.
+#################################################################
+
+# Проверка работоспособности cron (пишет метку времени в /tmp)
+0 */4 * * * echo `date +\%Y-\%m-\%d' '\%H:\%M` > /tmp/crontab_check.log
+
+#Ansible: FREEZE Заморозка ежемесячно
+# Заморозка старых транзакций (аналог VACUUM FREEZE) — 1-е число в 07:00
+0 7 1 * * /postgres/scripts/atom_vacuumdb.sh --analyze --freeze
+
+#Ansible: ANALYZE Анализ и VACUUM каждое утро
+# Утренний VACUUM ANALYZE всей базы — ежедневно в 08:00
+0 08 * * * /postgres/scripts/atom_vacuumdb.sh --analyze
+
+#Ansible: ANALYZE Анализ и VACUUM каждый вечер
+# Вечерний VACUUM ANALYZE всей базы — ежедневно в 19:00
+0 19 * * * /postgres/scripts/atom_vacuumdb.sh --analyze
+
+#Ansible: Количество ошибок в логах OP306388
+# Подсчёт ошибок в логах PostgreSQL — каждые 5 минут
+*/5 * * * * /postgres/scripts/errors_count.sh
+
+
+#################################################################
+# [1] ГЕНЕРАЦИЯ НАГРУЗКИ И ИНЦИДЕНТОВ (тестовый стенд)
+#     Эмуляция рабочей нагрузки и искусственных инцидентов
+#     для проверки модели на тестовой СУБД.
+#################################################################
+
+# Основной сборщик метрик производительности (pg_expecto) — ежеминутно
+*/1 * * * * /postgres/pg_expecto/sh/pg_expecto.sh
+
+# Load-test: сбор метрик под нагрузкой — ежеминутно
+*/1 * * * * /postgres/pg_expecto/sh/load_test/load_test.sh
+
+# Генератор инцидентов: имитация аварийной нагрузки — каждый час в :00
+0 * * * * /postgres/pg_expecto/sh/load_test/test.sh 4 >> /postgres/pg_expecto/sh/load_test/test.log 2>&1
+
+
+#################################################################
+# [2] ЯДРО ЦЕПИ МАРКОВА — ОЧИСТКА ЖУРНАЛОВ
+#     Регулярное удаление устаревших записей журналов переходов
+#     и применённого забывания согласно retention-политике.
+#################################################################
+
+# Очистка transition_log от записей старше transition_log_retention_days (01:15)
+# Удаляет устаревшую историю переходов; глубина хранения — из markov_config
 15 1 * * * psql -d expecto_db -U expecto_user -c "SELECT mchain_clean_transition_log();"
 
-# ============================================================
-# Очистка архивных данных (раз в неделю)
-# ============================================================
-# Очистка apply_forgetting_log (ежедневно в 02:00)
+# Очистка apply_forgetting_log от записей старше apply_forgetting_log_retention_days (02:00)
+# Удаляет журнал вызовов забывания; глубина хранения — из markov_config
 0 2 * * * psql -d expecto_db -U expecto_user -c "SELECT mchain_clean_apply_forgetting_log();"
 
-# ============================================================
-# Анализ качества прогноза
-# ============================================================
-# Обновление critical_states еженедельно (ежедневно 03:00):
+
+#################################################################
+# [3] АНАЛИЗ КАЧЕСТВА ПРОГНОЗОВ И ОБУЧЕНИЕ
+#     Поддержание актуальности критических состояний,
+#     расчёт исходов прогнозов, суточных метрик и адаптивных порогов.
+#################################################################
+
+# Обновление critical_states (ежедневно 03:00)
+# Пересчитывает список аварийных состояний по эмпирическому риску
+# (порог 0.10, min_transitions=20, интервал из markov_config).
+# Результат и audit записываются в лог-файл.
 0 3 * * * psql -d expecto_db -U expecto_user -c "SELECT refresh_critical_states(p_risk_threshold => 0.10, p_dry_run => FALSE, p_audit => TRUE);" >>/postgres/pg_expecto/sh/refresh_critical_states.log 2>&1
 
-# Обновление исходов каждые 5 минут
+# Обновление исходов прогнозов (каждые 5 минут)
+# Заполняет actual_outcome / first_incident_time / incident_count
+# для прогнозов с истёкшим горизонтом (из markov_config).
 */5 * * * * psql -d expecto_db -U expecto_user -c "SELECT update_prediction_outcomes();"
 
-# Расчёт суточных метрик в 02:00
+# Расчёт суточных метрик качества (02:00)
+# Brier, log-loss, ROC-AUC, precision/recall, MAE, ECE/MCE
+# за предыдущие сутки — записываются в mchain_quality_metrics_history.
 0 2 * * * psql -d expecto_db -U expecto_user -c "SELECT calculate_daily_quality_metrics(CURRENT_DATE - 1);"
 
-# Еженедельная адаптивная настройка min_freq_for_stability (воскресенье в 01:00)
+# Адаптивная настройка min_freq_for_stability (воскресенье 01:00)
+# Пересчитывает порог min_freq_for_stability по объёму переходов
+# за последние 14 дней (при достаточном обучении).
 0 1 * * 0 psql -d expecto_db -U expecto_user -c "SELECT refresh_stability_threshold();"
 
-#################################################################################################
-# Расчет метрик профиля нагрузки на основе цепи Маркова
-# Ежедневная очистка (в 03:00)
+
+#################################################################
+# [4] ПРОФИЛИРОВАНИЕ НАГРУЗКИ (profile_*)
+#     Сравнение эталонного и текущего профилей, сбор
+#     пред-инцидентных профилей, обслуживание индикатора профиля.
+#################################################################
+
+# Очистка profile_comparison_log (ежедневно 03:00)
+# Удаляет записи старше profile_comparison_retention_days (из markov_config).
 0 3 * * * psql -d expecto_db -U expecto_user -c "SELECT clean_profile_comparison_log();"
 
-# Ежедневно в 02:30 добавляем профили для инцидентов за предыдущий день
+# Сбор пред-инцидентных профилей (ежедневно 02:30)
+# За предыдущий день собирает в pre_incident_profiles профили
+# по 60-минутному окну перед каждым инцидентом.
 30 2 * * * psql -d expecto_db -U expecto_user -c "SELECT collect_pre_incident_profiles(now() - interval '1 day', now(), 60);" > /postgres/pg_expecto/sh/collect_pre_incident.log 2>&1
 
-# Очистка старых данных индикатора изменения профиля (каждый день в 2:00)
+# Очистка profile_change_indicator (ежедневно 02:00)
+# Удаляет записи старше 30 дней (индикатор прединцидентного состояния).
 0 2 * * * psql -d expecto_db -U expecto_user -c "SELECT clean_old_profile_change_indicator(30);" > /postgres/pg_expecto/sh/clean_old_profile_change_indicator.log 2>&1
 
-# Расчет метрик профиля нагрузки на основе цепи Маркова
-#################################################################################################
 
-# ============================================================
-# SICPP (Signal Indicating a Change in the Performance Profile)
-# ============================================================
-# Еженедельная очистка истории SICPP (воскресенье в 04:00)
+#################################################################
+# [5] SICPP — ИСТОРИЯ СИГНАЛА
+#     Очистка истории сигнала SICPP (Signal Indicating a Change
+#     in the Performance Profile) и журнала ALERT.
+#################################################################
+
+# Очистка sicpp_history старше 90 дней (воскресенье 04:00)
+# Удаляет устаревшие записи состояния SICPP; сохраняется последние 90 дней.
 0 4 * * 0 psql -d expecto_db -U expecto_user -c "SELECT sicpp_clean_history(90);" >/postgres/pg_expecto/sh/sicpp_clean_history.log 2>&1
 
+# Очистка operational_alert_history старше 90 дней (ежедневно 02:30)
+# Удаляет журнал изменений операционного индикатора ALERT (C-only).
 30 2 * * * psql -d expecto_db -U expecto_user -c "DELETE FROM operational_alert_history WHERE changed_at < now() - INTERVAL '90 days';"
 
-# ============================================================
-# c_only_incident_flag: retention (аналогично C-only, 90 дней)
-# ============================================================
+
+#################################################################
+# [6] ФЛАГИ ИНЦИДЕНТОВ — RETENTION
+#     Очистка историй флагов c_only_incident_flag и
+#     sicpp_incident_flag (retention 90 дней).
+#################################################################
+
+# Очистка c_only_incident_flag_history старше 90 дней (ежедневно 02:30)
+# Удаляет устаревшие записи истории флага C-only инцидентов.
 30 2 * * * psql -d expecto_db -U expecto_user -c "SELECT clean_c_only_incident_flag_history(90);" >/postgres/pg_expecto/sh/clean_c_only_incident_flag_history.log 2>&1
 
+# Очистка sicpp_incident_flag_history старше 90 дней (ежедневно 03:30)
+# Удаляет устаревшие записи истории флага SICPP инцидентов.
+30 3 * * * /usr/bin/psql -h 127.0.0.1 -U expecto_user -d expecto_db -c "SELECT clean_sicpp_incident_flag_history(90);" >> /postgres/pg_expecto/sh/sicpp_clean.log 2>&1
 
-# ежедневная очистка sicpp_incident_flag_history (retention 90 дней)
-30 3 * * * /usr/bin/psql -h 127.0.0.1 -U expecto_user -d expecto_db -c "SELECT clean_sicpp_incident_flag_history(90);"  >> >/postgres/pg_expecto/sh/sicpp_clean.log 2>&1
-
-# Markov chain
+#################################################################
+# End of Markov chain cron schedule
 #################################################################
