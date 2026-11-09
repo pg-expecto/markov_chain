@@ -1,0 +1,198 @@
+﻿#################################################################
+# Markov chain — CRON SCHEDULE
+# version 26.1.3
+#
+# Группировка задач по назначению:
+#   [1]   Генерация нагрузки и инцидентов (тестовый стенд)
+#   [2]   Ядро цепи Маркова — очистка журналов переходов и забывания
+#   [3]   Анализ качества прогнозов и обучение
+#   [4]   Профилирование нагрузки (profile_*)
+#   [5]   SICPP — история сигнала
+#   [6]   Флаги инцидентов (c_only / sicpp) — retention
+#   [7]   Калибровка риска (calibration_*) — health-report, refit, retention
+#################################################################
+
+
+
+
+
+#################################################################
+# [1] ГЕНЕРАЦИЯ НАГРУЗКИ И ИНЦИДЕНТОВ (тестовый стенд)
+#     Эмуляция рабочей нагрузки и искусственных инцидентов
+#     для проверки модели на тестовой СУБД.
+#################################################################
+
+# Основной сборщик метрик производительности (pg_expecto) — ежеминутно
+*/1 * * * * /postgres/pg_expecto/sh/pg_expecto.sh
+
+# Load-test: сбор метрик под нагрузкой — ежеминутно
+*/1 * * * * /postgres/pg_expecto/sh/load_test/load_test.sh
+
+# Генератор инцидентов: имитация аварийной нагрузки — каждый час в :00
+0 * * * * /postgres/pg_expecto/sh/load_test/test.sh 4 >> /postgres/pg_expecto/sh/load_test/test.log 2>&1
+
+
+#################################################################
+# [2] ЯДРО ЦЕПИ МАРКОВА — ОЧИСТКА ЖУРНАЛОВ
+#     Регулярное удаление устаревших записей журналов переходов
+#     и применённого забывания согласно retention-политике.
+#################################################################
+
+# Очистка transition_log от записей старше transition_log_retention_days (01:15)
+# Удаляет устаревшую историю переходов; глубина хранения — из markov_config
+15 1 * * * psql -d expecto_db -U expecto_user -c "SELECT mchain_clean_transition_log();"
+
+# Очистка apply_forgetting_log от записей старше apply_forgetting_log_retention_days (02:00)
+# Удаляет журнал вызовов забывания; глубина хранения — из markov_config
+0 2 * * * psql -d expecto_db -U expecto_user -c "SELECT mchain_clean_apply_forgetting_log();"
+
+
+#################################################################
+# [3] АНАЛИЗ КАЧЕСТВА ПРОГНОЗОВ И ОБУЧЕНИЕ
+#     Поддержание актуальности критических состояний,
+#     расчёт исходов прогнозов, суточных метрик и адаптивных порогов.
+#################################################################
+
+# Обновление critical_states (ежедневно 03:00)
+# Пересчитывает список аварийных состояний по эмпирическому риску
+# (порог 0.10, min_transitions=20, интервал из markov_config).
+# Результат и audit записываются в лог-файл.
+0 3 * * * psql -d expecto_db -U expecto_user -c "SELECT refresh_critical_states(p_risk_threshold => 0.10, p_dry_run => FALSE, p_audit => TRUE);" >>/postgres/pg_expecto/sh/refresh_critical_states.log 2>&1
+
+# Обновление исходов прогнозов (каждые 5 минут)
+# Заполняет actual_outcome / first_incident_time / incident_count
+# для прогнозов с истёкшим горизонтом (из markov_config).
+*/5 * * * * psql -d expecto_db -U expecto_user -c "SELECT update_prediction_outcomes();"
+
+# Расчёт суточных метрик качества (02:00)
+# Brier, log-loss, ROC-AUC, precision/recall, MAE, ECE/MCE
+# за предыдущие сутки — записываются в mchain_quality_metrics_history.
+0 2 * * * psql -d expecto_db -U expecto_user -c "SELECT calculate_daily_quality_metrics(CURRENT_DATE - 1);"
+
+# Адаптивная настройка min_freq_for_stability (воскресенье 01:00)
+# Пересчитывает порог min_freq_for_stability по объёму переходов
+# за последние 14 дней (при достаточном обучении).
+0 1 * * 0 psql -d expecto_db -U expecto_user -c "SELECT refresh_stability_threshold();"
+
+
+#################################################################
+# [4] ПРОФИЛИРОВАНИЕ НАГРУЗКИ (profile_*)
+#     Сравнение эталонного и текущего профилей, сбор
+#     пред-инцидентных профилей, обслуживание индикатора профиля.
+#################################################################
+
+# Очистка profile_comparison_log (ежедневно 03:00)
+# Удаляет записи старше profile_comparison_retention_days (из markov_config).
+0 3 * * * psql -d expecto_db -U expecto_user -c "SELECT clean_profile_comparison_log();"
+
+# Сбор пред-инцидентных профилей (ежедневно 02:30)
+# За предыдущий день собирает в pre_incident_profiles профили
+# по 60-минутному окну перед каждым инцидентом.
+30 2 * * * psql -d expecto_db -U expecto_user -c "SELECT collect_pre_incident_profiles(now() - interval '1 day', now(), 60);" > /postgres/pg_expecto/sh/collect_pre_incident.log 2>&1
+
+# Очистка profile_change_indicator (ежедневно 02:00)
+# Удаляет записи старше 30 дней (индикатор прединцидентного состояния).
+0 2 * * * psql -d expecto_db -U expecto_user -c "SELECT clean_old_profile_change_indicator(30);" > /postgres/pg_expecto/sh/clean_old_profile_change_indicator.log 2>&1
+
+
+#################################################################
+# [5] SICPP — ИСТОРИЯ СИГНАЛА
+#     Очистка истории сигнала SICPP (Signal Indicating a Change
+#     in the Performance Profile) и журнала ALERT.
+#################################################################
+
+# Очистка sicpp_history старше 90 дней (воскресенье 04:00)
+# Удаляет устаревшие записи состояния SICPP; сохраняется последние 90 дней.
+0 4 * * 0 psql -d expecto_db -U expecto_user -c "SELECT sicpp_clean_history(90);" >/postgres/pg_expecto/sh/sicpp_clean_history.log 2>&1
+
+# Очистка operational_alert_history старше 90 дней (ежедневно 02:30)
+# Удаляет журнал изменений операционного индикатора ALERT (C-only).
+30 2 * * * psql -d expecto_db -U expecto_user -c "DELETE FROM operational_alert_history WHERE changed_at < now() - INTERVAL '90 days';"
+
+
+#################################################################
+# [6] ФЛАГИ ИНЦИДЕНТОВ — RETENTION
+#     Очистка историй флагов c_only_incident_flag и
+#     sicpp_incident_flag (retention 90 дней).
+#################################################################
+
+# Очистка c_only_incident_flag_history старше 90 дней (ежедневно 02:30)
+# Удаляет устаревшие записи истории флага C-only инцидентов.
+30 2 * * * psql -d expecto_db -U expecto_user -c "SELECT clean_c_only_incident_flag_history(90);" >/postgres/pg_expecto/sh/clean_c_only_incident_flag_history.log 2>&1
+
+# Очистка sicpp_incident_flag_history старше 90 дней (ежедневно 03:30)
+# Удаляет устаревшие записи истории флага SICPP инцидентов.
+30 3 * * * /usr/bin/psql  -U expecto_user -d expecto_db -c "SELECT clean_sicpp_incident_flag_history(90);" >> /postgres/pg_expecto/sh/sicpp_clean.log 2>&1
+
+
+#################################################################
+# [7] КАЛИБРОВКА РИСКА (calibration_*)
+#     Мониторинг состояния калибровки (isotonic / platt / bin),
+#     еженедельный snapshot OOS-метрик, retention mchain_calibration_log,
+#     а также one-shot refit (2026-12-03) и backfill.
+#
+#     Требование: функция mchain_calibration_health_report()
+#     должна быть создана в БД (см. §6 отчёта test6).
+#
+#     Периодичность:
+#       - Daily  health-report → файл (до 2026-12-03, период накопления)
+#       - Weekly health-report → файл (основной, после refit)
+#       - Weekly snapshot OOS-метрик → mchain_calibration_log
+#       - Weekly cleanup mchain_calibration_log (retention 90 дней)
+#       - One-shot pre-refit check (2026-12-02)
+#       - One-shot refit + backfill (2026-12-03) — ЗАКОММЕНТИРОВАНО
+#################################################################
+
+# Daily calibration health-report → файл (09:00)
+# Период накопления данных до планового refit 2026-12-03.
+# Содержит: config state, notes-маркеры, OOS-метрики (raw vs calibrated:
+# Brier/ECE/MCE-all/MCE-n>=10), baseline, map jump-detector, readiness,
+# verdict (GREEN/YELLOW/RED).
+# После успешного refit — закомментировать эту строку (оставить weekly).
+0 9 * * * psql -d expecto_db -U expecto_user -A -t -c "SELECT unnest(mchain_calibration_health_report(7));" >> /postgres/pg_expecto/sh/mchain_calibration_daily.log 2>&1
+
+# Weekly calibration health-report → файл (понедельник 09:00)
+# Основной долгосрочный мониторинг (после 2026-12-03 — единственный источник).
+0 9 * * 1 psql -d expecto_db -U expecto_user -A -t -c "SELECT unnest(mchain_calibration_health_report(7));" >> /postgres/pg_expecto/sh/mchain_calibration_weekly.log 2>&1
+
+# Weekly snapshot OOS-метрик в mchain_calibration_log (понедельник 09:05)
+# Записывает raw/calibrated Brier/ECE за последние 7 дней — baseline
+# для сравнения со следующими неделями. Используется разделом BASELINE
+# в health-report.
+5 9 * * 1 psql -d expecto_db -U expecto_user -c "INSERT INTO mchain_calibration_log (method, training_start, training_end, sample_size, brier_before, brier_after, ece_before, ece_after, reason) SELECT 'monitor_weekly', now()-interval '7 days', now(), MAX(CASE WHEN variant='calibrated' THEN n END), MAX(CASE WHEN variant='raw' THEN brier END), MAX(CASE WHEN variant='calibrated' THEN brier END), MAX(CASE WHEN variant='raw' THEN ece END), MAX(CASE WHEN variant='calibrated' THEN ece END), 'Cron weekly monitor (auto)' FROM (SELECT 'raw' AS variant, m.* FROM mchain_compute_calibration_metrics(now()-interval '7 days', now(), FALSE, 30) m UNION ALL SELECT 'calibrated', m.* FROM mchain_compute_calibration_metrics(now()-interval '7 days', now(), TRUE, 30) m) sub;" >> /postgres/pg_expecto/sh/mchain_calibration_weekly.log 2>&1
+
+# Retention mchain_calibration_log (воскресенье 05:00, 90 дней)
+# Удаляет записи isotonic / backfill / audit_* / monitor_weekly
+# старше 90 дней. При частоте ~1 запись/неделю рост минимален,
+# но поддерживаем единую политику ретенции.
+0 5 * * 0 psql -d expecto_db -U expecto_user -c "DELETE FROM mchain_calibration_log WHERE ts < now() - INTERVAL '90 days';" >> /postgres/pg_expecto/sh/mchain_calibration_weekly.log 2>&1
+
+# ─── PRE-REFIT READINESS CHECK (one-shot 2026-12-02, среда 09:00) ───────
+# За день до планового refit 2026-12-03. Только читает состояние,
+# не изменяет конфиг. Запуск безопасен и в последующие годы
+# (просто выводит текущий health-report в отдельный лог).
+# После 2026-12-02 — можно закомментировать.
+0 9 2 12 * psql -d expecto_db -U expecto_user -A -t -c "SELECT unnest(mchain_calibration_health_report(7));" >> /postgres/pg_expecto/sh/mchain_refit.log 2>&1
+
+# ─── REFIT + BACKFILL (one-shot 2026-12-03) — ЗАКОММЕНТИРОВАНО ──────────
+# Активировать вручную после:
+#   (1) проверки pre-refit readiness (2026-12-02),
+#   (2) подтверждения GREEN-вердикта,
+#   (3) уведомления владельца дашбордов.
+# После refit выполнить backfill, затем post-refit verification.
+#
+# Refit: isotonic с p_n_bins=10 (снижает риск P3 map collapse [0.1-0.4)).
+# Train window: [now-37d, now-7d] — последние 7 дней остаются OOS.
+# 0 9 3 12 * psql -d expecto_db -U expecto_user -c "SELECT mchain_fit_calibration_isotonic(p_start => now() - interval '37 days', p_end => now() - interval '7 days', p_n_bins => 10, p_min_samples => 500, p_horizon_min => 30);" >> /postgres/pg_expecto/sh/mchain_refit.log 2>&1
+#
+# Backfill calibrated_risk за всю историю (новой картой).
+# 0 10 3 12 * psql -d expecto_db -U expecto_user -c "SELECT mchain_backfill_calibrated_risk(now() - interval '120 days', now());" >> /postgres/pg_expecto/sh/mchain_refit.log 2>&1
+
+# ─── POST-REFIT VERIFICATION (one-shot 2026-12-04) — ЗАКОММЕНТИРОВАНО ───
+# Сравнение OOS-метрик с baseline (запись monitor_weekly от 2026-11-09).
+# При улучшении OOS Brier/ECE/MCE(n≥10) — разрешить переключение
+# дашбордов на mchain_predict_risk_current_horizon_calibrated().
+# 0 9 4 12 * psql -d expecto_db -U expecto_user -A -t -c "SELECT unnest(mchain_calibration_health_report(7));" >> /postgres/pg_expecto/sh/mchain_refit.log 2>&1
+#################################################################
+# End of Markov chain cron schedule
+#################################################################
