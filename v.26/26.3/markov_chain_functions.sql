@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_functions.sql
--- version 26.2.1
+-- version 26.3
 
 /*
 Функция : markov_chain_functions.sql — набор функций для цепи Маркова
