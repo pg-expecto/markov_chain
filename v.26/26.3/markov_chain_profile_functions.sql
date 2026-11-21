@@ -13,234 +13,385 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_profile_functions.sql
--- version 26.2.3
+-- version 26.3
 --------------------------------------------------------------------------------
 /*
-Файл : markov_chain_profile_functions.sql
-Назначение : Функции профилирования нагрузки, сравнения эталонных и текущих профилей, расчёта SICPP, C-only ALERT, флагов инцидентов, адаптации порогов и формирования аналитических отчётов по цепи Маркова.
+Функции профилирования нагрузки, сравнения эталонных и текущих
+            профилей, расчёта SICPP, C-only ALERT, флагов инцидентов,
+            адаптации порогов и формирования аналитических отчётов по цепи
+            Маркова.
 
 Функция : calculate_profile_metrics(p_start, p_end)
-Назначение : Вычисляет набор профильных метрик (гистограмма состояний с Laplace smoothing, средняя корреляция, доля критических, энтропия, углы трендов, доля петель и топ-переход) для заданного временного окна.
+Назначение : Вычисляет набор профильных метрик (гистограмма состояний с
+             Laplace smoothing, средняя корреляция, доля критических, энтропия,
+             углы трендов, доля петель и топ-переход) для заданного временного
+             окна.
 
 Функция : detect_anomaly(p_profile_type, p_hour, p_dow, p_threshold)
-Назначение : Вычисляет Z-оценки текущих метрик профиля относительно эталона для заданного временного слота и возвращает список аномалий.
+Назначение : Вычисляет Z-оценки текущих метрик профиля относительно эталона
+             для заданного временного слота и возвращает список аномалий.
 
 Функция : get_deviation_report(p_profile_type, p_ts)
-Назначение : Возвращает отчёт об отклонениях последнего профиля указанного типа от эталона с уровнем серьёзности (NORMAL/WARNING/HIGH/CRITICAL).
+Назначение : Возвращает отчёт об отклонениях последнего профиля указанного
+             типа от эталона с уровнем серьёзности (NORMAL/WARNING/HIGH/CRITICAL).
 
-Функция : log_anomaly(p_profile_type, p_hour, p_dow, p_anomaly_score, p_affected_metrics, p_threshold, p_details)
-Назначение : Записывает обнаруженную аномалию в anomaly_log и возвращает ID новой записи.
+Функция : log_anomaly(p_profile_type, p_hour, p_dow, p_anomaly_score,
+                      p_affected_metrics, p_threshold, p_details)
+Назначение : Записывает обнаруженную аномалию в anomaly_log и возвращает ID
+             новой записи.
 
 Функция : append_performance_history(p_start, p_end)
-Назначение : Инкрементально добавляет или обновляет записи в performance_history из cluster_stat_median (без TRUNCATE), вычисляя корреляцию и углы трендов.
+Назначение : Инкрементально добавляет или обновляет записи в
+             performance_history из cluster_stat_median (без TRUNCATE),
+             вычисляя корреляцию и углы трендов.
 
 Функция : generate_profile_summary_report()
-Назначение : Формирует краткий текстовый отчёт по текущим профилям нагрузки (operational/daily/weekly) с основными метриками и последними аномалиями из anomaly_log.
+Назначение : Формирует краткий текстовый отчёт по текущим профилям нагрузки
+             (operational/daily/weekly) с основными метриками и последними
+             аномалиями из anomaly_log.
 
 Функция : generate_detailed_profile_report()
-Назначение : Формирует расширенный отчёт по профилям с контекстными метриками производительности, связью с инцидентами, сравнением с предыдущим периодом, прогнозными метриками и общей оценкой состояния системы.
+Назначение : Формирует расширенный отчёт по профилям с контекстными метриками
+             производительности, связью с инцидентами, сравнением с предыдущим
+             периодом, прогнозными метриками и общей оценкой состояния системы.
 
 Функция : refresh_performance_history()
-Назначение : Дополняет performance_history новыми минутами от последней записи до now() через append_performance_history.
+Назначение : Дополняет performance_history новыми минутами от последней записи
+             до now() через append_performance_history.
 
 Функция : save_current_profile(p_window_minutes)
-Назначение : Сохраняет текущий профиль за последние p_window_minutes минут (profile_type='current'), удаляя старый.
+Назначение : Сохраняет текущий профиль за последние p_window_minutes минут
+             (profile_type='current'), удаляя старый.
 
 Функция : histogram_divergence(h1, h2)
-Назначение : Вычисляет JS-дивергенцию между двумя гистограммами (поле pct в процентах).
+Назначение : Вычисляет JS-дивергенцию между двумя гистограммами (поле pct в
+             процентах).
 
-Функция : compare_profiles(p_window_minutes, p_exclude_before_min, p_exclude_after_min)
-Назначение : Сравнивает эталонный и текущий профили; приоритет статусов INCIDENT > RECOVERY > NO_BASELINE > NORMAL/WARNING/CRITICAL; вычисляет JS-дивергенцию, pre_alert_flag и pre_alert_flag_advanced.
+Функция : compare_profiles(p_window_minutes, p_exclude_before_min,
+                           p_exclude_after_min)
+Назначение : Сравнивает эталонный и текущий профили; приоритет статусов
+             INCIDENT > RECOVERY > NO_BASELINE > NORMAL/WARNING/CRITICAL;
+             вычисляет JS-дивергенцию, pre_alert_flag и pre_alert_flag_advanced.
 
 Функция : clean_profile_comparison_log()
-Назначение : Удаляет записи из profile_comparison_log старше profile_comparison_retention_days (из markov_config).
+Назначение : Удаляет записи из profile_comparison_log старше
+             profile_comparison_retention_days (из markov_config).
 
-Функция : get_incident_free_window_before(p_ts, p_window_minutes, p_lookback_days, p_exclude_before_min, p_exclude_after_min)
-Назначение : Возвращает самое свежее валидное окно заданной длины, заканчивающееся не позже p_ts − p_exclude_after_min, с проверкой продуктивной нагрузки и зазора до инцидентов.
+Функция : get_incident_free_window_before(p_ts, p_window_minutes,
+                                          p_lookback_days,
+                                          p_exclude_before_min,
+                                          p_exclude_after_min)
+Назначение : Возвращает самое свежее валидное окно заданной длины,
+             заканчивающееся не позже p_ts − p_exclude_after_min, с проверкой
+             продуктивной нагрузки и зазора до инцидентов.
 
 Функция : generate_profile_incident_analytics_report(p_start, p_end)
-Назначение : Аналитический отчёт по связке сравнений профилей и инцидентов: статистика статусов, JS-дивергенции, связь с инцидентами, тренды и распределение по дням недели.
+Назначение : Аналитический отчёт по связке сравнений профилей и инцидентов:
+             статистика статусов, JS-дивергенции, связь с инцидентами, тренды
+             и распределение по дням недели.
 
 Функция : generate_comprehensive_analytical_report(p_start, p_end)
-Назначение : Сводный аналитический отчёт по производительности, прогнозам и профилям с корреляциями, трендами и итоговыми рекомендациями.
+Назначение : Сводный аналитический отчёт по производительности, прогнозам и
+             профилям с корреляциями, трендами и итоговыми рекомендациями.
 
 Функция : generate_analytical_report(p_start, p_end)
-Назначение : Аналитический отчёт по периоду (исключая статус INCIDENT) с качеством прогнозов, долями статусов перед инцидентами, временем CRITICAL→инцидент и трендами.
+Назначение : Аналитический отчёт по периоду (исключая статус INCIDENT) с
+             качеством прогнозов, долями статусов перед инцидентами, временем
+             CRITICAL→инцидент и трендами.
 
 Функция : collect_pre_incident_profiles(p_start, p_end, p_window_minutes)
-Назначение : Собирает прединцидентные профили из markov_chain_performance_incident в pre_incident_profiles с дедупликацией по incident_id.
+Назначение : Собирает прединцидентные профили из
+             markov_chain_performance_incident в pre_incident_profiles с
+             дедупликацией по incident_id.
 
-Функция : find_matching_pre_incident_profile(p_state_histogram, p_threshold, p_max_profiles)
-Назначение : Ищет в pre_incident_profiles профиль с JS-дивергенцией меньше порога и возвращает его id.
+Функция : find_matching_pre_incident_profile(p_state_histogram, p_threshold,
+                                             p_max_profiles)
+Назначение : Ищет в pre_incident_profiles профиль с JS-дивергенцией меньше
+             порога и возвращает его id.
 
-Функция : generate_pre_incident_audit_report(p_start, p_end, p_max_js_divergence)
-Назначение : Формирует отчёт о совпадениях текущих профилей с пред-инцидентными шаблонами с опциональным фильтром по JS-дивергенции.
+Функция : generate_pre_incident_audit_report(p_start, p_end,
+                                             p_max_js_divergence)
+Назначение : Формирует отчёт о совпадениях текущих профилей с
+             пред-инцидентными шаблонами с опциональным фильтром по
+             JS-дивергенции.
 
 Функция : update_profile_change_indicator()
-Назначение : Ежеминутно обновляет индикатор изменения профиля по последнему pre_alert_flag_advanced (=100 → TRUE) и фиксирует изменения в profile_change_indicator.
+Назначение : Ежеминутно обновляет индикатор изменения профиля по последнему
+             pre_alert_flag_advanced (=100 → TRUE) и фиксирует изменения в
+             profile_change_indicator.
 
 Функция : historical_fill_profile_change_indicator(p_start, p_end)
-Назначение : Исторически заполняет profile_change_indicator по минутам, определяя значение сигнала из последнего pre_alert_flag_advanced с current_window_end <= рассматриваемой минуты.
+Назначение : Исторически заполняет profile_change_indicator по минутам,
+             определяя значение сигнала из последнего pre_alert_flag_advanced
+             с current_window_end <= рассматриваемой минуты.
 
 Функция : clean_old_profile_change_indicator(p_retention_days)
-Назначение : Удаляет записи profile_change_indicator старше указанного числа дней (по умолчанию 30).
+Назначение : Удаляет записи profile_change_indicator старше указанного числа
+             дней (по умолчанию 30).
 
 Функция : calculate_signal(p_time, ...)
-Назначение : Вычисляет сигнал и статистику (JS/риск avg/min/max, slope, длительность) для заданного времени по prediction_log и profile_comparison_log (используется для отладки и сверки).
+Назначение : Вычисляет сигнал и статистику (JS/риск avg/min/max, slope,
+             длительность) для заданного времени по prediction_log и
+             profile_comparison_log (используется для отладки и сверки).
 
 Функция : compare_with_fixed_baseline(p_ts)
-Назначение : Сравнивает профиль в окне перед p_ts с фиксированным эталоном (profile_type='baseline') и пишет результат в profile_comparison_log.
+Назначение : Сравнивает профиль в окне перед p_ts с фиксированным эталоном
+             (profile_type='baseline') и пишет результат в
+             profile_comparison_log.
 
-Процедура : historical_fill_profile_comparison(p_start, p_end, p_step_minutes)
-Назначение : Массово заполняет profile_comparison_log через compare_with_fixed_baseline с заданным шагом по минутам.
+Процедура : historical_fill_profile_comparison(p_start, p_end,
+                                               p_step_minutes)
+Назначение : Массово заполняет profile_comparison_log через
+             compare_with_fixed_baseline с заданным шагом по минутам.
 
-Функция : compare_profiles_at(p_ts, p_window_minutes, p_lookback_days, p_exclude_before_min, p_exclude_after_min)
-Назначение : Сравнение эталонного и текущего профилей для заданного исторического момента; приоритет INCIDENT > RECOVERY > NO_BASELINE > N/W/C; восстановлены секции вычисления метрик, JS, статуса, pre-alerts и сохранения.
+Функция : compare_profiles_at(p_ts, p_window_minutes, p_lookback_days,
+                              p_exclude_before_min, p_exclude_after_min)
+Назначение : Сравнение эталонного и текущего профилей для заданного
+             исторического момента; приоритет INCIDENT > RECOVERY > NO_BASELINE
+             > N/W/C; восстановлены секции вычисления метрик, JS, статуса,
+             pre-alerts и сохранения.
 
-Функция : fill_profile_comparison_historically(p_start, p_end, p_step_minutes, p_window_minutes, p_lookback_days, p_clean)
-Назначение : Заполняет profile_comparison_log за исторический период, вызывая compare_profiles_at для каждой минуты.
+Функция : fill_profile_comparison_historically(p_start, p_end,
+                                               p_step_minutes,
+                                               p_window_minutes,
+                                               p_lookback_days, p_clean)
+Назначение : Заполняет profile_comparison_log за исторический период, вызывая
+             compare_profiles_at для каждой минуты.
 
 Функция : generate_profile_comparison_report(p_start, p_end)
-Назначение : Детализированный отчёт по profile_comparison_log: распределение статусов, JS-статистика, динамика по дням, связь с инцидентами, топ-5 аномалий и выводы.
+Назначение : Детализированный отчёт по profile_comparison_log: распределение
+             статусов, JS-статистика, динамика по дням, связь с инцидентами,
+             топ-5 аномалий и выводы.
 
 Функция : sicpp_calculate_at(p_ts, ...)
-Назначение : Вычисляет состояние SICPP на заданный момент: статистику JS/риска по «чистым» точкам (вне инцидентов), сигнал (AND/OR/WEIGHTED/OR_WITH_DURATION), длительность эпизода, capped, slope; в зоне восстановления сигнал принудительно FALSE (IN_RECOVERY).
+Назначение : Вычисляет состояние SICPP на заданный момент: статистику
+             JS/риска по «чистым» точкам (вне инцидентов), сигнал
+             (AND/OR/WEIGHTED/OR_WITH_DURATION), длительность эпизода, capped,
+             slope; в зоне восстановления сигнал принудительно FALSE
+             (IN_RECOVERY).
 
 Функция : sicpp_update_state()
-Назначение : Онлайн-обновление SICPP: skip внутри инцидента, обработка cooldown, force-close capped, логирование изменений в sicpp_history с reason='recovery_zone' при завершении из-за recovery.
+Назначение : Онлайн-обновление SICPP: skip внутри инцидента, обработка
+             cooldown, force-close capped, логирование изменений в sicpp_history
+             с reason='recovery_zone' при завершении из-за recovery.
 
 Функция : sicpp_get_current()
-Назначение : Возвращает текущее состояние SICPP из sicpp_current_state (включая signal_capped и episode_started_at).
+Назначение : Возвращает текущее состояние SICPP из sicpp_current_state
+             (включая signal_capped и episode_started_at).
 
 Функция : historical_fill_sicpp(p_start, p_end, p_step_minutes, p_clean)
-Назначение : Историческое заполнение sicpp_history с пропуском точек внутри инцидентов, cooldown и force-close capped; reason='recovery_zone' при завершении в зоне восстановления.
+Назначение : Историческое заполнение sicpp_history с пропуском точек внутри
+             инцидентов, cooldown и force-close capped; reason='recovery_zone'
+             при завершении в зоне восстановления.
 
 Функция : sicpp_clean_history(p_retention_days)
-Назначение : Удаляет записи sicpp_history старше p_retention_days (по умолчанию 90).
+Назначение : Удаляет записи sicpp_history старше p_retention_days
+             (по умолчанию 90).
 
-Функция : generate_incident_forecast_report_v2(p_start, p_end, p_show_inmemory_reco)
-Назначение : Отчёт по прогнозированию инцидентов на основе sicpp_history: покрытие SICPP, C-only, диагностика C, точность эпизодов, распределение lead time, LONG-эпизоды, FP и рекомендации.
+Функция : generate_incident_forecast_report_v2(p_start, p_end,
+                                               p_show_inmemory_reco)
+Назначение : Отчёт по прогнозированию инцидентов на основе sicpp_history:
+             покрытие SICPP, C-only, диагностика C, точность эпизодов,
+             распределение lead time, LONG-эпизоды, FP и рекомендации.
 
 Функция : diagnose_incident_coverage(p_incident_id)
-Назначение : Диагностика покрытия конкретного инцидента: данные инцидента, фильтры status_filter/series_filter, последняя запись SICPP, покрывающие эпизоды и вердикт.
+Назначение : Диагностика покрытия конкретного инцидента: данные инцидента,
+             фильтры status_filter/series_filter, последняя запись SICPP,
+             покрывающие эпизоды и вердикт.
 
 Функция : get_active_p3_alerts()
-Назначение : Возвращает неподтверждённые P3-алерты из sicpp_coverage_alerts с возрастом в часах.
+Назначение : Возвращает неподтверждённые P3-алерты из sicpp_coverage_alerts с
+             возрастом в часах.
 
 Функция : acknowledge_p3_alert(p_incident_id, p_ack_by)
-Назначение : Подтверждает P3-алерт по incident_id (acknowledged=TRUE, фиксирует ack_at/by).
+Назначение : Подтверждает P3-алерт по incident_id (acknowledged=TRUE,
+             фиксирует ack_at/by).
 
 Функция : get_current_preincident_status(...)
-Назначение : Возвращает интегральный статус предынцедентного состояния (0/50/100) по данным markov state, sicpp_current_state, profile_comparison_log, mchain_predict_risk_current_horizon() и mchain_hybrid_alert_at(now()).
+Назначение : Возвращает интегральный статус предынцедентного состояния
+             (0/50/100) по данным markov state, sicpp_current_state,
+             profile_comparison_log, mchain_predict_risk_current_horizon() и
+             mchain_hybrid_alert_at(now()).
 
 Функция : get_current_preincident_status_detail(...)
-Назначение : Детализация решения get_current_preincident_status() по источникам (State, SICPP, Comparison, C, Risk) и порогам.
+Назначение : Детализация решения get_current_preincident_status() по
+             источникам (State, SICPP, Comparison, C, Risk) и порогам.
 
 Функция : is_within_productive_load(p_ts, p_start_hour, p_end_hour)
-Назначение : Проверяет, попадает ли момент времени в период продуктивной нагрузки (из markov_config или явно).
+Назначение : Проверяет, попадает ли момент времени в период продуктивной
+             нагрузки (из markov_config или явно).
 
-Функция : is_window_within_productive_load(p_start, p_end, p_start_hour, p_end_hour)
-Назначение : Проверяет, что всё окно [p_start, p_end) целиком лежит в периоде продуктивной нагрузки.
+Функция : is_window_within_productive_load(p_start, p_end, p_start_hour,
+                                           p_end_hour)
+Назначение : Проверяет, что всё окно [p_start, p_end) целиком лежит в периоде
+             продуктивной нагрузки.
 
 Функция : is_valid_baseline_window(p_start, p_end, p_reference_ts)
-Назначение : Комплексная проверка эталонного окна: продуктивная нагрузка, зазор до инцидентов (включая будущие) и возраст относительно p_reference_ts.
+Назначение : Комплексная проверка эталонного окна: продуктивная нагрузка,
+             зазор до инцидентов (включая будущие) и возраст относительно
+             p_reference_ts.
 
-Функция : mchain_hybrid_alert_at(p_ts, p_js_min, p_p90_min, p_w_min, p_include_b, p_include_a)
-Назначение : C-only ALERT: вычисляет alert/fired_a/fired_b/fired_c, risk_p90, js_avg, w_score, spike_cnt по «чистым» точкам; в зоне восстановления и внутри инцидента сигнальные флаги принудительно FALSE/NULL.
+Функция : mchain_hybrid_alert_at(p_ts, p_js_min, p_p90_min, p_w_min,
+                                 p_include_b, p_include_a)
+Назначение : C-only ALERT: вычисляет alert/fired_a/fired_b/fired_c, risk_p90,
+             js_avg, w_score, spike_cnt по «чистым» точкам; в зоне
+             восстановления и внутри инцидента сигнальные флаги принудительно
+             FALSE/NULL.
 
-Функция : find_incident_free_window(p_window_minutes, p_lookback_days, p_exclude_after_min, p_overlap_threshold)
-Назначение : Устанавливает самое свежее валидное окно в incident_free_window_current с дефолтным exclude_after=60 и стабилизацией при идентичном/устаревшем окне.
+Функция : find_incident_free_window(p_window_minutes, p_lookback_days,
+                                    p_exclude_after_min,
+                                    p_overlap_threshold)
+Назначение : Устанавливает самое свежее валидное окно в
+             incident_free_window_current с дефолтным exclude_after=60 и
+             стабилизацией при идентичном/устаревшем окне.
 
 Функция : adapt_c_thresholds()
-Назначение : Адаптивно настраивает пороги C-only (hybrid_js_min_threshold, hybrid_p90_min_threshold, hybrid_w_score_min_threshold, hybrid_window_minutes) по перцентилям p90/js непокрытых инцидентов и пишет историю в c_threshold_history.
+Назначение : Адаптивно настраивает пороги C-only (hybrid_js_min_threshold,
+             hybrid_p90_min_threshold, hybrid_w_score_min_threshold,
+             hybrid_window_minutes) по перцентилям p90/js непокрытых инцидентов
+             и пишет историю в c_threshold_history.
 
 Функция : adapt_sicpp_thresholds()
-Назначение : Адаптивно настраивает js_threshold и risk_threshold SICPP по «чистым» окнам за calibration_period_days с ограничением шага и записью в sicpp_threshold_history.
+Назначение : Адаптивно настраивает js_threshold и risk_threshold SICPP по
+             «чистым» окнам за calibration_period_days с ограничением шага и
+             записью в sicpp_threshold_history.
 
 Функция : signals_report(p_start, p_end)
-Назначение : Отчёт по сигналам предупреждения инцидентов (SICPP, C-only, Integral) с временем первой активации, lead time, SICPP end и сводкой по lead time.
+Назначение : Отчёт по сигналам предупреждения инцидентов (SICPP, C-only,
+             Integral) с временем первой активации, lead time, SICPP end и
+             сводкой по lead time.
 
 Функция : signals_false_positive_report(p_start, p_end, p_grace_minutes)
-Назначение : Отчёт о ложных срабатываниях (FP) SICPP и C-only: TP/FP по эпизодам, precision, распределение FP по длительности и тренд по дням.
+Назначение : Отчёт о ложных срабатываниях (FP) SICPP и C-only: TP/FP по
+             эпизодам, precision, распределение FP по длительности и тренд по
+             дням.
 
 Функция : get_signals_valid_from(p_warm_up_minutes)
-Назначение : Возвращает earliest_reliable_ts (max из первых записей sicpp_history и operational_alert_history) и recommended_start_ts с округлением до 30 мин + warm-up; alarm_first_record всегда NULL.
+Назначение : Возвращает earliest_reliable_ts (max из первых записей
+             sicpp_history и operational_alert_history) и recommended_start_ts
+             с округлением до 30 мин + warm-up; alarm_first_record всегда NULL.
 
 Функция : sicpp_cooldown_status()
-Назначение : Диагностика cooldown SICPP: cooldown_until, remaining_minutes, sicpp_cooldown_minutes, signal_active, last_history_reason.
+Назначение : Диагностика cooldown SICPP: cooldown_until, remaining_minutes,
+             sicpp_cooldown_minutes, signal_active, last_history_reason.
 
 Функция : sicpp_verify_max_duration_enforcement(p_start, p_end)
-Назначение : Проверяет применение max_signal_duration_minutes и cooldown в sicpp_history: нарушения по duration, capped_force_end, cooldown_suppressed, статусы OK/FAIL/WARN/INFO.
+Назначение : Проверяет применение max_signal_duration_minutes и cooldown в
+             sicpp_history: нарушения по duration, capped_force_end,
+             cooldown_suppressed, статусы OK/FAIL/WARN/INFO.
 
 Функция : get_current_signals_text()
-Назначение : Текстовый отчёт о текущих значениях SICPP и C-only (active, strength, duration, capped, episode_start, alert/fired_c/profile_c/spike_c/risk_p90/js_avg/w_score).
+Назначение : Текстовый отчёт о текущих значениях SICPP и C-only (active,
+             strength, duration, capped, episode_start,
+             alert/fired_c/profile_c/spike_c/risk_p90/js_avg/w_score).
 
 Функция : get_current_signals_status(p_lookback_days)
-Назначение : Отчёт о текущем состоянии SICPP и C-only (T/F, время последнего T↔F, охват/точность за период), c_only_incident_flag (stored/live/history), последнем инциденте и примечаниях.
+Назначение : Отчёт о текущем состоянии SICPP и C-only (T/F, время последнего
+             T↔F, охват/точность за период), c_only_incident_flag
+             (stored/live/history), последнем инциденте и примечаниях.
 
 Функция : get_current_signals_status_short(p_lookback_days)
-Назначение : Сокращенный отчёт о текущем состоянии SICPP и C-only и последнем инциденте 
-
+Назначение : Сокращенный отчёт о текущем состоянии SICPP и C-only и последнем
+             инциденте.
 
 Функция : historical_fill_c_only(p_start, p_end, p_step_minutes, p_clean)
-Назначение : Историческое заполнение operational_alert_history по mchain_hybrid_alert_at с пропуском точек внутри инцидентов, reason='recovery_zone' при завершении в recovery; в конце вызывает c_only_incident_flag_historical_fill().
+Назначение : Историческое заполнение operational_alert_history по
+             mchain_hybrid_alert_at с пропуском точек внутри инцидентов,
+             reason='recovery_zone' при завершении в recovery; в конце вызывает
+             c_only_incident_flag_historical_fill().
 
 Функция : is_ts_inside_incident(p_ts)
-Назначение : Возвращает TRUE, если p_ts попадает внутрь интервала инцидента (start_timepoint <= p_ts < COALESCE(finish_timepoint, infinity)).
+Назначение : Возвращает TRUE, если p_ts попадает внутрь интервала инцидента
+             (start_timepoint <= p_ts < COALESCE(finish_timepoint, infinity)).
 
 Функция : is_window_overlapping_incident(p_start, p_end)
-Назначение : Возвращает TRUE, если полуинтервал [p_start, p_end) пересекается с любым инцидентом.
+Назначение : Возвращает TRUE, если полуинтервал [p_start, p_end)
+             пересекается с любым инцидентом.
 
 Функция : update_operational_alert_state()
-Назначение : Обновление C-only singleton и operational_alert_history: skip внутри инцидента, reason='recovery_zone' при завершении в recovery, запись только при смене alert.
+Назначение : Обновление C-only singleton и operational_alert_history: skip
+             внутри инцидента, reason='recovery_zone' при завершении в recovery,
+             запись только при смене alert.
 
 Функция : save_baseline_profile(p_retention_count, p_overlap_threshold)
-Назначение : Сохраняет эталон из incident_free_window_current в profile_aggregated (profile_type='baseline') с проверкой is_valid_baseline_window и retention.
+Назначение : Сохраняет эталон из incident_free_window_current в
+             profile_aggregated (profile_type='baseline') с проверкой
+             is_valid_baseline_window и retention.
 
 Функция : is_in_recovery_zone(p_ts, p_window_minutes)
-Назначение : TRUE, если окно [p_ts - window, p_ts] ещё не сформировано относительно последнего завершённого инцидента (инцидент финишировал в зоне window..window+gap до p_ts).
+Назначение : TRUE, если окно [p_ts - window, p_ts] ещё не сформировано
+             относительно последнего завершённого инцидента (инцидент
+             финишировал в зоне window..window+gap до p_ts).
 
 Функция : c_only_incident_flag_update_step()
-Назначение : Онлайн-шаг обновления c_only_incident_flag: init=effective_c_only; c_started/c_ended/incident_started (приоритет 1); result = effective_c_only AND flag.
+Назначение : Онлайн-шаг обновления c_only_incident_flag: init=effective_c_only;
+             c_started/c_ended/incident_started (приоритет 1);
+             result = effective_c_only AND flag.
 
 Функция : c_only_incident_flag_at(p_ts)
-Назначение : Возвращает result_value последней записи c_only_incident_flag_history с changed_at <= p_ts (по умолчанию FALSE, p_ts ограничивается now()).
+Назначение : Возвращает result_value последней записи
+             c_only_incident_flag_history с changed_at <= p_ts (по умолчанию
+             FALSE, p_ts ограничивается now()).
 
 Функция : get_c_only_incident_flag_status()
-Назначение : Текущий статус c_only_incident_flag: LIVE (Status/result/flag/effective_c_only/inside/recovery), HISTORY, CONSISTENCY, последние 5 записей, счётчики причин за 7 дней.
+Назначение : Текущий статус c_only_incident_flag: LIVE
+             (Status/result/flag/effective_c_only/inside/recovery), HISTORY,
+             CONSISTENCY, последние 5 записей, счётчики причин за 7 дней.
 
-Функция : c_only_incident_flag_historical_fill(p_start, p_end, p_step_minutes, p_clean)
-Назначение : Backfill c_only_incident_flag_history по mchain_hybrid_alert_at поминутно с причинами init/c_started/c_ended/incident_started и обновлением singleton в конце.
+Функция : c_only_incident_flag_historical_fill(p_start, p_end,
+                                               p_step_minutes, p_clean)
+Назначение : Backfill c_only_incident_flag_history по mchain_hybrid_alert_at
+             поминутно с причинами init/c_started/c_ended/incident_started и
+             обновлением singleton в конце.
 
 Функция : clean_c_only_incident_flag_history(p_retention_days)
-Назначение : Удаляет записи c_only_incident_flag_history старше p_retention_days (по умолчанию 90).
+Назначение : Удаляет записи c_only_incident_flag_history старше
+             p_retention_days (по умолчанию 90).
 
 Функция : c_only_incident_flag_detail_at(p_ts)
-Назначение : Возвращает полный контекст последней записи c_only_incident_flag_history с changed_at <= p_ts и поле status (ACTIVE/BLIND_ZONE/INACTIVE/STALE_FLAG).
+Назначение : Возвращает полный контекст последней записи
+             c_only_incident_flag_history с changed_at <= p_ts и поле status
+             (ACTIVE/BLIND_ZONE/INACTIVE/STALE_FLAG).
 
 Функция : sicpp_incident_flag_update_step()
-Назначение : Онлайн-шаг обновления sicpp_incident_flag: init=effective_sicpp; sicpp_started/sicpp_ended/incident_started (приоритет 1); result = effective_sicpp AND flag.
+Назначение : Онлайн-шаг обновления sicpp_incident_flag: init=effective_sicpp;
+             sicpp_started/sicpp_ended/incident_started (приоритет 1);
+             result = effective_sicpp AND flag.
 
 Функция : sicpp_incident_flag_at(p_ts)
-Назначение : Возвращает result_value последней записи sicpp_incident_flag_history с changed_at <= p_ts.
+Назначение : Возвращает result_value последней записи
+             sicpp_incident_flag_history с changed_at <= p_ts.
 
 Функция : sicpp_incident_flag_detail_at(p_ts)
-Назначение : Возвращает полный контекст последней записи sicpp_incident_flag_history с changed_at <= p_ts и status (ACTIVE/BLIND_ZONE/STALE_FLAG/INACTIVE).
+Назначение : Возвращает полный контекст последней записи
+             sicpp_incident_flag_history с changed_at <= p_ts и status
+             (ACTIVE/BLIND_ZONE/STALE_FLAG/INACTIVE).
 
-Функция : sicpp_incident_flag_historical_fill(p_start, p_end, p_step_minutes, p_clean)
-Назначение : Backfill sicpp_incident_flag_history по sicpp_calculate_at поминутно с причинами init/sicpp_started/sicpp_ended/incident_started и обновлением singleton.
+Функция : sicpp_incident_flag_historical_fill(p_start, p_end,
+                                              p_step_minutes, p_clean)
+Назначение : Backfill sicpp_incident_flag_history по sicpp_calculate_at
+             поминутно с причинами init/sicpp_started/sicpp_ended/
+             incident_started и обновлением singleton.
 
 Функция : get_sicpp_incident_flag_status()
-Назначение : Текущий статус sicpp_incident_flag (аналог get_c_only_incident_flag_status): LIVE, HISTORY, CONSISTENCY, последние 5 записей, счётчики причин за 7 дней.
+Назначение : Текущий статус sicpp_incident_flag (аналог
+             get_c_only_incident_flag_status): LIVE, HISTORY, CONSISTENCY,
+             последние 5 записей, счётчики причин за 7 дней.
 
 Функция : clean_sicpp_incident_flag_history(p_retention_days)
-Назначение : Удаляет записи sicpp_incident_flag_history старше p_retention_days (по умолчанию 90).
+Назначение : Удаляет записи sicpp_incident_flag_history старше p_retention_days
+             (по умолчанию 90).
 
 Функция : sicpp_incident_flag_fill_from_history(p_start, p_end, p_clean)
-Назначение : Обёртка над sicpp_incident_flag_historical_fill с автоопределением периода: p_start = training_start_time → MIN(start_timepoint)−90 days → now()−30 days; p_end = now().
+Назначение : Обёртка над sicpp_incident_flag_historical_fill с
+             автоопределением периода: p_start = training_start_time →
+             MIN(start_timepoint)−90 days → now()−30 days; p_end = now().
 
 Функция : operational_signals_report(p_start, p_end)
-Назначение : Сводный отчёт по сигналам c_only_incident_flag и sicpp_incident_flag: результирующие эпизоды (start → incident_started), статистика длительностей, процент конверсии, сравнительная таблица и выводы.
+Назначение : Сводный отчёт по сигналам c_only_incident_flag и
+             sicpp_incident_flag: результирующие эпизоды (start →
+             incident_started), статистика длительностей, процент конверсии,
+             сравнительная таблица и выводы.
 */
 
 
