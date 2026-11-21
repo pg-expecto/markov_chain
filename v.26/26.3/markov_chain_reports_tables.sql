@@ -13,11 +13,26 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_reports_tables.sql
--- version 26.2.1.1
---------------------------------------------------------------------------------
--- Таблицы для отчетов по цепи Маркова 
---------------------------------------------------------------------------------
--- ============================================================================
+-- version 26.3
+/*
+Определения таблиц для отчётов по цепи Маркова: агрегирование метрик профиля производительности PostgreSQL с часовой, суточной и недельной детализацией, а также хранение обнаруженных переходных периодов.
+
+Таблица : profile_hourly
+Назначение : Хранение агрегированных метрик профиля производительности с часовой детализацией. Используется для оперативных дашбордов и отслеживания изменений в течение дня. Заполняется функцией build_profile_hourly().
+Ключевые поля : bucket_hour (PK), avg_speed, avg_waitings, avg_correlation, avg_js_divergence, max_js_divergence, avg_entropy, critical_state_share, anomaly_count, sicpp_active_share, sicpp_activations, sicpp_lead_time_avg, c_only_active_share, c_only_activations, c_only_lead_time_avg, created_at.
+
+Таблица : profile_daily
+Назначение : Суточное агрегирование метрик профиля производительности. Используется для ежедневных отчётов и выявления устойчивых трендов. Заполняется функцией build_profile_daily().
+Ключевые поля : bucket_day (PK), avg_speed, avg_waitings, avg_correlation, avg_slope_speed, avg_slope_waitings, avg_js_divergence, max_js_divergence, avg_entropy, critical_state_share, anomaly_count, sicpp_true_positive_rate, c_only_precision, incident_coverage_total, false_positive_episode_count, created_at.
+
+Таблица : profile_weekly
+Назначение : Недельное агрегирование метрик профиля производительности. Используется для еженедельных отчётов и стратегического анализа. Заполняется функцией build_profile_weekly().
+Ключевые поля : week_start (PK), avg_speed, avg_waitings, avg_correlation, avg_js_divergence, max_js_divergence, avg_entropy, critical_state_share, anomaly_count, transition_period_count, sicpp_weekly_coverage, c_only_weekly_coverage, avg_lead_time_sicpp, avg_lead_time_c_only, created_at.
+
+Таблица : profile_transition_periods
+Назначение : Хранение обнаруженных переходных периодов (degradation / recovery / instability) с указанием подтверждающих сигналов и атрибутов критичности. Заполняется функцией detect_transition_periods().
+Ключевые поля : period_id (PK), start_time, end_time, duration_minutes, period_type, status, confirming_signals, max_js, avg_js, max_z_score, slope_speed, slope_waitings, correlation, entropy, critical_state_share, affected_metrics, related_anomaly_ids, criticality, confidence, probable_cause, recommendation, created_at.
+*/-- ============================================================================
 -- Таблица: profile_hourly
 -- Назначение: хранение агрегированных метрик профиля производительности
 --             с часовой детализацией. Используется для оперативных дашбордов
