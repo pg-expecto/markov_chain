@@ -14,10 +14,57 @@
 --------------------------------------------------------------------------------
 -- markov_chain_reports_functions.sql
 -- version 26.3
---------------------------------------------------------------------------------
--- Функции для отчетов по цепи Маркова 
---------------------------------------------------------------------------------
+/*
+Функции для построения отчётов и агрегирования метрик цепи
+            Маркова: часовые, суточные и недельные профили, обнаружение
+            переходных периодов и формирование сводного отчёта о
+            производительности.
 
+Функция : build_profile_hourly(p_period_start timestamptz)
+Назначение : Часовое агрегирование профиля производительности. Собирает
+             базовые метрики (скорость, ожидания, корреляция, наклоны) из
+             cluster_stat_median; JS-дивергенцию — из profile_comparison_log;
+             энтропию и долю критических состояний — из profile_aggregated
+             (с fallback на transition_log); количество аномалий — из
+             anomaly_log; активность SICPP и C-only (с клиппингом по границам
+             часа); средний lead time для SICPP и C-only. Идемпотентна.
+
+Функция : build_profile_daily(p_period_start timestamptz)
+Назначение : Суточное агрегирование. Базовые метрики — из
+             cluster_stat_median; марковские метрики сворачиваются из
+             profile_hourly; точность SICPP (true positive rate) — из
+             sicpp_incident_flag_history; precision C-only — из
+             c_only_incident_flag_history; покрытие инцидентов сигналами и
+             количество ложных эпизодов. Идемпотентна.
+
+Функция : build_profile_weekly(p_period_start timestamptz)
+Назначение : Недельное агрегирование. Базовые метрики — из
+             cluster_stat_median; марковские метрики — из profile_daily;
+             количество переходных периодов — из profile_transition_periods;
+             недельное покрытие и средний lead time для SICPP и C-only — из
+             sicpp_history и c_only_incident_flag_history. Идемпотентна.
+
+Функция : detect_transition_periods(p_period_start timestamptz)
+Назначение : Обнаружение переходных периодов по часовым агрегатам.
+             Критерий перехода: avg_js_divergence >= 0.05 ИЛИ
+             (avg_slope_speed < 0 AND avg_slope_waitings > 0). Реализация
+             gaps-and-islands через CTE (row_number() вынесен в отдельный шаг,
+             чтобы не использовать оконную функцию в GROUP BY). Идемпотентна
+             (DELETE + INSERT).
+
+Функция : generate_performance_report(
+              p_start timestamptz DEFAULT now() - interval '30 days',
+              p_end timestamptz DEFAULT now(),
+              p_include_hourly boolean DEFAULT TRUE
+          )
+Назначение : Формирует сводный текстовый отчёт о профиле
+             производительности за указанный период. Оркестрирует вызовы
+             build_profile_hourly, build_profile_daily, build_profile_weekly
+             и detect_transition_periods, начиная с начала недели,
+             выровненной по p_start. Включает почасовую (опционально),
+             ежедневную и недельную динамику, а также проверку источника
+             данных и нормализацию периода. Возвращает массив строк (text[]).
+*/
 -- ============================================================================
 -- Функция: build_profile_hourly
 -- Назначение: часовое агрегирование профиля производительности.
