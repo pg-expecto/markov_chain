@@ -13,7 +13,7 @@
 -- limitations under the License.
 --------------------------------------------------------------------------------
 -- markov_chain_functions.sql
--- version 26.3
+-- version 26.3.1
 
 /*
 Набор функций для обучения, забывания, логирования переходов,
@@ -221,6 +221,12 @@
 Процедура : mchain_initial_train_from_history(...)
 Назначение : Выполняет первоначальное обучение цепи по историческим данным
              cluster_stat_median с очисткой таблиц модели.
+			 
+Функция : start_incident
+Назначение : Начать инцидент производительности
+
+Функция : stop_incidents
+Назначение : Завершить инциденты производительности  			 
 */
 
 --------------------------------------------------------------------------------
@@ -7042,3 +7048,84 @@ BEGIN
     SELECT s.brier, a.ece, a.mce, s.n, s.avg_pred, s.obs_rate
     FROM stats s CROSS JOIN agg a;
 END; $$;
+
+--------------------------------------------------------------------------------
+-- Начать инцидент производительности приоритет с заданным приоритетов 
+CREATE OR REPLACE PROCEDURE start_incident(curr_priority integer)
+AS $$
+DECLARE
+    p_count integer;
+    open_count integer;
+    start_timepoint timestamp with time zone;
+BEGIN
+    start_timepoint := date_trunc('minute', CURRENT_TIMESTAMP);
+
+    SELECT count(id)
+    INTO p_count
+    FROM performance_incident
+    WHERE priority = curr_priority
+      AND finish_timepoint IS NULL;
+
+    SELECT count(id)
+    INTO open_count
+    FROM performance_incident
+    WHERE finish_timepoint IS NULL;
+
+    -- Новый инцидент для данного приоритета
+    IF p_count = 0 THEN
+        INSERT INTO performance_incident
+        (
+            priority,
+            start_timepoint
+        )
+        VALUES
+        (
+            curr_priority,
+            start_timepoint
+        );
+
+        -- Если до вставки не было ни одного открытого инцидента,
+        -- открываем новую запись в markov_chain_performance_incident
+        IF open_count = 0 THEN
+            INSERT INTO markov_chain_performance_incident
+            (
+                start_timepoint
+            )
+            VALUES
+            (
+                start_timepoint
+            );
+        END IF;
+    END IF;
+END
+$$ LANGUAGE plpgsql;
+COMMENT ON PROCEDURE  start_incident IS 'Начать инцидент производительности приоритет с заданным приоритетов';
+-- Начать инцидент производительности приоритет с заданным приоритетов
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+-- Завершить инциденты производительности 
+CREATE OR REPLACE PROCEDURE stop_incidents()
+AS $$
+DECLARE
+    timepoint timestamp with time zone;
+BEGIN
+    timepoint := date_trunc('minute', CURRENT_TIMESTAMP);
+
+    -- Закрыть инциденты производительности
+    UPDATE performance_incident
+    SET finish_timepoint = timepoint
+    WHERE finish_timepoint IS NULL;
+
+    -- Закрыть открытые записи markov_chain_performance_incident
+    UPDATE markov_chain_performance_incident
+    SET finish_timepoint = timepoint
+    WHERE finish_timepoint IS NULL;
+END
+$$ LANGUAGE plpgsql;
+
+COMMENT ON PROCEDURE stop_incidents IS
+'Завершить инциденты производительности';
+-- Завершить инциденты производительности 
+--------------------------------------------------------------------------------
+
